@@ -65,7 +65,7 @@ def test_evaluation_policy_snapshot_serialization_and_fingerprint(typed_crystal)
         policy.validate_fingerprint()
 
 
-def test_solver_path_migration_and_energy_only_contract(typed_crystal):
+def test_solver_path_migration_and_first_derivative_contract(typed_crystal):
     model, template = make_model_and_template(typed_crystal)
     context = make_context(template)
     policy = _policy(template)
@@ -79,13 +79,13 @@ def test_solver_path_migration_and_energy_only_contract(typed_crystal):
         model(*arguments, solver_path=EVAL_ADAPTIVE, template_context=context)
     with pytest.raises(ValueError, match="TemplateExecutionContext"):
         model(*arguments, solver_path=EVAL_ADAPTIVE, evaluation_policy=policy)
-    for keyword in ("compute_forces", "compute_stress", "create_graph"):
-        with pytest.raises(ValueError, match="energy-only"):
-            model(
-                *arguments, solver_path=EVAL_ADAPTIVE,
-                evaluation_policy=policy, template_context=context,
-                **{keyword: True},
-            )
+    with pytest.raises(EvaluationPhaseError) as caught:
+        model(
+            *arguments, solver_path=EVAL_ADAPTIVE,
+            evaluation_policy=policy, template_context=context,
+            create_graph=True,
+        )
+    assert caught.value.reason_code == "CREATE_GRAPH_UNSUPPORTED"
 
 
 def test_valid_evaluation_energy_diagnostics_graph_and_state_contract(typed_crystal):

@@ -1,4 +1,5 @@
 from __future__ import annotations
+import contextlib
 import math
 import torch
 from torch import nn
@@ -206,6 +207,11 @@ class ReferenceSitePotential(nn.Module):
         reference_amplitudes,
         cross_amplitudes,
         ot,
+        effective_transport_tolerance,
+        *,
+        derivative_requested=False,
+        forces_requested=False,
+        stress_requested=False,
     ):
         def scalar(value):
             return float(value.detach().cpu())
@@ -255,6 +261,16 @@ class ReferenceSitePotential(nn.Module):
             transport_newton_iterations=ot.newton_iterations,
             transport_cg_iterations=ot.cg_iterations,
             transport_fallback_used=ot.fallback_used,
+            effective_transport_tolerance=effective_transport_tolerance,
+            differentiability_scope=(
+                "selected_branch_first_order"
+                if derivative_requested
+                else "energy_only"
+            ),
+            hard_branch_frozen=True,
+            derivative_order=1 if derivative_requested else 0,
+            forces_requested=forces_requested,
+            stress_requested=stress_requested,
         )
 
     def energy(
@@ -268,6 +284,9 @@ class ReferenceSitePotential(nn.Module):
         return_aux=False,
         template_context=None,
         evaluation_policy=None,
+        _evaluation_derivative_request=False,
+        _forces_requested=False,
+        _stress_requested=False,
     ):
         if solver_path == TRAIN_FIXED:
             if evaluation_policy is not None:
@@ -332,6 +351,16 @@ class ReferenceSitePotential(nn.Module):
                     threshold=error.threshold,
                 ) from error
             phase=evaluation.refined.phase
+        if (
+            solver_path == EVAL_ADAPTIVE
+            and _evaluation_derivative_request
+            and not phase.requires_grad
+        ):
+            raise EvaluationPhaseError(
+                "GRAPH_DISCONNECTED",
+                "selected refined phase is detached from the input geometry",
+                template_id=runtime.template_id,
+            )
         references=aligned_reference_sites(topology.reference_fractional,phase,origin,cell); displacements=atom_site_displacements(positions,references,cell,topology.pbc); cost=displacements.square().sum(-1)/(2*self.config.ell_ot**2)
         if solver_path==TRAIN_FIXED: ot=solve_atom_vacancy_ot(cost,self.config.epsilon_ot,TRAIN_FIXED,'sinkhorn',TrainSinkhornConfig(self.config.train_sinkhorn_iterations))
         else:
@@ -339,6 +368,22 @@ class ReferenceSitePotential(nn.Module):
                 1.0e-6 if cost.dtype == torch.float32 else 1.0e-12
             )
             ot=solve_atom_vacancy_ot(cost,self.config.epsilon_ot,EVAL_ADAPTIVE,'hybrid',EvalOTConfig(sinkhorn_iterations=16,convergence_tolerance=evaluation_ot_tolerance))
+            if _evaluation_derivative_request and ot.fallback_used:
+                raise EvaluationPhaseError(
+                    "DERIVATIVE_FALLBACK_UNSUPPORTED",
+                    "the selected adaptive transport fallback is not certified for derivatives",
+                    template_id=runtime.template_id,
+                )
+            vacancy_present = topology.num_sites > positions.shape[0]
+            if _evaluation_derivative_request and (
+                not ot.P.requires_grad
+                or (vacancy_present and not ot.q.requires_grad)
+            ):
+                raise EvaluationPhaseError(
+                    "GRAPH_DISCONNECTED",
+                    "adaptive transport P or q is detached from the selected geometry branch",
+                    template_id=runtime.template_id,
+                )
         features=build_probability_multipoles(ot.P,ot.q,atomic_numbers,displacements,self.config.feature,topology.site_types)
         c_raw=features.raw_probability_state; c_bar=self.central(c_raw,topology.site_types); h=self.probability_encoder(features.equivariant_features)+self.central_encoder(c_bar)
         geometry=update_reference_edge_geometry(topology,cell,edge_length_scale=self.config.higher_body.edge_length_scale); radial=squared_edge_radial_basis(geometry.radial_coordinate,self.config.higher_body.radial_feature_dim)
@@ -347,27 +392,108 @@ class ReferenceSitePotential(nn.Module):
             h,corr=layer(h,c_bar,topology.edge_index,geometry.edge_vectors,radial,geometry.cutoff_values)
             if return_aux: correlations.append(corr)
         site_energy=self.readout(h[:,self.scalar_slice],c_bar); residual=site_energy.sum(); baseline=self.atomic_baseline.to(positions)[species].sum(); total=baseline+residual
+        if solver_path == EVAL_ADAPTIVE and not bool(torch.isfinite(total).detach()):
+            raise EvaluationPhaseError(
+                "NONFINITE_OUTPUT",
+                "evaluation energy is nonfinite",
+                template_id=runtime.template_id,
+            )
         if return_aux:
             aux={'phase':phase,'ot':ot,'q':ot.q,'multipoles':features,'correlations':correlations}
             if evaluation is not None:
-                aux['evaluation_diagnostics']=self._compact_evaluation_diagnostics(runtime,evaluation,*amplitudes,ot)
+                aux['evaluation_diagnostics']=self._compact_evaluation_diagnostics(
+                    runtime,
+                    evaluation,
+                    *amplitudes,
+                    ot,
+                    evaluation_ot_tolerance,
+                    derivative_requested=_evaluation_derivative_request,
+                    forces_requested=_forces_requested,
+                    stress_requested=_stress_requested,
+                )
         else:
             aux=None
         return PotentialOutput(total,site_energy,baseline,residual,h,c_raw,auxiliary=aux)
     def forward(self,positions,atomic_numbers,cell,origin,*,solver_path=TRAIN_FIXED,compute_forces=False,compute_stress=False,create_graph=False,return_aux=False,template_context=None,evaluation_policy=None):
-        if solver_path == EVAL_ADAPTIVE and (compute_forces or compute_stress or create_graph):
-            raise ValueError('EVAL_ADAPTIVE is energy-only in Milestone 7A-2')
-        if not compute_forces and not compute_stress: return self.energy(positions,atomic_numbers,cell,origin,solver_path=solver_path,return_aux=return_aux,template_context=template_context,evaluation_policy=evaluation_policy)
-        strain=torch.zeros((3,3),dtype=positions.dtype,device=positions.device,requires_grad=compute_stress)
-        F=torch.eye(3,dtype=positions.dtype,device=positions.device)+strain
-        p=positions@F; H=cell@F; o=origin@F
-        out=self.energy(p,atomic_numbers,H,o,solver_path=solver_path,return_aux=return_aux,template_context=template_context,evaluation_policy=evaluation_policy)
-        inputs=[]
-        if compute_forces: inputs.append(positions)
-        if compute_stress: inputs.append(strain)
-        gradients=torch.autograd.grad(out.energy,inputs,create_graph=create_graph,retain_graph=create_graph)
-        index=0; forces=None; stress=None; voigt=None
-        if compute_forces: forces=-gradients[index]; index+=1
-        if compute_stress:
-            stress=gradients[index]/torch.linalg.det(cell).abs(); stress=.5*(stress+stress.T); voigt=stress[(0,1,2,1,0,0),(0,1,2,2,2,1)]
-        return PotentialOutput(out.energy,out.site_energy,out.baseline_energy,out.residual_energy,out.site_features,out.raw_c,forces,stress,voigt,out.auxiliary)
+        derivative_requested = compute_forces or compute_stress
+        if solver_path == EVAL_ADAPTIVE and create_graph:
+            raise EvaluationPhaseError(
+                "CREATE_GRAPH_UNSUPPORTED",
+                "EVAL_ADAPTIVE supports selected-branch first derivatives only; create_graph=True is unsupported",
+                template_id=getattr(template_context, "template_id", None),
+            )
+        if (
+            solver_path == EVAL_ADAPTIVE
+            and derivative_requested
+            and torch.is_inference_mode_enabled()
+        ):
+            raise EvaluationPhaseError(
+                "INFERENCE_MODE_DERIVATIVE_UNSUPPORTED",
+                "EVAL_ADAPTIVE force/stress requires autograd and cannot run under torch.inference_mode()",
+                template_id=getattr(template_context, "template_id", None),
+            )
+        if not derivative_requested:
+            return self.energy(positions,atomic_numbers,cell,origin,solver_path=solver_path,return_aux=return_aux,template_context=template_context,evaluation_policy=evaluation_policy)
+
+        grad_context = (
+            torch.enable_grad()
+            if solver_path == EVAL_ADAPTIVE
+            else contextlib.nullcontext()
+        )
+        with grad_context:
+            derivative_positions = positions
+            if (
+                solver_path == EVAL_ADAPTIVE
+                and compute_forces
+                and not derivative_positions.requires_grad
+            ):
+                derivative_positions = positions.detach().clone().requires_grad_(True)
+            strain=torch.zeros((3,3),dtype=positions.dtype,device=positions.device,requires_grad=compute_stress)
+            F=torch.eye(3,dtype=positions.dtype,device=positions.device)+strain
+            p=derivative_positions@F; H=cell@F; o=origin@F
+            out=self.energy(
+                p,atomic_numbers,H,o,
+                solver_path=solver_path,
+                return_aux=return_aux,
+                template_context=template_context,
+                evaluation_policy=evaluation_policy,
+                _evaluation_derivative_request=(solver_path == EVAL_ADAPTIVE),
+                _forces_requested=compute_forces,
+                _stress_requested=compute_stress,
+            )
+            inputs=[]
+            if compute_forces: inputs.append(derivative_positions)
+            if compute_stress: inputs.append(strain)
+            try:
+                gradients=torch.autograd.grad(
+                    out.energy,
+                    inputs,
+                    create_graph=create_graph,
+                    retain_graph=create_graph,
+                )
+            except RuntimeError as error:
+                if solver_path != EVAL_ADAPTIVE:
+                    raise
+                raise EvaluationPhaseError(
+                    "GRAPH_DISCONNECTED",
+                    "selected evaluation branch is not differentiably connected to requested geometry",
+                    template_id=getattr(template_context, "template_id", None),
+                ) from error
+            index=0; forces=None; stress=None; voigt=None
+            if compute_forces: forces=-gradients[index]; index+=1
+            if compute_stress:
+                stress=gradients[index]/torch.linalg.det(cell).abs(); stress=.5*(stress+stress.T); voigt=stress[(0,1,2,1,0,0),(0,1,2,2,2,1)]
+            if solver_path == EVAL_ADAPTIVE:
+                if forces is not None and not bool(torch.all(torch.isfinite(forces)).detach()):
+                    raise EvaluationPhaseError(
+                        "NONFINITE_OUTPUT",
+                        "evaluation forces are nonfinite",
+                        template_id=getattr(template_context, "template_id", None),
+                    )
+                if stress is not None and not bool(torch.all(torch.isfinite(stress)).detach()):
+                    raise EvaluationPhaseError(
+                        "NONFINITE_OUTPUT",
+                        "evaluation stress is nonfinite",
+                        template_id=getattr(template_context, "template_id", None),
+                    )
+            return PotentialOutput(out.energy,out.site_energy,out.baseline_energy,out.residual_energy,out.site_features,out.raw_c,forces,stress,voigt,out.auxiliary)

@@ -34,6 +34,12 @@ class EvaluationDiagnostics:
     transport_newton_iterations: int
     transport_cg_iterations: int
     transport_fallback_used: bool
+    effective_transport_tolerance: float
+    differentiability_scope: str
+    hard_branch_frozen: bool
+    derivative_order: int
+    forces_requested: bool
+    stress_requested: bool
 
 
 @dataclass(frozen=True)

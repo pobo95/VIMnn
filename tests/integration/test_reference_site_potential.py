@@ -71,8 +71,6 @@ def test_eval_adaptive_semantic_migration_is_explicit(typed_crystal):
     model=_model(typed_crystal); p=typed_crystal['positions'][:5].clone().requires_grad_(True); z=_numbers(typed_crystal)
     with pytest.raises(ValueError,match='evaluation_policy'):
         model(p,z,typed_crystal['cell'],typed_crystal['origin'],solver_path=EVAL_ADAPTIVE)
-    with pytest.raises(ValueError,match='energy-only'):
-        model(p,z,typed_crystal['cell'],typed_crystal['origin'],solver_path=EVAL_ADAPTIVE,compute_forces=True)
 
 
 def test_apply_fitted_atomic_baseline_preserves_model_state_contract(typed_crystal,tmp_path):
