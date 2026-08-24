@@ -13,6 +13,13 @@ from .epoch import (
     run_training_epoch,
     run_validation_epoch,
 )
+from .fit import (
+    FitConfig,
+    FitEpochRecord,
+    FitExecutionError,
+    FitResult,
+    run_fit,
+)
 from .losses import (
     LossConfig,
     LossTerm,
@@ -46,6 +53,10 @@ __all__ = [
     "EpochMetrics",
     "EpochResult",
     "EpochTermMetrics",
+    "FitConfig",
+    "FitEpochRecord",
+    "FitExecutionError",
+    "FitResult",
     "LossConfig",
     "LossTerm",
     "ModelSelectionConfig",
@@ -66,6 +77,7 @@ __all__ = [
     "compute_potential_loss",
     "fit_atomic_baseline",
     "process_primary_validation",
+    "run_fit",
     "run_training_epoch",
     "run_validation_epoch",
     "train_step",
