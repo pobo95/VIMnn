@@ -26,9 +26,11 @@ from refsite_mlip.training import (
     LossConfig,
     OptimizerConfig,
     TrainStepConfig,
+    ValidationStepConfig,
     build_optimizer,
     compute_potential_loss,
     train_step,
+    validation_step,
 )
 from refsite_mlip.transport import TRAIN_FIXED
 
@@ -509,6 +511,51 @@ def test_actual_energy_force_stress_step_with_clipping(typed_crystal):
     assert result.post_clip_grad_norm <= 0.5 + 1.0e-10
 
 
+def test_actual_mixed_validation_matches_direct_loss_inside_no_grad(typed_crystal):
+    _, model, _, _, batch, contexts = _case(typed_crystal)
+    target = replace(
+        batch,
+        forces=torch.zeros_like(batch.forces),
+        force_mask=torch.ones_like(batch.force_mask),
+        stress=torch.zeros_like(batch.stress),
+        stress_mask=torch.ones_like(batch.stress_mask),
+        force_present=torch.ones_like(batch.force_present),
+        stress_present=torch.ones_like(batch.stress_present),
+        force_mask_provided=torch.zeros_like(batch.force_mask_provided),
+        stress_mask_provided=torch.zeros_like(batch.stress_mask_provided),
+    )
+    direct_batch = replace(
+        target,
+        positions=target.positions.detach().clone().requires_grad_(True),
+    )
+    model.eval()
+    direct_prediction = evaluate_structure_batch(
+        model,
+        direct_batch,
+        contexts,
+        solver_path=TRAIN_FIXED,
+        compute_forces=True,
+        compute_stress=True,
+        create_graph=False,
+    )
+    loss_config = LossConfig(energy_weight=1.0, force_weight=0.2, stress_weight=0.1)
+    direct_loss = compute_potential_loss(direct_prediction, direct_batch, loss_config)
+    model.train()
+    with torch.no_grad():
+        first = validation_step(
+            model, target, contexts, loss_config, ValidationStepConfig()
+        )
+    second = validation_step(
+        model, target, contexts, loss_config, ValidationStepConfig()
+    )
+    assert first == second and model.training
+    assert first.total_loss == float(direct_loss.total.detach())
+    assert first.energy.numerator == float(direct_loss.energy.numerator.detach())
+    assert first.force.numerator == float(direct_loss.force.numerator.detach())
+    assert first.stress.numerator == float(direct_loss.stress.numerator.detach())
+    assert first.need_forces and first.need_stress and first.has_supervision
+
+
 def test_context_resolution_fail_fast_and_extra_context_is_allowed(typed_crystal):
     data, model, _, _, batch, contexts = _case(typed_crystal)
     with pytest.raises(KeyError, match="missing TemplateExecutionContext"):
@@ -590,3 +637,20 @@ def test_grouped_cuda_smoke_when_available(typed_crystal, dtype):
     assert result.need_forces and result.need_stress
     assert result.number_of_parameters_with_grad > 0
     assert result.pre_clip_grad_norm > 0.0
+    cpu_rng = torch.random.get_rng_state().clone()
+    cuda_rng = tuple(state.clone() for state in torch.cuda.get_rng_state_all())
+    with torch.no_grad():
+        validation = validation_step(
+            model,
+            target,
+            contexts,
+            LossConfig(energy_weight=1.0, force_weight=0.1, stress_weight=0.1),
+            ValidationStepConfig(),
+        )
+    assert validation.need_forces and validation.need_stress
+    assert validation.has_supervision
+    assert torch.equal(torch.random.get_rng_state(), cpu_rng)
+    assert all(
+        torch.equal(after, before)
+        for after, before in zip(torch.cuda.get_rng_state_all(), cuda_rng)
+    )

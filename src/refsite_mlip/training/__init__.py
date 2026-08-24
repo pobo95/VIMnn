@@ -19,6 +19,12 @@ from .step import (
     TrainStepTermResult,
     train_step,
 )
+from .validation import (
+    ValidationStepConfig,
+    ValidationStepResult,
+    ValidationTermResult,
+    validation_step,
+)
 
 __all__ = [
     "AtomicBaselineConfig",
@@ -30,9 +36,13 @@ __all__ = [
     "TrainStepConfig",
     "TrainStepResult",
     "TrainStepTermResult",
+    "ValidationStepConfig",
+    "ValidationStepResult",
+    "ValidationTermResult",
     "apply_atomic_baseline_",
     "build_optimizer",
     "compute_potential_loss",
     "fit_atomic_baseline",
     "train_step",
+    "validation_step",
 ]
