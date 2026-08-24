@@ -2,10 +2,12 @@ from __future__ import annotations
 import copy
 import pytest
 import torch
+from refsite_mlip.data import StructureSample
 from refsite_mlip.features import ProbabilityMultipoleConfig
 from refsite_mlip.graph import build_reference_graph_topology
 from refsite_mlip.interactions import HigherBodyConfig
 from refsite_mlip.models import PotentialConfig,ReferenceSitePotential
+from refsite_mlip.training import AtomicBaselineConfig,apply_atomic_baseline_,fit_atomic_baseline
 from refsite_mlip.transport import TRAIN_FIXED,EVAL_ADAPTIVE
 
 
@@ -66,6 +68,27 @@ def test_stress_symmetric_voigt_and_finite_difference(typed_crystal):
 def test_train_eval_energy_force_stress_parity_and_state_roundtrip(typed_crystal):
     m=_model(typed_crystal); clone=_model(typed_crystal); clone.load_state_dict(m.state_dict()); p=typed_crystal['positions'][:5].clone().requires_grad_(True); z=_numbers(typed_crystal); a=m(p,z,typed_crystal['cell'],typed_crystal['origin'],compute_forces=True,compute_stress=True); b=clone(p,z,typed_crystal['cell'],typed_crystal['origin'],solver_path=EVAL_ADAPTIVE,compute_forces=True,compute_stress=True)
     torch.testing.assert_close(a.energy,b.energy,atol=3e-10,rtol=3e-10); torch.testing.assert_close(a.forces,b.forces,atol=3e-8,rtol=3e-8); torch.testing.assert_close(a.stress,b.stress,atol=3e-9,rtol=3e-9)
+
+
+def test_apply_fitted_atomic_baseline_preserves_model_state_contract(typed_crystal,tmp_path):
+    def sample(sample_id,numbers,energy):
+        count=len(numbers); dtype=torch.float64
+        return StructureSample(sample_id,torch.zeros((count,3),dtype=dtype),torch.tensor(numbers,dtype=torch.long),torch.eye(3,dtype=dtype),torch.ones(3,dtype=torch.bool),torch.zeros(3,dtype=dtype),'template',energy=torch.tensor(energy,dtype=dtype))
+    dataset=(sample('carbon',(6,),-1.5),sample('niobium',(41,),2.25),sample('mixed',(6,6,41),-0.75))
+    fit=fit_atomic_baseline(dataset,range(3),(6,41),AtomicBaselineConfig())
+    model=_model(typed_crystal,baseline=None); parameter_ids=tuple(id(value) for value in model.parameters()); parameter_count=sum(value.numel() for value in model.parameters()); state_keys=tuple(model.state_dict()); baseline_id=id(model.atomic_baseline)
+    returned=apply_atomic_baseline_(model,fit)
+    assert returned is model and id(model.atomic_baseline)==baseline_id and tuple(model.state_dict())==state_keys
+    assert tuple(id(value) for value in model.parameters())==parameter_ids and sum(value.numel() for value in model.parameters())==parameter_count
+    assert not model.atomic_baseline.requires_grad and 'atomic_baseline' in model._buffers
+    torch.testing.assert_close(model.atomic_baseline,torch.tensor([-1.5,2.25],dtype=torch.float64),atol=2e-15,rtol=2e-15)
+    z=_numbers(typed_crystal); output=model(typed_crystal['positions'][:5],z,typed_crystal['cell'],typed_crystal['origin']); indices=model._species_indices(z); expected=model.atomic_baseline[indices].sum()
+    torch.testing.assert_close(output.baseline_energy,expected,atol=0,rtol=0); torch.testing.assert_close(output.residual_energy,output.site_energy.sum(),atol=0,rtol=0); torch.testing.assert_close(output.energy,output.baseline_energy+output.residual_energy,atol=0,rtol=0)
+    path=tmp_path/'baseline-state.pt'; torch.save(model.state_dict(),path); loaded=torch.load(path,weights_only=True); clone=_model(typed_crystal,baseline=None); result=clone.load_state_dict(loaded,strict=True)
+    assert result.missing_keys==[] and result.unexpected_keys==[] and torch.equal(clone.atomic_baseline,model.atomic_baseline)
+    reversed_fit=fit_atomic_baseline(dataset,range(3),(41,6),AtomicBaselineConfig())
+    with pytest.raises(ValueError,match='vocabulary/order'):
+        apply_atomic_baseline_(model,reversed_fit)
 
 @pytest.mark.parametrize('dtype',[torch.float32,torch.float64])
 def test_cpu_and_cuda_dtype_device(typed_crystal,dtype):
