@@ -17,6 +17,13 @@ from .checkpoint import (
     load_training_checkpoint,
     save_training_checkpoint,
 )
+from .checkpointed_fit import (
+    CheckpointedFitConfig,
+    CheckpointedFitExecutionError,
+    CheckpointedFitResult,
+    run_checkpointed_fit,
+)
+
 from .checkpoint_manager import (
     CheckpointManager,
     CheckpointManagerConfig,
@@ -87,6 +94,9 @@ __all__ = [
     "CheckpointManager",
     "CheckpointManagerConfig",
     "CheckpointManagerError",
+    "CheckpointedFitConfig",
+    "CheckpointedFitExecutionError",
+    "CheckpointedFitResult",
     "CheckpointCompatibilityError",
     "CheckpointRestoreError",
     "EpochMetrics",
@@ -128,6 +138,7 @@ __all__ = [
     "load_training_checkpoint",
     "process_primary_validation",
     "run_fit",
+    "run_checkpointed_fit",
     "run_training_epoch",
     "run_validation_epoch",
     "save_training_checkpoint",
