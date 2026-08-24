@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from dataclasses import replace
 
 import pytest
@@ -21,7 +22,14 @@ from refsite_mlip.models import (
     evaluate_structure_batch,
 )
 from refsite_mlip.phase.stabilizer import find_typed_stabilizer
-from refsite_mlip.training import LossConfig, compute_potential_loss
+from refsite_mlip.training import (
+    LossConfig,
+    OptimizerConfig,
+    TrainStepConfig,
+    build_optimizer,
+    compute_potential_loss,
+    train_step,
+)
 from refsite_mlip.transport import TRAIN_FIXED
 
 
@@ -410,6 +418,97 @@ def test_grouped_energy_force_stress_masked_loss_backward(typed_crystal):
     assert all(bool(torch.any(value != 0)) for value in gradients)
 
 
+def test_actual_energy_train_step_is_deterministic_and_updates_once(typed_crystal):
+    _, model, _, _, batch, contexts = _case(typed_crystal)
+    clone = copy.deepcopy(model)
+    first_optimizer = build_optimizer(
+        model, OptimizerConfig(learning_rate=2.0e-4, weight_decay=0.0)
+    )
+    second_optimizer = build_optimizer(
+        clone, OptimizerConfig(learning_rate=2.0e-4, weight_decay=0.0)
+    )
+    baseline = model.atomic_baseline.clone()
+    original_positions = batch.positions.clone()
+    first = train_step(
+        model, first_optimizer, batch, contexts, LossConfig(), TrainStepConfig()
+    )
+    second = train_step(
+        clone, second_optimizer, batch, contexts, LossConfig(), TrainStepConfig()
+    )
+    assert first == second and first.energy.valid_count == 2
+    assert not first.need_forces and not first.need_stress
+    assert torch.equal(batch.positions, original_positions) and not batch.positions.requires_grad
+    assert torch.equal(model.atomic_baseline, baseline)
+    for left, right in zip(model.state_dict().values(), clone.state_dict().values()):
+        assert torch.equal(left, right)
+    assert any(
+        float(state["step"]) == 1.0 for state in first_optimizer.state.values()
+    )
+    assert all(
+        float(state["step"]) == 1.0 for state in first_optimizer.state.values()
+    )
+
+
+def test_actual_force_only_step_prepares_leaf_and_mixed_template_gradients(typed_crystal):
+    _, model, _, _, batch, contexts = _case(typed_crystal)
+    target = replace(
+        batch,
+        energy=torch.zeros_like(batch.energy),
+        energy_mask=torch.zeros_like(batch.energy_mask),
+        forces=torch.zeros_like(batch.forces),
+        force_mask=torch.ones_like(batch.force_mask),
+        force_present=torch.ones_like(batch.force_present),
+        force_mask_provided=torch.zeros_like(batch.force_mask_provided),
+    )
+    before = {name: parameter.detach().clone() for name, parameter in model.named_parameters()}
+    result = train_step(
+        model,
+        build_optimizer(model, OptimizerConfig(learning_rate=1.0e-4, weight_decay=0.0)),
+        target,
+        contexts,
+        LossConfig(energy_weight=0.0, force_weight=1.0),
+        TrainStepConfig(),
+    )
+    assert result.need_forces and not result.need_stress
+    assert result.force.valid_count == 3 * batch.num_atoms
+    assert result.number_of_parameters_with_grad > 0
+    assert result.pre_clip_grad_norm > 0.0
+    assert any(
+        not torch.equal(parameter.detach(), before[name])
+        for name, parameter in model.named_parameters()
+    )
+    assert not target.positions.requires_grad
+
+
+def test_actual_energy_force_stress_step_with_clipping(typed_crystal):
+    _, model, _, _, batch, contexts = _case(typed_crystal)
+    target = replace(
+        batch,
+        forces=torch.zeros_like(batch.forces),
+        force_mask=torch.ones_like(batch.force_mask),
+        stress=torch.zeros_like(batch.stress),
+        stress_mask=torch.ones_like(batch.stress_mask),
+        force_present=torch.ones_like(batch.force_present),
+        stress_present=torch.ones_like(batch.stress_present),
+        force_mask_provided=torch.zeros_like(batch.force_mask_provided),
+        stress_mask_provided=torch.zeros_like(batch.stress_mask_provided),
+    )
+    result = train_step(
+        model,
+        build_optimizer(model, OptimizerConfig(learning_rate=1.0e-4, weight_decay=0.0)),
+        target,
+        contexts,
+        LossConfig(energy_weight=1.0, force_weight=0.2, stress_weight=0.1),
+        TrainStepConfig(gradient_clip_norm=0.5),
+    )
+    assert result.need_forces and result.need_stress
+    assert result.energy.valid_count == 2
+    assert result.force.valid_count == 3 * batch.num_atoms
+    assert result.stress.valid_count == 6 * batch.num_structures
+    assert result.number_of_parameters_with_grad > 0
+    assert result.post_clip_grad_norm <= 0.5 + 1.0e-10
+
+
 def test_context_resolution_fail_fast_and_extra_context_is_allowed(typed_crystal):
     data, model, _, _, batch, contexts = _case(typed_crystal)
     with pytest.raises(KeyError, match="missing TemplateExecutionContext"):
@@ -468,3 +567,26 @@ def test_grouped_cuda_smoke_when_available(typed_crystal, dtype):
     assert bool(torch.all(torch.isfinite(output.energy)))
     assert bool(torch.all(torch.isfinite(output.forces)))
     assert bool(torch.all(torch.isfinite(output.stress)))
+    target = replace(
+        batch,
+        positions=batch.positions.detach(),
+        forces=torch.zeros_like(batch.forces),
+        force_mask=torch.ones_like(batch.force_mask),
+        stress=torch.zeros_like(batch.stress),
+        stress_mask=torch.ones_like(batch.stress_mask),
+        force_present=torch.ones_like(batch.force_present),
+        stress_present=torch.ones_like(batch.stress_present),
+        force_mask_provided=torch.zeros_like(batch.force_mask_provided),
+        stress_mask_provided=torch.zeros_like(batch.stress_mask_provided),
+    )
+    result = train_step(
+        model,
+        build_optimizer(model, OptimizerConfig(learning_rate=1.0e-4, weight_decay=0.0)),
+        target,
+        contexts,
+        LossConfig(energy_weight=1.0, force_weight=0.1, stress_weight=0.1),
+        TrainStepConfig(),
+    )
+    assert result.need_forces and result.need_stress
+    assert result.number_of_parameters_with_grad > 0
+    assert result.pre_clip_grad_norm > 0.0

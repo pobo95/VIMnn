@@ -12,14 +12,27 @@ from .losses import (
     PotentialLossOutput,
     compute_potential_loss,
 )
+from .optimizer import OptimizerConfig, build_optimizer
+from .step import (
+    TrainStepConfig,
+    TrainStepResult,
+    TrainStepTermResult,
+    train_step,
+)
 
 __all__ = [
     "AtomicBaselineConfig",
     "AtomicBaselineFit",
     "LossConfig",
     "LossTerm",
+    "OptimizerConfig",
     "PotentialLossOutput",
+    "TrainStepConfig",
+    "TrainStepResult",
+    "TrainStepTermResult",
     "apply_atomic_baseline_",
+    "build_optimizer",
     "compute_potential_loss",
     "fit_atomic_baseline",
+    "train_step",
 ]
