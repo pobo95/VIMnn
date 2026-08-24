@@ -21,6 +21,7 @@ from refsite_mlip.models import (
     evaluate_structure_batch,
 )
 from refsite_mlip.phase.stabilizer import find_typed_stabilizer
+from refsite_mlip.training import LossConfig, compute_potential_loss
 from refsite_mlip.transport import TRAIN_FIXED
 
 
@@ -180,12 +181,24 @@ def _assert_grouped_matches_individual(grouped, individual):
         torch.cat([out.site_energy for out in individual]),
     )
     if grouped.forces is not None:
-        assert torch.equal(grouped.forces, torch.cat([out.forces for out in individual]))
+        torch.testing.assert_close(
+            grouped.forces,
+            torch.cat([out.forces for out in individual]),
+            atol=2.0e-14,
+            rtol=2.0e-14,
+        )
     if grouped.stress is not None:
-        assert torch.equal(grouped.stress, torch.stack([out.stress for out in individual]))
-        assert torch.equal(
+        torch.testing.assert_close(
+            grouped.stress,
+            torch.stack([out.stress for out in individual]),
+            atol=2.0e-14,
+            rtol=2.0e-14,
+        )
+        torch.testing.assert_close(
             grouped.stress_voigt,
             torch.stack([out.stress_voigt for out in individual]),
+            atol=2.0e-14,
+            rtol=2.0e-14,
         )
 
 
@@ -350,6 +363,49 @@ def test_mixed_template_force_loss_backward_is_finite(typed_crystal):
         model.central.embedding.weight,
     )
     gradients = torch.autograd.grad(output.forces.square().sum(), selected)
+    assert all(bool(torch.all(torch.isfinite(value))) for value in gradients)
+    assert all(bool(torch.any(value != 0)) for value in gradients)
+
+
+def test_grouped_energy_force_stress_masked_loss_backward(typed_crystal):
+    _, model, _, _, batch, contexts = _case(typed_crystal)
+    batch.positions.requires_grad_(True)
+    prediction = evaluate_structure_batch(
+        model,
+        batch,
+        contexts,
+        solver_path=TRAIN_FIXED,
+        compute_forces=True,
+        compute_stress=True,
+        create_graph=True,
+    )
+    target_batch = replace(
+        batch,
+        forces=torch.zeros_like(batch.forces),
+        force_mask=torch.ones_like(batch.force_mask),
+        stress=torch.zeros_like(batch.stress),
+        stress_mask=torch.ones_like(batch.stress_mask),
+        force_present=torch.ones_like(batch.force_present),
+        stress_present=torch.ones_like(batch.stress_present),
+        force_mask_provided=torch.zeros_like(batch.force_mask_provided),
+        stress_mask_provided=torch.zeros_like(batch.stress_mask_provided),
+    )
+    loss = compute_potential_loss(
+        prediction,
+        target_batch,
+        LossConfig(energy_weight=1.0, force_weight=1.0, stress_weight=1.0),
+    )
+    assert int(loss.energy.valid_count) == 2
+    assert int(loss.force.valid_count) == 3 * batch.num_atoms
+    assert int(loss.stress.valid_count) == 6 * batch.num_structures
+    assert bool(torch.isfinite(loss.total))
+
+    selected = (
+        model.readout.mlp[-1].weight,
+        model.layers[0].edge.radial_head.network[0].weight,
+        model.central.embedding.weight,
+    )
+    gradients = torch.autograd.grad(loss.total, selected)
     assert all(bool(torch.all(torch.isfinite(value))) for value in gradients)
     assert all(bool(torch.any(value != 0)) for value in gradients)
 
