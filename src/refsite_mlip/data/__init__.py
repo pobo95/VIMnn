@@ -1,5 +1,6 @@
 """Generic in-memory structure and reference-template contracts."""
 
+from .batch import StructureBatch, TemplateGroup, collate_structure_samples
 from .dataset import InMemoryStructureDataset
 from .schema import (
     ENERGY_UNIT,
@@ -21,6 +22,9 @@ __all__ = [
     "STRESS_SIGN",
     "STRESS_UNIT",
     "STRESS_VOIGT_ORDER",
+    "StructureBatch",
     "StructureSample",
+    "TemplateGroup",
     "TemplateRegistry",
+    "collate_structure_samples",
 ]
