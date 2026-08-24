@@ -6,6 +6,13 @@ from .baseline import (
     apply_atomic_baseline_,
     fit_atomic_baseline,
 )
+from .epoch import (
+    EpochMetrics,
+    EpochResult,
+    EpochTermMetrics,
+    run_training_epoch,
+    run_validation_epoch,
+)
 from .losses import (
     LossConfig,
     LossTerm,
@@ -29,6 +36,9 @@ from .validation import (
 __all__ = [
     "AtomicBaselineConfig",
     "AtomicBaselineFit",
+    "EpochMetrics",
+    "EpochResult",
+    "EpochTermMetrics",
     "LossConfig",
     "LossTerm",
     "OptimizerConfig",
@@ -43,6 +53,8 @@ __all__ = [
     "build_optimizer",
     "compute_potential_loss",
     "fit_atomic_baseline",
+    "run_training_epoch",
+    "run_validation_epoch",
     "train_step",
     "validation_step",
 ]

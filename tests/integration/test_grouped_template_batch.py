@@ -29,6 +29,8 @@ from refsite_mlip.training import (
     ValidationStepConfig,
     build_optimizer,
     compute_potential_loss,
+    run_training_epoch,
+    run_validation_epoch,
     train_step,
     validation_step,
 )
@@ -556,6 +558,118 @@ def test_actual_mixed_validation_matches_direct_loss_inside_no_grad(typed_crysta
     assert first.need_forces and first.need_stress and first.has_supervision
 
 
+def test_actual_two_batch_training_epoch_determinism_and_split_validation(typed_crystal):
+    _, model, registry, samples, batch, contexts = _case(typed_crystal)
+    clone = copy.deepcopy(model)
+    training_batches = (
+        collate_structure_samples((samples[0],), registry),
+        collate_structure_samples((samples[2],), registry),
+    )
+    first_optimizer = build_optimizer(
+        model, OptimizerConfig(learning_rate=1.0e-4, weight_decay=0.0)
+    )
+    second_optimizer = build_optimizer(
+        clone, OptimizerConfig(learning_rate=1.0e-4, weight_decay=0.0)
+    )
+    first = run_training_epoch(
+        model,
+        first_optimizer,
+        training_batches,
+        contexts,
+        LossConfig(),
+        TrainStepConfig(),
+        epoch_index=2,
+        global_step_start=5,
+    )
+    second = run_training_epoch(
+        clone,
+        second_optimizer,
+        training_batches,
+        contexts,
+        LossConfig(),
+        TrainStepConfig(),
+        epoch_index=2,
+        global_step_start=5,
+    )
+    assert first == second
+    assert first.global_step_end == 7 and first.successful_optimizer_steps == 2
+    assert first.ordered_batch_sample_ids == (("zeta-vacancy",), ("zeta-pristine",))
+    for left, right in zip(model.state_dict().values(), clone.state_dict().values()):
+        assert torch.equal(left, right)
+    for left_parameter, right_parameter in zip(model.parameters(), clone.parameters()):
+        left_state = first_optimizer.state.get(left_parameter, {})
+        right_state = second_optimizer.state.get(right_parameter, {})
+        assert left_state.keys() == right_state.keys()
+        for key in left_state:
+            if isinstance(left_state[key], torch.Tensor):
+                assert torch.equal(left_state[key], right_state[key])
+            else:
+                assert left_state[key] == right_state[key]
+
+    validation_state = {
+        key: value.clone() for key, value in model.state_dict().items()
+    }
+    validation_gradients = tuple(
+        (
+            parameter.grad,
+            None if parameter.grad is None else parameter.grad.clone(),
+        )
+        for parameter in model.parameters()
+    )
+    optimizer_steps = tuple(
+        float(state["step"])
+        for state in first_optimizer.state.values()
+        if "step" in state
+    )
+    validation_rng = torch.random.get_rng_state().clone()
+    full = run_validation_epoch(
+        model,
+        (batch,),
+        contexts,
+        LossConfig(),
+        ValidationStepConfig(),
+        epoch_index=2,
+        global_step=7,
+    )
+    full_repeat = run_validation_epoch(
+        model,
+        (batch,),
+        contexts,
+        LossConfig(),
+        ValidationStepConfig(),
+        epoch_index=2,
+        global_step=7,
+    )
+    assert full_repeat == full
+    split_batches = tuple(
+        collate_structure_samples((sample,), registry) for sample in samples
+    )
+    split = run_validation_epoch(
+        model,
+        split_batches,
+        contexts,
+        LossConfig(),
+        ValidationStepConfig(),
+        epoch_index=2,
+        global_step=7,
+    )
+    assert full.energy == split.energy and full.total_loss == split.total_loss
+    assert full.number_of_structures == split.number_of_structures == 3
+    assert split.number_of_supervised_batches == 2
+    assert torch.equal(torch.random.get_rng_state(), validation_rng)
+    for key, value in model.state_dict().items():
+        assert torch.equal(value, validation_state[key])
+    for parameter, (identity, value) in zip(model.parameters(), validation_gradients):
+        assert parameter.grad is identity
+        if value is not None:
+            assert torch.equal(parameter.grad, value)
+    assert optimizer_steps == tuple(
+        float(state["step"])
+        for state in first_optimizer.state.values()
+        if "step" in state
+    )
+
+
 def test_context_resolution_fail_fast_and_extra_context_is_allowed(typed_crystal):
     data, model, _, _, batch, contexts = _case(typed_crystal)
     with pytest.raises(KeyError, match="missing TemplateExecutionContext"):
@@ -654,3 +768,26 @@ def test_grouped_cuda_smoke_when_available(typed_crystal, dtype):
         torch.equal(after, before)
         for after, before in zip(torch.cuda.get_rng_state_all(), cuda_rng)
     )
+    validation_epoch = run_validation_epoch(
+        model,
+        (target,),
+        contexts,
+        LossConfig(energy_weight=1.0, force_weight=0.1, stress_weight=0.1),
+        ValidationStepConfig(),
+        epoch_index=0,
+        global_step=1,
+    )
+    assert validation_epoch.global_step_start == validation_epoch.global_step_end == 1
+    assert validation_epoch.has_supervision
+    training_epoch = run_training_epoch(
+        model,
+        build_optimizer(model, OptimizerConfig(learning_rate=1.0e-4, weight_decay=0.0)),
+        (batch,),
+        contexts,
+        LossConfig(),
+        TrainStepConfig(),
+        epoch_index=0,
+        global_step_start=1,
+    )
+    assert training_epoch.global_step_end == 2
+    assert training_epoch.successful_optimizer_steps == 1
