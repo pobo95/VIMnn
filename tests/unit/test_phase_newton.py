@@ -150,6 +150,13 @@ def test_evaluation_groups_stabilizer_equivalent_candidates():
     from refsite_mlip.phase.stabilizer import stabilizer_equivalent
 
     assert stabilizer_equivalent(result.refined.phase, training.phase, stabilizer)
+    assert result.input_candidate_count == 3
+    assert result.non_equivalent_group_count == 2
+    assert int(result.selected_grouped_index) == 0
+    torch.testing.assert_close(
+        result.best_raw_score - result.second_best_raw_score,
+        result.non_equivalent_gap,
+    )
 
 
 def test_evaluation_phase_candidate_switching_boundary_fails_gap():

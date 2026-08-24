@@ -65,9 +65,14 @@ def test_stress_symmetric_voigt_and_finite_difference(typed_crystal):
     torch.testing.assert_close(out.stress,0.5*(derivative+derivative.T)/torch.linalg.det(typed_crystal['cell']).abs(),atol=3e-12,rtol=3e-12)
 
 
-def test_train_eval_energy_force_stress_parity_and_state_roundtrip(typed_crystal):
-    m=_model(typed_crystal); clone=_model(typed_crystal); clone.load_state_dict(m.state_dict()); p=typed_crystal['positions'][:5].clone().requires_grad_(True); z=_numbers(typed_crystal); a=m(p,z,typed_crystal['cell'],typed_crystal['origin'],compute_forces=True,compute_stress=True); b=clone(p,z,typed_crystal['cell'],typed_crystal['origin'],solver_path=EVAL_ADAPTIVE,compute_forces=True,compute_stress=True)
-    torch.testing.assert_close(a.energy,b.energy,atol=3e-10,rtol=3e-10); torch.testing.assert_close(a.forces,b.forces,atol=3e-8,rtol=3e-8); torch.testing.assert_close(a.stress,b.stress,atol=3e-9,rtol=3e-9)
+def test_eval_adaptive_semantic_migration_is_explicit(typed_crystal):
+    """7A-2 replaces implicit fixed-phase evaluation with a bound policy."""
+
+    model=_model(typed_crystal); p=typed_crystal['positions'][:5].clone().requires_grad_(True); z=_numbers(typed_crystal)
+    with pytest.raises(ValueError,match='evaluation_policy'):
+        model(p,z,typed_crystal['cell'],typed_crystal['origin'],solver_path=EVAL_ADAPTIVE)
+    with pytest.raises(ValueError,match='energy-only'):
+        model(p,z,typed_crystal['cell'],typed_crystal['origin'],solver_path=EVAL_ADAPTIVE,compute_forces=True)
 
 
 def test_apply_fitted_atomic_baseline_preserves_model_state_contract(typed_crystal,tmp_path):
