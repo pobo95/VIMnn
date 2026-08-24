@@ -46,6 +46,13 @@ from .resume import (
     restore_training_checkpoint_,
     validate_checkpoint_compatibility,
 )
+from .resume_fit import (
+    ResumedFitExecutionError,
+    ResumedFitResult,
+    compose_resumed_fit_result,
+    run_resumed_fit,
+    validate_checkpoint_history,
+)
 from .scheduler import SchedulerConfig, build_scheduler
 from .selection import (
     ModelSelectionConfig,
@@ -89,6 +96,8 @@ __all__ = [
     "PotentialLossOutput",
     "ResumePolicy",
     "ResumeState",
+    "ResumedFitExecutionError",
+    "ResumedFitResult",
     "SchedulerConfig",
     "TrainStepConfig",
     "TrainStepResult",
@@ -113,7 +122,10 @@ __all__ = [
     "run_validation_epoch",
     "save_training_checkpoint",
     "restore_training_checkpoint_",
+    "run_resumed_fit",
     "train_step",
     "validation_step",
     "validate_checkpoint_compatibility",
+    "validate_checkpoint_history",
+    "compose_resumed_fit_result",
 ]
