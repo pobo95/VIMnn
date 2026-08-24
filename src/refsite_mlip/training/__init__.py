@@ -17,6 +17,12 @@ from .checkpoint import (
     load_training_checkpoint,
     save_training_checkpoint,
 )
+from .checkpoint_manager import (
+    CheckpointManager,
+    CheckpointManagerConfig,
+    CheckpointManagerError,
+    ManagedCheckpointResult,
+)
 from .epoch import (
     EpochMetrics,
     EpochResult,
@@ -78,6 +84,9 @@ __all__ = [
     "AtomicBaselineFit",
     "CHECKPOINT_SCHEMA_VERSION",
     "CheckpointMetadata",
+    "CheckpointManager",
+    "CheckpointManagerConfig",
+    "CheckpointManagerError",
     "CheckpointCompatibilityError",
     "CheckpointRestoreError",
     "EpochMetrics",
@@ -92,6 +101,7 @@ __all__ = [
     "LossTerm",
     "ModelSelectionConfig",
     "ModelSelectionState",
+    "ManagedCheckpointResult",
     "OptimizerConfig",
     "PotentialLossOutput",
     "ResumePolicy",
