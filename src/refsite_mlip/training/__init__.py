@@ -20,6 +20,13 @@ from .losses import (
     compute_potential_loss,
 )
 from .optimizer import OptimizerConfig, build_optimizer
+from .scheduler import SchedulerConfig, build_scheduler
+from .selection import (
+    ModelSelectionConfig,
+    ModelSelectionState,
+    ValidationDecision,
+    process_primary_validation,
+)
 from .step import (
     TrainStepConfig,
     TrainStepResult,
@@ -41,18 +48,24 @@ __all__ = [
     "EpochTermMetrics",
     "LossConfig",
     "LossTerm",
+    "ModelSelectionConfig",
+    "ModelSelectionState",
     "OptimizerConfig",
     "PotentialLossOutput",
+    "SchedulerConfig",
     "TrainStepConfig",
     "TrainStepResult",
     "TrainStepTermResult",
+    "ValidationDecision",
     "ValidationStepConfig",
     "ValidationStepResult",
     "ValidationTermResult",
     "apply_atomic_baseline_",
     "build_optimizer",
+    "build_scheduler",
     "compute_potential_loss",
     "fit_atomic_baseline",
+    "process_primary_validation",
     "run_training_epoch",
     "run_validation_epoch",
     "train_step",
