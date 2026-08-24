@@ -38,6 +38,14 @@ from .losses import (
     compute_potential_loss,
 )
 from .optimizer import OptimizerConfig, build_optimizer
+from .resume import (
+    CheckpointCompatibilityError,
+    CheckpointRestoreError,
+    ResumePolicy,
+    ResumeState,
+    restore_training_checkpoint_,
+    validate_checkpoint_compatibility,
+)
 from .scheduler import SchedulerConfig, build_scheduler
 from .selection import (
     ModelSelectionConfig,
@@ -63,6 +71,8 @@ __all__ = [
     "AtomicBaselineFit",
     "CHECKPOINT_SCHEMA_VERSION",
     "CheckpointMetadata",
+    "CheckpointCompatibilityError",
+    "CheckpointRestoreError",
     "EpochMetrics",
     "EpochResult",
     "EpochTermMetrics",
@@ -77,6 +87,8 @@ __all__ = [
     "ModelSelectionState",
     "OptimizerConfig",
     "PotentialLossOutput",
+    "ResumePolicy",
+    "ResumeState",
     "SchedulerConfig",
     "TrainStepConfig",
     "TrainStepResult",
@@ -100,6 +112,8 @@ __all__ = [
     "run_training_epoch",
     "run_validation_epoch",
     "save_training_checkpoint",
+    "restore_training_checkpoint_",
     "train_step",
     "validation_step",
+    "validate_checkpoint_compatibility",
 ]
