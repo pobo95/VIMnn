@@ -60,6 +60,13 @@ def build_ot_problem(
         raise TransportSupportError(
             "INVALID_SUPPORT_CONFIG", "support_config must be TransportSupportConfig"
         )
+    if support.backend == "edge_list":
+        raise TransportSupportError(
+            "EDGE_LIST_DENSE_PROBLEM_UNSUPPORTED",
+            "build_ot_problem creates a dense OTProblem; use build_compact_transport_edges and solve_sparse_sinkhorn_train_fixed",
+            template_id=template_id,
+            sample_id=sample_id,
+        )
     if support.kind == "compact_c2" and atom_distances is not None:
         if not bool(torch.all(torch.isfinite(atom_distances)).detach()):
             raise TransportSupportError(

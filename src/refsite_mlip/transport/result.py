@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Union
+from typing import Optional, Union, TYPE_CHECKING
 
 import torch
 
 from .support import TransportSupportDiagnostics
+
+if TYPE_CHECKING:
+    from .edge_list import CompactTransportEdges
 
 
 @dataclass(frozen=True)
@@ -61,6 +64,42 @@ class OTResult:
     accepted_damping: Optional[float] = None
     warmup_sinkhorn_iterations: int = 0
     fallback_sinkhorn_iterations: int = 0
+
+
+@dataclass(frozen=True)
+class SparseOTResult:
+    """Fixed compact transport retained in canonical candidate-edge form."""
+
+    edges: "CompactTransportEdges"
+    edge_plan: torch.Tensor
+    q: torch.Tensor
+    f: torch.Tensor
+    g: torch.Tensor
+    row_residual: torch.Tensor
+    column_residual: torch.Tensor
+    converged: Union[bool, torch.Tensor]
+    sinkhorn_iterations: int
+    solver_name: str = "edge_list_sinkhorn"
+    path_name: str = "train_fixed"
+    support_diagnostics: TransportSupportDiagnostics | None = None
+    effective_diagnostic_tolerance: float | None = None
+    dense_plan_materialized: bool = False
+    newton_iterations: int = 0
+    cg_iterations: int = 0
+    line_search_reductions: int = 0
+    fallback_used: bool = False
+    failure_reason: Optional[str] = None
+    accepted_damping: Optional[float] = None
+    warmup_sinkhorn_iterations: int = 0
+    fallback_sinkhorn_iterations: int = 0
+
+
+@dataclass(frozen=True)
+class DensePlanMaterialization:
+    """Explicit record proving that sparse transport was densified on request."""
+
+    plan: torch.Tensor
+    densification_performed: bool = True
 
 
 @dataclass(frozen=True)

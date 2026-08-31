@@ -76,6 +76,18 @@ def solve_atom_vacancy_ot(
         raise TransportSupportError(
             "INVALID_SUPPORT_CONFIG", "support_config must be TransportSupportConfig"
         )
+    if support.backend == "edge_list":
+        reason = (
+            "EDGE_LIST_EVAL_ADAPTIVE_UNSUPPORTED"
+            if path == EVAL_ADAPTIVE
+            else "EDGE_LIST_REQUIRES_DISPLACEMENTS"
+        )
+        raise TransportSupportError(
+            reason,
+            "solve_atom_vacancy_ot is the dense backend; edge-list TRAIN_FIXED requires live displacement vectors via build_compact_transport_edges",
+            template_id=template_id,
+            sample_id=sample_id,
+        )
     problem = build_ot_problem(
         atom_cost,
         epsilon_ot,

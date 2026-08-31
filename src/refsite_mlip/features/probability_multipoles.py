@@ -18,6 +18,11 @@ from .result import (
 from .solid_harmonics import harmonic_slice, regular_solid_harmonics
 from .species import species_probabilities
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from refsite_mlip.transport.edge_list import CompactTransportEdges
+
 
 def effective_probability_validation_tolerances(
     P: torch.Tensor,
@@ -51,6 +56,40 @@ def effective_probability_validation_tolerances(
     local = max(base, local_depth * epsilon)
     count = max(base, global_reduction_depth * epsilon)
     return {"simplex": local, "species_count": count, "vacancy_mass": local}
+
+
+def _effective_sparse_tolerances(
+    *,
+    sites: int,
+    atoms: int,
+    dtype: torch.dtype,
+    configured_tolerance: float | None,
+) -> dict[str, float]:
+    if configured_tolerance is not None:
+        value = float(configured_tolerance)
+        return {"simplex": value, "species_count": value, "vacancy_mass": value}
+    if dtype == torch.float64:
+        return {"simplex": 1.0e-7, "species_count": 1.0e-7, "vacancy_mass": 1.0e-7}
+    if dtype != torch.float32:
+        raise ValueError("probability validation supports float32 and float64")
+    epsilon = torch.finfo(dtype).eps
+    local_depth = math.ceil(math.log2(max(atoms, 2))) + 3
+    global_depth = (
+        math.ceil(math.log2(max(atoms, 2)))
+        + math.ceil(math.log2(max(sites, 2)))
+        + 2
+    )
+    # Each atom column is independently normalized in the sparse segmented
+    # solve.  A species-count invariant subsequently sums as many as N signed
+    # column residuals, so its worst-case roundoff contains a linear N*eps
+    # term in addition to the pairwise feature-reduction depth.  Local site and
+    # atom invariants retain the stricter depth-only bound below.
+    species_count_depth = atoms + global_depth
+    return {
+        "simplex": max(1.0e-7, local_depth * epsilon),
+        "species_count": max(1.0e-7, species_count_depth * epsilon),
+        "vacancy_mass": max(1.0e-7, local_depth * epsilon),
+    }
 
 
 def _validate_inputs(
@@ -233,4 +272,151 @@ def build_probability_multipoles(
         site_types=site_types,
         site_type_vocabulary=config.site_type_vocabulary,
         config_metadata=config.to_dict(),
+    )
+
+
+def _site_segment_sum(
+    values: torch.Tensor, site_index: torch.Tensor, num_sites: int
+) -> torch.Tensor:
+    output = values.new_zeros((num_sites,) + values.shape[1:])
+    return output.index_add(0, site_index, values)
+
+
+def build_sparse_probability_multipoles(
+    edge_plan: torch.Tensor,
+    q: torch.Tensor,
+    edges: "CompactTransportEdges",
+    atomic_numbers: torch.Tensor,
+    config: ProbabilityMultipoleConfig,
+    site_types: Optional[torch.Tensor] = None,
+) -> ProbabilityMultipoleResult:
+    """Build probability features directly from candidate-edge transport mass."""
+
+    from refsite_mlip.transport.edge_list import CompactTransportEdges
+    from .species import species_indicator
+
+    config.validate()
+    if not isinstance(edges, CompactTransportEdges):
+        raise TypeError("edges must be CompactTransportEdges")
+    if edge_plan.shape != (edges.num_candidate_edges,):
+        raise ValueError("edge_plan must have one value per candidate edge")
+    if q.shape != (edges.num_sites,):
+        raise ValueError("q must have shape [M]")
+    if atomic_numbers.shape != (edges.num_atoms,) or atomic_numbers.dtype != torch.long:
+        raise ValueError("atomic_numbers must be long with shape [N]")
+    for value in (edge_plan, q, edges.displacements):
+        if value.dtype not in (torch.float32, torch.float64):
+            raise ValueError("sparse feature floating inputs must use float32 or float64")
+        if value.dtype != edge_plan.dtype or value.device != edge_plan.device:
+            raise ValueError("sparse feature tensors must share dtype/device")
+        if not bool(torch.all(torch.isfinite(value))):
+            raise ValueError("sparse feature input contains NaN or Inf")
+    if atomic_numbers.device != edge_plan.device:
+        raise ValueError("atomic_numbers must share edge_plan device")
+    if bool(torch.any(edge_plan < 0.0)) or bool(torch.any(q < 0.0)) or bool(
+        torch.any(q > 1.0)
+    ):
+        raise ValueError("edge_plan and q must satisfy probability bounds")
+    if site_types is not None:
+        if site_types.shape != (edges.num_sites,) or site_types.dtype != torch.long:
+            raise ValueError("site_types must be long with shape [M]")
+        if site_types.device != edge_plan.device:
+            raise ValueError("site_types must share edge_plan device")
+        if config.site_type_vocabulary is None:
+            raise ValueError("site_types require a fixed site_type_vocabulary")
+        vocabulary = torch.tensor(
+            config.site_type_vocabulary, dtype=torch.long, device=edge_plan.device
+        )
+        if bool(torch.any((site_types[:, None] == vocabulary[None, :]).sum(-1) != 1)):
+            raise ValueError("unknown reference-site type")
+
+    indicator = species_indicator(
+        atomic_numbers, config.species_vocabulary, dtype=edge_plan.dtype
+    )
+    edge_indicator = indicator[edges.atom_index]
+    probabilities = _site_segment_sum(
+        edge_plan[:, None] * edge_indicator, edges.site_index, edges.num_sites
+    )
+    tolerances = _effective_sparse_tolerances(
+        sites=edges.num_sites,
+        atoms=edges.num_atoms,
+        dtype=edge_plan.dtype,
+        configured_tolerance=config.probability_tolerance,
+    )
+    validation_dtype = torch.float64 if edge_plan.dtype == torch.float32 else edge_plan.dtype
+    validation_plan = edge_plan.to(validation_dtype)
+    validation_q = q.to(validation_dtype)
+    validation_indicator = edge_indicator.to(validation_dtype)
+    validation_probabilities = _site_segment_sum(
+        validation_plan[:, None] * validation_indicator,
+        edges.site_index,
+        edges.num_sites,
+    )
+    simplex_error = (validation_probabilities.sum(1) + validation_q - 1.0).abs().max()
+    count_error = (
+        validation_probabilities.sum(0)
+        - indicator.to(validation_dtype).sum(0)
+    ).abs().max()
+    vacancy_error = (validation_q.sum() - float(edges.num_vacancies)).abs()
+    ordered = validation_plan[edges.atom_major_permutation]
+    atom_pointer = edges.atom_ptr.detach().cpu().tolist()
+    atom_mass = (
+        torch.stack(
+            [ordered[int(a) : int(b)].sum() for a, b in zip(atom_pointer[:-1], atom_pointer[1:])]
+        )
+        if edges.num_atoms
+        else validation_plan.new_empty((0,))
+    )
+    atom_error = (
+        (atom_mass - 1.0).abs().max()
+        if edges.num_atoms
+        else validation_plan.new_zeros(())
+    )
+    if (
+        bool(simplex_error > tolerances["simplex"])
+        or bool(count_error > tolerances["species_count"])
+        or bool(vacancy_error > tolerances["vacancy_mass"])
+        or bool(atom_error > tolerances["simplex"])
+    ):
+        raise ValueError("edge_plan/q do not satisfy the balanced probability-field contract")
+
+    y = edges.displacements / edges.displacements.new_tensor(config.ell_feature)
+    xi = torch.sum(y * y, dim=-1)
+    radial = compact_radial_basis(
+        xi,
+        n_radial=config.n_radial,
+        ell_feature=config.ell_feature,
+        r_cut=config.r_cut,
+    )
+    harmonics, _ = regular_solid_harmonics(y, config.lmax)
+    blocks = [probabilities]
+    for l in range(config.lmax + 1):
+        values = harmonics[..., harmonic_slice(l)]
+        edge_values = (
+            edge_plan[:, None, None, None]
+            * edge_indicator[:, :, None, None]
+            * radial[:, None, :, None]
+            * values[:, None, None, :]
+        )
+        multipoles = _site_segment_sum(
+            edge_values, edges.site_index, edges.num_sites
+        )
+        blocks.append(multipoles.reshape(edges.num_sites, -1))
+    equivariant = torch.cat(blocks, dim=1)
+    irreps_out, metadata = _layout(config)
+    raw_state = torch.cat((probabilities, q.unsqueeze(-1)), dim=1)
+    metadata_config = config.to_dict()
+    metadata_config["transport_representation"] = "edge_list"
+    metadata_config["effective_probability_validation_tolerances"] = tolerances
+    return ProbabilityMultipoleResult(
+        species_probabilities=probabilities,
+        vacancy_probabilities=q,
+        raw_probability_state=raw_state,
+        equivariant_features=equivariant,
+        irreps_out=irreps_out,
+        channel_metadata=metadata,
+        species_vocabulary=config.species_vocabulary,
+        site_types=site_types,
+        site_type_vocabulary=config.site_type_vocabulary,
+        config_metadata=metadata_config,
     )

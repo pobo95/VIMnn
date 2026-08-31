@@ -2,6 +2,7 @@
 
 from .probability_multipoles import (
     build_probability_multipoles,
+    build_sparse_probability_multipoles,
     effective_probability_validation_tolerances,
 )
 from .radial import RADIAL_BASIS_VERSION, c2_envelope, compact_radial_basis
@@ -20,6 +21,7 @@ __all__ = [
     "ProbabilityMultipoleConfig",
     "ProbabilityMultipoleResult",
     "build_probability_multipoles",
+    "build_sparse_probability_multipoles",
     "effective_probability_validation_tolerances",
     "c2_envelope",
     "compact_radial_basis",

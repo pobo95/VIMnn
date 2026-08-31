@@ -59,11 +59,21 @@ class TransportSupportConfig:
     switch_width: float = 0.5
     candidate_skin: float = 0.2
     convention_version: str = TRANSPORT_SUPPORT_CONVENTION_VERSION
+    backend: str = "dense"
 
     def __post_init__(self) -> None:
         if self.kind not in ("dense", "compact_c2"):
             raise TransportSupportError(
                 "INVALID_SUPPORT_CONFIG", "kind must be dense or compact_c2"
+            )
+        if self.backend not in ("dense", "edge_list"):
+            raise TransportSupportError(
+                "INVALID_SUPPORT_CONFIG", "backend must be dense or edge_list"
+            )
+        if self.backend == "edge_list" and self.kind != "compact_c2":
+            raise TransportSupportError(
+                "INVALID_SUPPORT_CONFIG",
+                "edge_list backend is supported only for compact_c2 transport",
             )
         cutoff = _finite_real(self.cutoff, "cutoff", positive=True)
         width = _finite_real(self.switch_width, "switch_width", positive=True)
@@ -98,6 +108,7 @@ class TransportSupportConfig:
             "cutoff": self.cutoff,
             "switch_width": self.switch_width,
             "candidate_skin": self.candidate_skin,
+            "backend": self.backend,
             "convention_version": self.convention_version,
         }
 
@@ -113,6 +124,7 @@ class TransportSupportConfig:
 @dataclass(frozen=True)
 class TransportSupportDiagnostics:
     kind: str
+    backend: str
     template_id: str | None
     sample_id: str | None
     candidate_edge_count: int
@@ -144,6 +156,7 @@ class TransportSupportDiagnostics:
     def to_dict(self) -> dict[str, Any]:
         return {
             "kind": self.kind,
+            "backend": self.backend,
             "template_id": self.template_id,
             "sample_id": self.sample_id,
             "candidate_edge_count": self.candidate_edge_count,
@@ -394,6 +407,7 @@ def validate_compact_support(
         maximum_switch = 0.0
     diagnostics = TransportSupportDiagnostics(
         kind=config.kind,
+        backend=config.backend,
         template_id=template_id,
         sample_id=sample_id,
         candidate_edge_count=int(candidate.detach().sum().cpu()),

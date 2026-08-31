@@ -4,7 +4,7 @@ import math
 import torch
 from torch import nn
 from refsite_mlip.compatibility import import_e3nn_0_4_4
-from refsite_mlip.features import build_probability_multipoles
+from refsite_mlip.features import build_probability_multipoles,build_sparse_probability_multipoles
 from refsite_mlip.geometry.reference import aligned_reference_sites
 from refsite_mlip.graph import update_reference_edge_geometry
 from refsite_mlip.interactions import CentralConditioner,EquivariantNodeEncoder,squared_edge_radial_basis
@@ -20,7 +20,7 @@ from refsite_mlip.phase.newton import solve_training_phase
 from refsite_mlip.phase.objective import typed_reciprocal_fields
 from refsite_mlip.phase.stabilizer import validate_alias_matches_stabilizer
 from refsite_mlip.phase.types import EvaluationPhaseError
-from refsite_mlip.transport import TRAIN_FIXED,EVAL_ADAPTIVE,TrainSinkhornConfig,EvalOTConfig,atom_site_displacements,solve_atom_vacancy_ot
+from refsite_mlip.transport import TRAIN_FIXED,EVAL_ADAPTIVE,TrainSinkhornConfig,EvalOTConfig,TransportSupportError,atom_site_displacements,build_compact_transport_edges,solve_atom_vacancy_ot,solve_sparse_sinkhorn_train_fixed
 from .config import PotentialConfig
 from .evaluation_policy import EvaluationPolicy
 from .outputs import EvaluationDiagnostics, PotentialOutput
@@ -355,6 +355,15 @@ class ReferenceSitePotential(nn.Module):
                 raise TypeError("evaluation_policy must be an EvaluationPolicy")
         else:
             raise ValueError("unsupported solver path")
+        if (
+            self.config.transport_support.backend == "edge_list"
+            and solver_path == EVAL_ADAPTIVE
+        ):
+            raise TransportSupportError(
+                "EDGE_LIST_EVAL_ADAPTIVE_UNSUPPORTED",
+                "edge_list compact transport currently supports TRAIN_FIXED only; use backend=dense for EVAL_ADAPTIVE",
+                template_id=getattr(template_context, "template_id", None),
+            )
         runtime = None
         if template_context is None:
             topology=self.topology.to(device=positions.device,dtype=positions.dtype); phase_modes=self.phase_modes; phase_mode_weights=self.phase_mode_weights.to(positions); site_alignment_weights=self.site_alignment_weights.to(positions); phase_channel_weights=self.phase_channel_weights.to(positions)
@@ -408,8 +417,25 @@ class ReferenceSitePotential(nn.Module):
                 "selected refined phase is detached from the input geometry",
                 template_id=runtime.template_id,
             )
-        references=aligned_reference_sites(topology.reference_fractional,phase,origin,cell); displacements=atom_site_displacements(positions,references,cell,topology.pbc); cost=displacements.square().sum(-1)/(2*self.config.ell_ot**2)
-        if solver_path==TRAIN_FIXED:
+        references=aligned_reference_sites(topology.reference_fractional,phase,origin,cell); displacements=atom_site_displacements(positions,references,cell,topology.pbc)
+        edge_backend=(
+            self.config.transport_support.kind == "compact_c2"
+            and self.config.transport_support.backend == "edge_list"
+        )
+        if edge_backend:
+            edges=build_compact_transport_edges(
+                displacements,
+                epsilon_ot=self.config.epsilon_ot,
+                ell_ot=self.config.ell_ot,
+                config=self.config.transport_support,
+                template_id=getattr(runtime, "template_id", None),
+            )
+            ot=solve_sparse_sinkhorn_train_fixed(
+                edges,TrainSinkhornConfig(self.config.train_sinkhorn_iterations)
+            )
+        else:
+            cost=displacements.square().sum(-1)/(2*self.config.ell_ot**2)
+        if solver_path==TRAIN_FIXED and not edge_backend:
             distances = (
                 torch.linalg.vector_norm(displacements, dim=-1)
                 if self.config.transport_support.kind == "compact_c2"
@@ -422,7 +448,7 @@ class ReferenceSitePotential(nn.Module):
                 atom_distances=distances,
                 template_id=getattr(runtime, "template_id", None),
             )
-        else:
+        elif solver_path==EVAL_ADAPTIVE:
             evaluation_ot_tolerance = (
                 1.0e-6 if cost.dtype == torch.float32 else 1.0e-12
             )
@@ -460,7 +486,12 @@ class ReferenceSitePotential(nn.Module):
                     "adaptive transport P or q is detached from the selected geometry branch",
                     template_id=runtime.template_id,
                 )
-        features=build_probability_multipoles(ot.P,ot.q,atomic_numbers,displacements,self.config.feature,topology.site_types)
+        if edge_backend:
+            features=build_sparse_probability_multipoles(
+                ot.edge_plan,ot.q,ot.edges,atomic_numbers,self.config.feature,topology.site_types
+            )
+        else:
+            features=build_probability_multipoles(ot.P,ot.q,atomic_numbers,displacements,self.config.feature,topology.site_types)
         c_raw=features.raw_probability_state; c_bar=self.central(c_raw,topology.site_types); h=self.probability_encoder(features.equivariant_features)+self.central_encoder(c_bar)
         geometry=update_reference_edge_geometry(topology,cell,edge_length_scale=self.config.higher_body.edge_length_scale); radial=squared_edge_radial_basis(geometry.radial_coordinate,self.config.higher_body.radial_feature_dim)
         correlations=[]

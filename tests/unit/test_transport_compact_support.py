@@ -49,6 +49,7 @@ def test_support_config_validation_canonical_round_trip_and_dense_default():
         "cutoff",
         "switch_width",
         "candidate_skin",
+        "backend",
         "convention_version",
     )
     for kwargs in (
