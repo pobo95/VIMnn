@@ -129,6 +129,7 @@ class TransportSupportDiagnostics:
     total_matching_size: int
     total_support_feasible: bool
     cutoff_boundary_gap: float
+    switch_on_boundary_gap: float
     candidate_boundary_gap: float
     active_dense_ratio: float
     candidate_dense_ratio: float
@@ -159,6 +160,7 @@ class TransportSupportDiagnostics:
             "total_matching_size": self.total_matching_size,
             "total_support_feasible": self.total_support_feasible,
             "cutoff_boundary_gap": self.cutoff_boundary_gap,
+            "switch_on_boundary_gap": self.switch_on_boundary_gap,
             "candidate_boundary_gap": self.candidate_boundary_gap,
             "active_dense_ratio": self.active_dense_ratio,
             "candidate_dense_ratio": self.candidate_dense_ratio,
@@ -376,6 +378,9 @@ def validate_compact_support(
         cutoff_gap = float(
             torch.min(torch.abs(distances.detach() - config.cutoff)).cpu()
         )
+        switch_on_gap = float(
+            torch.min(torch.abs(distances.detach() - config.r_on)).cpu()
+        )
         candidate_gap = float(
             torch.min(torch.abs(distances.detach() - config.r_candidate)).cpu()
         )
@@ -383,6 +388,7 @@ def validate_compact_support(
         maximum_switch = float(switch.detach().max().cpu())
     else:
         cutoff_gap = math.inf
+        switch_on_gap = math.inf
         candidate_gap = math.inf
         minimum_switch = 0.0
         maximum_switch = 0.0
@@ -412,6 +418,7 @@ def validate_compact_support(
         total_matching_size=total_matching,
         total_support_feasible=True,
         cutoff_boundary_gap=cutoff_gap,
+        switch_on_boundary_gap=switch_on_gap,
         candidate_boundary_gap=candidate_gap,
         active_dense_ratio=(float(active_cpu.sum()) / dense_edges if dense_edges else 0.0),
         candidate_dense_ratio=(

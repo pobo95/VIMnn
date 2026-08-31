@@ -49,6 +49,7 @@ class EvaluationDiagnostics:
     transport_candidate_edge_count: int | None
     transport_maximum_matching_size: int | None
     transport_total_support_feasible: bool | None
+    transport_switch_on_boundary_gap: float | None
     transport_cutoff_boundary_gap: float | None
     transport_candidate_boundary_gap: float | None
     transport_line_search_reductions: int

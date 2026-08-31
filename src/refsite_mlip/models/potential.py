@@ -295,6 +295,9 @@ class ReferenceSitePotential(nn.Module):
             transport_total_support_feasible=(
                 support.total_support_feasible if support is not None else None
             ),
+            transport_switch_on_boundary_gap=(
+                support.switch_on_boundary_gap if support is not None else None
+            ),
             transport_cutoff_boundary_gap=(
                 support.cutoff_boundary_gap if support is not None else None
             ),
@@ -434,7 +437,7 @@ class ReferenceSitePotential(nn.Module):
                 EVAL_ADAPTIVE,
                 "hybrid",
                 EvalOTConfig(
-                    sinkhorn_iterations=16,
+                    sinkhorn_iterations=self.config.eval_sinkhorn_warmup_iterations,
                     convergence_tolerance=evaluation_ot_tolerance,
                 ),
                 support_config=self.config.transport_support,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Optional
 
 import torch
@@ -16,6 +17,40 @@ from .result import (
 )
 from .solid_harmonics import harmonic_slice, regular_solid_harmonics
 from .species import species_probabilities
+
+
+def effective_probability_validation_tolerances(
+    P: torch.Tensor,
+    configured_tolerance: float | None,
+) -> dict[str, float]:
+    """Return validation-only roundoff limits without changing feature arithmetic.
+
+    An explicitly configured tolerance is authoritative.  The automatic float64
+    contract remains 1e-7.  For float32, the bound follows the pairwise reduction
+    depth of the atom and site reductions, plus final additions.  Solver
+    residuals, non-finiteness, and the actual P/q/features are never altered by
+    this helper.
+    """
+
+    if configured_tolerance is not None:
+        value = float(configured_tolerance)
+        return {"simplex": value, "species_count": value, "vacancy_mass": value}
+    base = 1.0e-7
+    if P.dtype == torch.float64:
+        return {"simplex": base, "species_count": base, "vacancy_mass": base}
+    if P.dtype != torch.float32:
+        raise ValueError("probability validation supports float32 and float64")
+    sites, atoms = P.shape
+    global_reduction_depth = (
+        math.ceil(math.log2(max(atoms, 2)))
+        + math.ceil(math.log2(max(sites, 2)))
+        + 2
+    )
+    epsilon = torch.finfo(P.dtype).eps
+    local_depth = math.ceil(math.log2(max(atoms, 2))) + 3
+    local = max(base, local_depth * epsilon)
+    count = max(base, global_reduction_depth * epsilon)
+    return {"simplex": local, "species_count": count, "vacancy_mass": local}
 
 
 def _validate_inputs(
@@ -131,15 +166,33 @@ def build_probability_multipoles(
     probabilities, indicator = species_probabilities(
         P, atomic_numbers, config.species_vocabulary
     )
-    tolerance = config.probability_tolerance
-    simplex_error = (probabilities.sum(dim=1) + q - 1.0).abs().max()
-    expected_counts = indicator.sum(dim=0)
-    count_error = (probabilities.sum(dim=0) - expected_counts).abs().max()
-    vacancy_error = (q.sum() - float(P.shape[0] - P.shape[1])).abs()
+    tolerances = effective_probability_validation_tolerances(
+        P, config.probability_tolerance
+    )
+    # Validation reductions use float64 for float32 inputs, while the returned
+    # probability/features retain the requested dtype and exact arithmetic.
+    # This separates stored-plan error from an avoidable second reduction error.
+    validation_dtype = torch.float64 if P.dtype == torch.float32 else P.dtype
+    validation_P = P.to(validation_dtype)
+    validation_q = q.to(validation_dtype)
+    validation_indicator = indicator.to(validation_dtype)
+    validation_probabilities = validation_P @ validation_indicator
+    simplex_error = (
+        validation_probabilities.sum(dim=1) + validation_q - 1.0
+    ).abs().max()
+    expected_counts = validation_indicator.sum(dim=0)
+    count_error = (
+        validation_probabilities.sum(dim=0) - expected_counts
+    ).abs().max()
+    vacancy_error = (
+        validation_q.sum() - float(P.shape[0] - P.shape[1])
+    ).abs()
+    atom_column_error = (validation_P.sum(dim=0) - 1.0).abs().max()
     if (
-        bool(simplex_error > tolerance)
-        or bool(count_error > tolerance)
-        or bool(vacancy_error > tolerance)
+        bool(simplex_error > tolerances["simplex"])
+        or bool(count_error > tolerances["species_count"])
+        or bool(vacancy_error > tolerances["vacancy_mass"])
+        or bool(atom_column_error > tolerances["simplex"])
     ):
         raise ValueError(
             "P/q do not satisfy the balanced probability-field contract"

@@ -86,6 +86,42 @@ def _compact_clone(model):
     return compact
 
 
+def _with_eval_warmup(model, iterations):
+    configured = ReferenceSitePotential(
+        replace(model.config, eval_sinkhorn_warmup_iterations=iterations),
+        model.topology,
+        model.phase_modes,
+        model.phase_mode_weights,
+        model.species_alignment_weights,
+        model.site_alignment_weights,
+        model.phase_channel_weights,
+        model.atomic_baseline,
+    ).to(model.atomic_baseline)
+    configured.load_state_dict(model.state_dict(), strict=True)
+    return configured
+
+
+def test_evaluation_sinkhorn_warmup_is_explicit_config_opt_in(typed_crystal):
+    base = _compact_clone(_model(typed_crystal))
+    model = _with_eval_warmup(base, 32)
+    template = make_template(typed_crystal, template_id="compact-warmup-opt-in")
+    output = model(
+        typed_crystal["positions"][:5],
+        _numbers(typed_crystal),
+        typed_crystal["cell"],
+        typed_crystal["origin"],
+        solver_path=EVAL_ADAPTIVE,
+        template_context=make_context(template),
+        evaluation_policy=_policy(template),
+        return_aux=True,
+    )
+    diagnostics = output.auxiliary["evaluation_diagnostics"]
+    assert diagnostics.transport_sinkhorn_warmup_iterations == 32
+    assert model.config.eval_sinkhorn_warmup_iterations == 32
+    assert PotentialConfig.from_dict(model.config.to_dict()) == model.config
+    assert set(model.state_dict()) == set(base.state_dict())
+
+
 def _adaptive_energy(model, data, context, policy, positions, *, cell=None, origin=None):
     return model(
         positions,

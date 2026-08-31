@@ -1,5 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
+from numbers import Integral
 from typing import Any, Mapping
 from refsite_mlip.features import ProbabilityMultipoleConfig
 from refsite_mlip.interactions import HigherBodyConfig
@@ -19,6 +20,7 @@ class PotentialConfig:
     phase_steps:tuple[float,...]=(.7,.8,.9,1.)
     phase_damping:tuple[float,...]=(2.,1.,.5,.2)
     transport_support:TransportSupportConfig=field(default_factory=TransportSupportConfig)
+    eval_sinkhorn_warmup_iterations:int=16
     def validate(self):
         if self.num_layers<=0: raise ValueError('num_layers must be positive')
         if self.feature.species_vocabulary!=self.species_vocabulary: raise ValueError('feature species mismatch')
@@ -26,6 +28,7 @@ class PotentialConfig:
         if self.higher_body.irreps_feature!=str(self.feature_irreps): raise ValueError('higher-body feature irreps mismatch')
         if self.readout_hidden<=0 or self.energy_scale<=0: raise ValueError('readout/energy scale must be positive')
         if not isinstance(self.transport_support,TransportSupportConfig): raise TypeError('transport_support must be TransportSupportConfig')
+        if isinstance(self.eval_sinkhorn_warmup_iterations,bool) or not isinstance(self.eval_sinkhorn_warmup_iterations,Integral) or self.eval_sinkhorn_warmup_iterations<0: raise ValueError('eval_sinkhorn_warmup_iterations must be a nonnegative integer')
     def to_dict(self)->dict[str,Any]:
         self.validate()
         return {
@@ -41,6 +44,7 @@ class PotentialConfig:
             'phase_steps':list(self.phase_steps),
             'phase_damping':list(self.phase_damping),
             'transport_support':self.transport_support.to_dict(),
+            'eval_sinkhorn_warmup_iterations':self.eval_sinkhorn_warmup_iterations,
         }
     @classmethod
     def from_dict(cls,values:Mapping[str,Any])->'PotentialConfig':

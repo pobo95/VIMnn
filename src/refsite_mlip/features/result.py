@@ -22,7 +22,7 @@ class ProbabilityMultipoleConfig:
     lmax: int = 2
     ell_feature: float = 1.0
     r_cut: float = 3.0
-    probability_tolerance: float = 1.0e-7
+    probability_tolerance: Optional[float] = None
     site_type_vocabulary: Optional[tuple[int, ...]] = None
     feature_layout_version: str = FEATURE_LAYOUT_VERSION
     radial_basis_version: str = RADIAL_BASIS_VERSION
@@ -53,7 +53,6 @@ class ProbabilityMultipoleConfig:
         for name, value in (
             ("ell_feature", self.ell_feature),
             ("r_cut", self.r_cut),
-            ("probability_tolerance", self.probability_tolerance),
         ):
             if (
                 isinstance(value, bool)
@@ -62,6 +61,17 @@ class ProbabilityMultipoleConfig:
                 or float(value) <= 0.0
             ):
                 raise ValueError(f"{name} must be finite and positive")
+        if self.probability_tolerance is not None:
+            value = self.probability_tolerance
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, Real)
+                or not math.isfinite(float(value))
+                or float(value) <= 0.0
+            ):
+                raise ValueError(
+                    "probability_tolerance must be None or finite and positive"
+                )
         if self.site_type_vocabulary is not None and (
             len(set(self.site_type_vocabulary))
             != len(self.site_type_vocabulary)
