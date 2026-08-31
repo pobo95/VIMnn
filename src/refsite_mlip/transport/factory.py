@@ -20,15 +20,26 @@ from .sinkhorn import (
     solve_sinkhorn_eval_adaptive,
     solve_sinkhorn_train_fixed,
 )
+from .support import TransportSupportConfig, TransportSupportError
 
 
 TRAIN_FIXED = "train_fixed"
 EVAL_ADAPTIVE = "eval_adaptive"
 
 
-def _analytic_empty_atom_result(problem, path: str) -> OTResult:
+def _analytic_empty_atom_result(problem, path: str, config) -> OTResult:
     f = torch.zeros_like(problem.row_marginal)
     g = torch.zeros_like(problem.column_marginal)
+    effective_tolerance = None
+    if path == TRAIN_FIXED and isinstance(config, TrainSinkhornConfig):
+        effective_tolerance = (
+            1.0e-6
+            if config.diagnostic_tolerance is None
+            and problem.cost.dtype == torch.float32
+            else 1.0e-7
+            if config.diagnostic_tolerance is None
+            else float(config.diagnostic_tolerance)
+        )
     return build_result(
         problem,
         f,
@@ -41,6 +52,7 @@ def _analytic_empty_atom_result(problem, path: str) -> OTResult:
         fallback_used=False,
         solver_name="analytic_empty_atoms",
         path_name=path,
+        effective_diagnostic_tolerance=effective_tolerance,
     )
 
 
@@ -51,12 +63,36 @@ def solve_atom_vacancy_ot(
     solver: str,
     config: Union[TrainSinkhornConfig, EvalOTConfig],
     init_duals: Optional[DualVariables] = None,
+    *,
+    support_config: TransportSupportConfig | None = None,
+    atom_distances: torch.Tensor | None = None,
+    template_id: str | None = None,
+    sample_id: str | None = None,
 ) -> OTResult:
-    problem = build_ot_problem(atom_cost, epsilon_ot)
     if path not in (TRAIN_FIXED, EVAL_ADAPTIVE):
         raise ValueError("path must be train_fixed or eval_adaptive")
+    support = TransportSupportConfig() if support_config is None else support_config
+    if not isinstance(support, TransportSupportConfig):
+        raise TransportSupportError(
+            "INVALID_SUPPORT_CONFIG", "support_config must be TransportSupportConfig"
+        )
+    if path == EVAL_ADAPTIVE and support.kind != "dense":
+        raise TransportSupportError(
+            "COMPACT_EVAL_ADAPTIVE_UNSUPPORTED",
+            "compact_c2 currently supports TRAIN_FIXED only",
+            template_id=template_id,
+            sample_id=sample_id,
+        )
+    problem = build_ot_problem(
+        atom_cost,
+        epsilon_ot,
+        support_config=support,
+        atom_distances=atom_distances,
+        template_id=template_id,
+        sample_id=sample_id,
+    )
     if problem.num_atoms == 0:
-        return _analytic_empty_atom_result(problem, path)
+        return _analytic_empty_atom_result(problem, path, config)
 
     if path == TRAIN_FIXED:
         if solver != "sinkhorn":

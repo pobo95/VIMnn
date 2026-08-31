@@ -7,6 +7,8 @@ from typing import Optional, Union
 
 import torch
 
+from .support import TransportSupportDiagnostics
+
 
 @dataclass(frozen=True)
 class DualVariables:
@@ -17,7 +19,7 @@ class DualVariables:
 @dataclass(frozen=True)
 class TrainSinkhornConfig:
     iterations: int = 256
-    diagnostic_tolerance: float = 1.0e-7
+    diagnostic_tolerance: float | None = None
 
 
 @dataclass(frozen=True)
@@ -54,6 +56,8 @@ class OTResult:
     path_name: str
     final_linear_residual: Optional[torch.Tensor] = None
     failure_reason: Optional[str] = None
+    support_diagnostics: TransportSupportDiagnostics | None = None
+    effective_diagnostic_tolerance: float | None = None
 
 
 @dataclass(frozen=True)

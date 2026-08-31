@@ -11,6 +11,13 @@ from .problem import OTProblem
 def transport_plan(
     problem: OTProblem, f: torch.Tensor, g: torch.Tensor
 ) -> torch.Tensor:
+    if problem.log_kernel is not None:
+        log_gamma = (
+            f.unsqueeze(-1) / problem.epsilon
+            + g.unsqueeze(-2) / problem.epsilon
+            + problem.log_kernel
+        )
+        return torch.exp(log_gamma)
     log_gamma = (
         f.unsqueeze(-1) + g.unsqueeze(-2) - problem.cost
     ) / problem.epsilon

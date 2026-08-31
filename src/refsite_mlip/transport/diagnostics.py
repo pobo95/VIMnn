@@ -25,10 +25,16 @@ def build_result(
     path_name: str,
     final_linear_residual=None,
     failure_reason=None,
+    effective_diagnostic_tolerance=None,
 ) -> OTResult:
     gamma = transport_plan(problem, f, g)
     row, column = marginal_residuals(problem, gamma)
     P, q = split_atom_vacancy_plan(problem, gamma)
+    support_diagnostics = problem.support_diagnostics
+    if support_diagnostics is not None and effective_diagnostic_tolerance is not None:
+        support_diagnostics = support_diagnostics.with_effective_tolerance(
+            effective_diagnostic_tolerance
+        )
     return OTResult(
         gamma=gamma,
         P=P,
@@ -47,6 +53,8 @@ def build_result(
         path_name=path_name,
         final_linear_residual=final_linear_residual,
         failure_reason=failure_reason,
+        support_diagnostics=support_diagnostics,
+        effective_diagnostic_tolerance=effective_diagnostic_tolerance,
     )
 
 

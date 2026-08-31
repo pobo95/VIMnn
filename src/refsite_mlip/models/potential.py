@@ -20,7 +20,7 @@ from refsite_mlip.phase.newton import solve_training_phase
 from refsite_mlip.phase.objective import typed_reciprocal_fields
 from refsite_mlip.phase.stabilizer import validate_alias_matches_stabilizer
 from refsite_mlip.phase.types import EvaluationPhaseError
-from refsite_mlip.transport import TRAIN_FIXED,EVAL_ADAPTIVE,TrainSinkhornConfig,EvalOTConfig,atom_site_displacements,solve_atom_vacancy_ot
+from refsite_mlip.transport import TRAIN_FIXED,EVAL_ADAPTIVE,TrainSinkhornConfig,EvalOTConfig,TransportSupportError,atom_site_displacements,solve_atom_vacancy_ot
 from .config import PotentialConfig
 from .evaluation_policy import EvaluationPolicy
 from .outputs import EvaluationDiagnostics, PotentialOutput
@@ -292,6 +292,12 @@ class ReferenceSitePotential(nn.Module):
         _forces_requested=False,
         _stress_requested=False,
     ):
+        if solver_path == EVAL_ADAPTIVE and self.config.transport_support.kind != "dense":
+            raise TransportSupportError(
+                "COMPACT_EVAL_ADAPTIVE_UNSUPPORTED",
+                "compact_c2 currently supports TRAIN_FIXED only",
+                template_id=getattr(template_context, "template_id", None),
+            )
         if solver_path == TRAIN_FIXED:
             if evaluation_policy is not None:
                 raise ValueError(
@@ -311,7 +317,6 @@ class ReferenceSitePotential(nn.Module):
                 raise TypeError("evaluation_policy must be an EvaluationPolicy")
         else:
             raise ValueError("unsupported solver path")
-
         runtime = None
         if template_context is None:
             topology=self.topology.to(device=positions.device,dtype=positions.dtype); phase_modes=self.phase_modes; phase_mode_weights=self.phase_mode_weights.to(positions); site_alignment_weights=self.site_alignment_weights.to(positions); phase_channel_weights=self.phase_channel_weights.to(positions)
@@ -366,7 +371,19 @@ class ReferenceSitePotential(nn.Module):
                 template_id=runtime.template_id,
             )
         references=aligned_reference_sites(topology.reference_fractional,phase,origin,cell); displacements=atom_site_displacements(positions,references,cell,topology.pbc); cost=displacements.square().sum(-1)/(2*self.config.ell_ot**2)
-        if solver_path==TRAIN_FIXED: ot=solve_atom_vacancy_ot(cost,self.config.epsilon_ot,TRAIN_FIXED,'sinkhorn',TrainSinkhornConfig(self.config.train_sinkhorn_iterations))
+        if solver_path==TRAIN_FIXED:
+            distances = (
+                torch.linalg.vector_norm(displacements, dim=-1)
+                if self.config.transport_support.kind == "compact_c2"
+                else None
+            )
+            ot=solve_atom_vacancy_ot(
+                cost,self.config.epsilon_ot,TRAIN_FIXED,'sinkhorn',
+                TrainSinkhornConfig(self.config.train_sinkhorn_iterations),
+                support_config=self.config.transport_support,
+                atom_distances=distances,
+                template_id=getattr(runtime, "template_id", None),
+            )
         else:
             evaluation_ot_tolerance = (
                 1.0e-6 if cost.dtype == torch.float32 else 1.0e-12
@@ -404,6 +421,8 @@ class ReferenceSitePotential(nn.Module):
             )
         if return_aux:
             aux={'phase':phase,'ot':ot,'q':ot.q,'multipoles':features,'correlations':correlations}
+            if ot.support_diagnostics is not None:
+                aux['transport_support']=ot.support_diagnostics
             if evaluation is not None:
                 aux['evaluation_diagnostics']=self._compact_evaluation_diagnostics(
                     runtime,

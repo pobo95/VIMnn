@@ -72,6 +72,31 @@ def sinkhorn_full_update(
     return project_duals(updated_f, updated_g)
 
 
+def masked_sinkhorn_full_update(
+    problem: OTProblem, f: torch.Tensor, g: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """One exact-zero-aware update for a prevalidated masked log kernel."""
+
+    if problem.log_kernel is None:
+        raise ValueError("masked Sinkhorn requires a masked log kernel")
+    log_rows = torch.log(problem.row_marginal)
+    updated_f = problem.epsilon * (
+        log_rows
+        - torch.logsumexp(
+            g.unsqueeze(0) / problem.epsilon + problem.log_kernel, dim=1
+        )
+    )
+    log_columns = torch.log(problem.column_marginal)
+    updated_g = problem.epsilon * (
+        log_columns
+        - torch.logsumexp(
+            updated_f.unsqueeze(1) / problem.epsilon + problem.log_kernel,
+            dim=0,
+        )
+    )
+    return project_duals(updated_f, updated_g)
+
+
 def fixed_sinkhorn_updates(
     problem: OTProblem,
     iterations: int,
@@ -84,7 +109,10 @@ def fixed_sinkhorn_updates(
     f, g = duals.f, duals.g
     with torch.autocast(device_type=problem.cost.device.type, enabled=False):
         for _ in range(count):
-            f, g = sinkhorn_full_update(problem, f, g)
+            if problem.log_kernel is None:
+                f, g = sinkhorn_full_update(problem, f, g)
+            else:
+                f, g = masked_sinkhorn_full_update(problem, f, g)
     return DualVariables(f=f, g=g)
 
 
@@ -92,7 +120,13 @@ def solve_sinkhorn_train_fixed(
     problem: OTProblem, config: TrainSinkhornConfig
 ) -> OTResult:
     iterations = _validate_iterations(config.iterations)
-    tolerance = float(config.diagnostic_tolerance)
+    tolerance = (
+        1.0e-6
+        if config.diagnostic_tolerance is None and problem.cost.dtype == torch.float32
+        else 1.0e-7
+        if config.diagnostic_tolerance is None
+        else float(config.diagnostic_tolerance)
+    )
     if not math.isfinite(tolerance) or tolerance <= 0.0:
         raise ValueError("diagnostic_tolerance must be finite and positive")
     duals = fixed_sinkhorn_updates(problem, iterations)
@@ -111,6 +145,7 @@ def solve_sinkhorn_train_fixed(
         fallback_used=False,
         solver_name="sinkhorn",
         path_name="train_fixed",
+        effective_diagnostic_tolerance=tolerance,
     )
 
 
