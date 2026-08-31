@@ -284,20 +284,22 @@ def test_compact_geometry_force_stress_fd_and_symmetries():
     torch.testing.assert_close(wrapped_energy, energy.detach(), atol=2e-14, rtol=2e-14)
 
 
-def test_compact_eval_adaptive_is_actionably_unsupported():
+def test_compact_eval_adaptive_sinkhorn_preserves_exact_support():
     distances = torch.tensor([[0.2], [0.4]], dtype=torch.float64)
     cost = distances.square() / (2.0 * 1.5**2)
-    with pytest.raises(TransportSupportError) as failure:
-        solve_atom_vacancy_ot(
-            cost,
-            0.5,
-            EVAL_ADAPTIVE,
-            "sinkhorn",
-            EvalOTConfig(),
-            support_config=_config(),
-            atom_distances=distances,
-        )
-    assert failure.value.reason_code == "COMPACT_EVAL_ADAPTIVE_UNSUPPORTED"
+    result = solve_atom_vacancy_ot(
+        cost,
+        0.5,
+        EVAL_ADAPTIVE,
+        "sinkhorn",
+        EvalOTConfig(sinkhorn_iterations=512, convergence_tolerance=1.0e-12),
+        support_config=_config(),
+        atom_distances=distances,
+    )
+    assert result.converged and not result.fallback_used
+    assert result.support_diagnostics is not None
+    assert result.support_diagnostics.effective_diagnostic_tolerance == 1.0e-12
+    torch.testing.assert_close(result.P.sum(), torch.tensor(1.0, dtype=torch.float64))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")

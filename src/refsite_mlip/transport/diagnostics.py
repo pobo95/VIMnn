@@ -26,6 +26,9 @@ def build_result(
     final_linear_residual=None,
     failure_reason=None,
     effective_diagnostic_tolerance=None,
+    accepted_damping=None,
+    warmup_sinkhorn_iterations=0,
+    fallback_sinkhorn_iterations=0,
 ) -> OTResult:
     gamma = transport_plan(problem, f, g)
     row, column = marginal_residuals(problem, gamma)
@@ -55,6 +58,9 @@ def build_result(
         failure_reason=failure_reason,
         support_diagnostics=support_diagnostics,
         effective_diagnostic_tolerance=effective_diagnostic_tolerance,
+        accepted_damping=accepted_damping,
+        warmup_sinkhorn_iterations=warmup_sinkhorn_iterations,
+        fallback_sinkhorn_iterations=fallback_sinkhorn_iterations,
     )
 
 

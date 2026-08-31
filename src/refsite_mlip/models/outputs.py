@@ -34,9 +34,26 @@ class EvaluationDiagnostics:
     transport_row_residual: float
     transport_column_residual: float
     transport_sinkhorn_iterations: int
+    transport_sinkhorn_warmup_iterations: int
+    transport_fallback_sinkhorn_iterations: int
     transport_newton_iterations: int
     transport_cg_iterations: int
     transport_fallback_used: bool
+    transport_fallback_reason: str | None
+    transport_kind: str
+    transport_r_on: float | None
+    transport_r_off: float | None
+    transport_r_candidate: float | None
+    transport_core_edge_count: int | None
+    transport_active_edge_count: int | None
+    transport_candidate_edge_count: int | None
+    transport_maximum_matching_size: int | None
+    transport_total_support_feasible: bool | None
+    transport_cutoff_boundary_gap: float | None
+    transport_candidate_boundary_gap: float | None
+    transport_line_search_reductions: int
+    transport_accepted_damping: float | None
+    transport_q_mass_error: float
     effective_transport_tolerance: float
     differentiability_scope: str
     hard_branch_frozen: bool

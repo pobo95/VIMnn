@@ -82,6 +82,7 @@ def solve_newton_krylov(
     total_cg = 0
     total_reductions = 0
     final_linear_residual = None
+    last_accepted_damping = None
 
     for newton_index in range(config.max_newton_iterations):
         gamma = transport_plan(problem, f, g)
@@ -111,6 +112,7 @@ def solve_newton_krylov(
                 total_reductions,
                 final_linear_residual,
                 None,
+                last_accepted_damping,
             )
 
         inverse_diagonal = jacobi_inverse(problem, gamma)
@@ -205,6 +207,7 @@ def solve_newton_krylov(
                 "Armijo line search failed",
             )
         f, g = accepted_f, accepted_g
+        last_accepted_damping = step
         total_reductions += reductions_this_step
 
     final_gamma = transport_plan(problem, f, g)
@@ -226,4 +229,5 @@ def solve_newton_krylov(
         total_reductions,
         final_linear_residual,
         None if converged else "maximum Newton iterations reached",
+        last_accepted_damping,
     )

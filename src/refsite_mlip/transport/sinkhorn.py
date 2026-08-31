@@ -163,6 +163,8 @@ def solve_sinkhorn_eval_adaptive(
     line_search_reductions: int = 0,
     final_linear_residual=None,
     failure_reason=None,
+    accepted_damping=None,
+    warmup_sinkhorn_iterations: int = 0,
 ) -> OTResult:
     maximum = _validate_iterations(maximum_iterations)
     if not isinstance(tolerance, Real) or not math.isfinite(float(tolerance)) or tolerance <= 0:
@@ -173,7 +175,10 @@ def solve_sinkhorn_eval_adaptive(
     converged = False
     with torch.autocast(device_type=problem.cost.device.type, enabled=False):
         for index in range(maximum):
-            f, g = sinkhorn_full_update(problem, f, g)
+            if problem.log_kernel is None:
+                f, g = sinkhorn_full_update(problem, f, g)
+            else:
+                f, g = masked_sinkhorn_full_update(problem, f, g)
             used = index + 1
             gamma = transport_plan(problem, f, g)
             row, column = marginal_residuals(problem, gamma)
@@ -204,4 +209,10 @@ def solve_sinkhorn_eval_adaptive(
         path_name="eval_adaptive",
         final_linear_residual=final_linear_residual,
         failure_reason=failure_reason,
+        accepted_damping=accepted_damping,
+        effective_diagnostic_tolerance=(
+            float(tolerance) if problem.support_diagnostics is not None else None
+        ),
+        warmup_sinkhorn_iterations=warmup_sinkhorn_iterations,
+        fallback_sinkhorn_iterations=(used if fallback_used else 0),
     )

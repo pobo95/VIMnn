@@ -12,12 +12,22 @@ def transport_plan(
     problem: OTProblem, f: torch.Tensor, g: torch.Tensor
 ) -> torch.Tensor:
     if problem.log_kernel is not None:
-        log_gamma = (
+        live_log_gamma = (
             f.unsqueeze(-1) / problem.epsilon
             + g.unsqueeze(-2) / problem.epsilon
             + problem.log_kernel
         )
-        return torch.exp(log_gamma)
+        # Avoid the indeterminate ``-inf + inf``/``exp(nan)`` arithmetic that
+        # can otherwise occur on an exactly masked entry while an adaptive
+        # dual iterate is large.  The support is a discrete, prevalidated
+        # control decision; arithmetic on every active entry remains live.
+        active = torch.isfinite(problem.log_kernel)
+        safe_log_gamma = torch.where(
+            active, live_log_gamma, torch.zeros_like(live_log_gamma)
+        )
+        return torch.where(
+            active, torch.exp(safe_log_gamma), torch.zeros_like(safe_log_gamma)
+        )
     log_gamma = (
         f.unsqueeze(-1) + g.unsqueeze(-2) - problem.cost
     ) / problem.epsilon

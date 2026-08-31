@@ -76,13 +76,6 @@ def solve_atom_vacancy_ot(
         raise TransportSupportError(
             "INVALID_SUPPORT_CONFIG", "support_config must be TransportSupportConfig"
         )
-    if path == EVAL_ADAPTIVE and support.kind != "dense":
-        raise TransportSupportError(
-            "COMPACT_EVAL_ADAPTIVE_UNSUPPORTED",
-            "compact_c2 currently supports TRAIN_FIXED only",
-            template_id=template_id,
-            sample_id=sample_id,
-        )
     problem = build_ot_problem(
         atom_cost,
         epsilon_ot,
@@ -136,6 +129,12 @@ def solve_atom_vacancy_ot(
             solver_name="newton_krylov",
             path_name=EVAL_ADAPTIVE,
             final_linear_residual=outcome.final_linear_residual,
+            accepted_damping=outcome.accepted_damping,
+            effective_diagnostic_tolerance=(
+                config.convergence_tolerance
+                if problem.support_diagnostics is not None
+                else None
+            ),
         )
     if solver == "hybrid":
         return solve_hybrid_eval(problem, config, init_duals)

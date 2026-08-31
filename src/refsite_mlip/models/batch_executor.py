@@ -8,7 +8,11 @@ import torch
 
 from refsite_mlip.data import StructureBatch
 from refsite_mlip.phase.types import EvaluationPhaseError
-from refsite_mlip.transport import EVAL_ADAPTIVE, TRAIN_FIXED
+from refsite_mlip.transport import (
+    EVAL_ADAPTIVE,
+    TRAIN_FIXED,
+    TransportSupportError,
+)
 
 from .evaluation_policy import EvaluationPolicy
 from .outputs import BatchedPotentialOutput, PotentialOutput
@@ -192,6 +196,12 @@ def _raise_grouped_evaluation_error(
             template_id=template_id,
             observed=error.observed,
             threshold=error.threshold,
+        ) from error
+    if isinstance(error, TransportSupportError):
+        raise EvaluationPhaseError(
+            error.reason_code,
+            f"{context}: {error}",
+            template_id=template_id,
         ) from error
     raise EvaluationPhaseError(
         "STRUCTURE_EVALUATION_FAILED",

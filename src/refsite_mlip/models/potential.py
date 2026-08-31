@@ -20,7 +20,7 @@ from refsite_mlip.phase.newton import solve_training_phase
 from refsite_mlip.phase.objective import typed_reciprocal_fields
 from refsite_mlip.phase.stabilizer import validate_alias_matches_stabilizer
 from refsite_mlip.phase.types import EvaluationPhaseError
-from refsite_mlip.transport import TRAIN_FIXED,EVAL_ADAPTIVE,TrainSinkhornConfig,EvalOTConfig,TransportSupportError,atom_site_displacements,solve_atom_vacancy_ot
+from refsite_mlip.transport import TRAIN_FIXED,EVAL_ADAPTIVE,TrainSinkhornConfig,EvalOTConfig,atom_site_displacements,solve_atom_vacancy_ot
 from .config import PotentialConfig
 from .evaluation_policy import EvaluationPolicy
 from .outputs import EvaluationDiagnostics, PotentialOutput
@@ -209,6 +209,7 @@ class ReferenceSitePotential(nn.Module):
         cross_amplitudes,
         ot,
         effective_transport_tolerance,
+        support_config,
         *,
         derivative_requested=False,
         forces_requested=False,
@@ -220,6 +221,9 @@ class ReferenceSitePotential(nn.Module):
         curvature = torch.linalg.eigvalsh(-evaluation.refined.hessian)
         minimum_curvature = curvature[..., 0]
         maximum_curvature = curvature[..., -1]
+        support = ot.support_diagnostics
+        compact = support_config.kind == "compact_c2"
+        expected_q_mass = runtime.topology.num_sites - ot.P.shape[1]
         return EvaluationDiagnostics(
             template_id=runtime.template_id,
             template_fingerprint=runtime.fingerprint,
@@ -262,9 +266,46 @@ class ReferenceSitePotential(nn.Module):
             transport_row_residual=scalar(ot.row_residual),
             transport_column_residual=scalar(ot.column_residual),
             transport_sinkhorn_iterations=ot.sinkhorn_iterations,
+            transport_sinkhorn_warmup_iterations=ot.warmup_sinkhorn_iterations,
+            transport_fallback_sinkhorn_iterations=ot.fallback_sinkhorn_iterations,
             transport_newton_iterations=ot.newton_iterations,
             transport_cg_iterations=ot.cg_iterations,
             transport_fallback_used=ot.fallback_used,
+            transport_fallback_reason=ot.failure_reason,
+            transport_kind=support_config.kind,
+            transport_r_on=support_config.r_on if compact else None,
+            transport_r_off=support_config.cutoff if compact else None,
+            transport_r_candidate=(
+                support_config.r_candidate if compact else None
+            ),
+            transport_core_edge_count=(
+                support.core_edge_count if support is not None else None
+            ),
+            transport_active_edge_count=(
+                support.active_edge_count if support is not None else None
+            ),
+            transport_candidate_edge_count=(
+                support.candidate_edge_count if support is not None else None
+            ),
+            transport_maximum_matching_size=(
+                support.maximum_atom_matching_size
+                if support is not None
+                else None
+            ),
+            transport_total_support_feasible=(
+                support.total_support_feasible if support is not None else None
+            ),
+            transport_cutoff_boundary_gap=(
+                support.cutoff_boundary_gap if support is not None else None
+            ),
+            transport_candidate_boundary_gap=(
+                support.candidate_boundary_gap if support is not None else None
+            ),
+            transport_line_search_reductions=ot.line_search_reductions,
+            transport_accepted_damping=ot.accepted_damping,
+            transport_q_mass_error=scalar(
+                torch.abs(ot.q.sum() - ot.q.new_tensor(expected_q_mass))
+            ),
             effective_transport_tolerance=effective_transport_tolerance,
             differentiability_scope=(
                 "selected_branch_first_order"
@@ -292,12 +333,6 @@ class ReferenceSitePotential(nn.Module):
         _forces_requested=False,
         _stress_requested=False,
     ):
-        if solver_path == EVAL_ADAPTIVE and self.config.transport_support.kind != "dense":
-            raise TransportSupportError(
-                "COMPACT_EVAL_ADAPTIVE_UNSUPPORTED",
-                "compact_c2 currently supports TRAIN_FIXED only",
-                template_id=getattr(template_context, "template_id", None),
-            )
         if solver_path == TRAIN_FIXED:
             if evaluation_policy is not None:
                 raise ValueError(
@@ -388,7 +423,24 @@ class ReferenceSitePotential(nn.Module):
             evaluation_ot_tolerance = (
                 1.0e-6 if cost.dtype == torch.float32 else 1.0e-12
             )
-            ot=solve_atom_vacancy_ot(cost,self.config.epsilon_ot,EVAL_ADAPTIVE,'hybrid',EvalOTConfig(sinkhorn_iterations=16,convergence_tolerance=evaluation_ot_tolerance))
+            distances = (
+                torch.linalg.vector_norm(displacements, dim=-1)
+                if self.config.transport_support.kind == "compact_c2"
+                else None
+            )
+            ot=solve_atom_vacancy_ot(
+                cost,
+                self.config.epsilon_ot,
+                EVAL_ADAPTIVE,
+                "hybrid",
+                EvalOTConfig(
+                    sinkhorn_iterations=16,
+                    convergence_tolerance=evaluation_ot_tolerance,
+                ),
+                support_config=self.config.transport_support,
+                atom_distances=distances,
+                template_id=runtime.template_id,
+            )
             if _evaluation_derivative_request and ot.fallback_used:
                 raise EvaluationPhaseError(
                     "DERIVATIVE_FALLBACK_UNSUPPORTED",
@@ -431,6 +483,7 @@ class ReferenceSitePotential(nn.Module):
                     *amplitudes,
                     ot,
                     evaluation_ot_tolerance,
+                    self.config.transport_support,
                     derivative_requested=_evaluation_derivative_request,
                     forces_requested=_forces_requested,
                     stress_requested=_stress_requested,

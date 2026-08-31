@@ -35,6 +35,13 @@ def solve_hybrid_eval(
             solver_name="hybrid",
             path_name="eval_adaptive",
             final_linear_residual=outcome.final_linear_residual,
+            accepted_damping=outcome.accepted_damping,
+            effective_diagnostic_tolerance=(
+                config.convergence_tolerance
+                if problem.support_diagnostics is not None
+                else None
+            ),
+            warmup_sinkhorn_iterations=config.sinkhorn_iterations,
         )
     fallback_initial = DualVariables(outcome.f, outcome.g)
     return solve_sinkhorn_eval_adaptive(
@@ -50,4 +57,6 @@ def solve_hybrid_eval(
         line_search_reductions=outcome.line_search_reductions,
         final_linear_residual=outcome.final_linear_residual,
         failure_reason=outcome.failure_reason,
+        accepted_damping=outcome.accepted_damping,
+        warmup_sinkhorn_iterations=config.sinkhorn_iterations,
     )

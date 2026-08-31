@@ -58,6 +58,9 @@ class OTResult:
     failure_reason: Optional[str] = None
     support_diagnostics: TransportSupportDiagnostics | None = None
     effective_diagnostic_tolerance: float | None = None
+    accepted_damping: Optional[float] = None
+    warmup_sinkhorn_iterations: int = 0
+    fallback_sinkhorn_iterations: int = 0
 
 
 @dataclass(frozen=True)
@@ -80,3 +83,4 @@ class NewtonOutcome:
     line_search_reductions: int
     final_linear_residual: Optional[torch.Tensor]
     failure_reason: Optional[str]
+    accepted_damping: Optional[float] = None
