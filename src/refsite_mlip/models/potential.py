@@ -202,6 +202,7 @@ class ReferenceSitePotential(nn.Module):
     @staticmethod
     def _compact_evaluation_diagnostics(
         runtime,
+        policy,
         evaluation,
         atomic_amplitudes,
         reference_amplitudes,
@@ -222,6 +223,9 @@ class ReferenceSitePotential(nn.Module):
         return EvaluationDiagnostics(
             template_id=runtime.template_id,
             template_fingerprint=runtime.fingerprint,
+            context_fingerprint=runtime.fingerprint,
+            policy_template_fingerprint=policy.template_fingerprint,
+            policy_content_fingerprint=policy.content_fingerprint,
             input_candidate_count=evaluation.input_candidate_count,
             non_equivalent_group_count=evaluation.non_equivalent_group_count,
             selected_original_candidate_index=int(
@@ -403,6 +407,7 @@ class ReferenceSitePotential(nn.Module):
             if evaluation is not None:
                 aux['evaluation_diagnostics']=self._compact_evaluation_diagnostics(
                     runtime,
+                    evaluation_policy,
                     evaluation,
                     *amplitudes,
                     ot,

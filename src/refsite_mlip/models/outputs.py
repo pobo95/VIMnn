@@ -7,6 +7,9 @@ import torch
 class EvaluationDiagnostics:
     template_id: str
     template_fingerprint: str
+    context_fingerprint: str
+    policy_template_fingerprint: str
+    policy_content_fingerprint: str
     input_candidate_count: int
     non_equivalent_group_count: int
     selected_original_candidate_index: int
