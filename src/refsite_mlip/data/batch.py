@@ -341,11 +341,12 @@ def collate_structure_samples(
 
     templates = [template_registry.resolve(sample.template_id) for sample in samples]
     for sample, template in zip(samples, templates):
-        if sample.num_atoms > template.topology.num_sites:
-            raise ValueError(f"N > M for sample {sample.sample_id}")
-        species = set(sample.atomic_numbers.detach().cpu().tolist())
-        if not species.issubset(set(template.supported_species)):
-            raise ValueError(f"unknown species for template {sample.template_id}")
+        template.validate_structure(
+            sample.atomic_numbers,
+            cell=sample.cell if template.strict_domain is not None else None,
+            pbc=sample.pbc if template.strict_domain is not None else None,
+            sample_id=sample.sample_id,
+        )
 
     atom_counts = torch.tensor(
         [sample.num_atoms for sample in samples], dtype=torch.long, device=device

@@ -9,6 +9,7 @@ from numbers import Real
 import torch
 
 from refsite_mlip.data.templates import ReferenceTemplate
+from refsite_mlip.data.template_domain import StrictTemplateDomain
 from refsite_mlip.graph import ReferenceGraphTopology
 from refsite_mlip.phase.types import TypedStabilizer
 
@@ -40,6 +41,7 @@ class _MaterializedTemplateExecutionContext:
     supported_species: tuple[int, ...]
     convention_version: str
     avg_num_neighbors: float
+    strict_domain: StrictTemplateDomain | None = None
 
 
 @dataclass(frozen=True)
@@ -62,6 +64,7 @@ class TemplateExecutionContext:
     supported_species: tuple[int, ...]
     convention_version: str
     avg_num_neighbors: float
+    strict_domain: StrictTemplateDomain | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -113,6 +116,7 @@ class TemplateExecutionContext:
             supported_species=snapshot.supported_species,
             convention_version=snapshot.convention_version,
             avg_num_neighbors=avg_num_neighbors,
+            strict_domain=snapshot.strict_domain,
         )
         return context
 
@@ -147,6 +151,7 @@ class TemplateExecutionContext:
             self.stabilizer,
             self.supported_species,
             self.convention_version,
+            self.strict_domain,
         )
 
     def validate_fingerprint(self) -> None:
@@ -191,4 +196,5 @@ class TemplateExecutionContext:
             supported_species=self.supported_species,
             convention_version=self.convention_version,
             avg_num_neighbors=self.avg_num_neighbors,
+            strict_domain=self.strict_domain,
         )

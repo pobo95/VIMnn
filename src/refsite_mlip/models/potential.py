@@ -60,6 +60,10 @@ class ReferenceSitePotential(nn.Module):
         if positions.shape[0]>M: raise ValueError(f'atom count N={positions.shape[0]} exceeds reference-site count M={M}')
         actual_species=set(int(z) for z in atomic_numbers.detach().cpu().tolist())
         if not actual_species.issubset(set(context.supported_species)): raise ValueError('atomic species are unsupported by runtime template')
+        if context.strict_domain is not None:
+            context.strict_domain.validate_atomic_numbers(
+                atomic_numbers, template_id=context.template_id
+            )
         if context.site_alignment_weights.ndim!=2 or context.site_alignment_weights.shape[0]!=M: raise ValueError('runtime site alignment must have shape [M,C]')
         C=context.site_alignment_weights.shape[1]
         if context.phase_channel_weights.shape!=(C,): raise ValueError('runtime phase channel weights must have shape [C]')

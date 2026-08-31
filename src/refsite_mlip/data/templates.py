@@ -8,8 +8,16 @@ import struct
 
 import torch
 
-from refsite_mlip.graph import ReferenceGraphTopology
+from refsite_mlip.graph import (
+    ReferenceGraphTopology,
+    update_reference_edge_geometry,
+)
 from refsite_mlip.phase.types import TypedStabilizer
+
+from .template_domain import (
+    StrictTemplateDomain,
+    TemplateDomainValidation,
+)
 
 
 def _clone(tensor: torch.Tensor) -> torch.Tensor:
@@ -43,6 +51,7 @@ class ReferenceTemplate:
     stabilizer: TypedStabilizer
     supported_species: tuple[int, ...]
     convention_version: str = "reference_template_v1"
+    strict_domain: StrictTemplateDomain | None = None
 
     @classmethod
     def snapshot(
@@ -56,6 +65,7 @@ class ReferenceTemplate:
         stabilizer,
         supported_species,
         convention_version="reference_template_v1",
+        strict_domain=None,
     ) -> "ReferenceTemplate":
         if not isinstance(template_id, str) or not template_id:
             raise ValueError("template_id must be nonempty")
@@ -84,6 +94,11 @@ class ReferenceTemplate:
             ),
             supported_species=tuple(int(value) for value in supported_species),
             convention_version=convention_version,
+            strict_domain=(
+                None
+                if strict_domain is None
+                else StrictTemplateDomain.from_dict(strict_domain.to_dict())
+            ),
         )
         result.validate()
         return result
@@ -126,6 +141,18 @@ class ReferenceTemplate:
         ):
             raise ValueError(
                 "supported_species must be unique positive integers"
+            )
+        if self.strict_domain is not None:
+            if not isinstance(self.strict_domain, StrictTemplateDomain):
+                raise TypeError("strict_domain must be a StrictTemplateDomain")
+            if self.strict_domain.reference_site_count != num_sites:
+                raise ValueError("strict domain M differs from template topology")
+            if self.strict_domain.species_vocabulary != self.supported_species:
+                raise ValueError(
+                    "strict domain species order differs from supported_species"
+                )
+            self.strict_domain.validate_reference_site_types(
+                self.topology.site_types
             )
         floating_metadata = (
             self.phase_mode_weights,
@@ -172,7 +199,85 @@ class ReferenceTemplate:
         )
         for value in scalars:
             _text(digest, value)
+        # Preserve the exact legacy hash byte stream when no strict domain is
+        # present.  New strict templates bind every domain field explicitly.
+        if self.strict_domain is not None:
+            _text(digest, "strict_domain")
+            for value in self.strict_domain.fingerprint_values():
+                _text(digest, value)
         return digest.hexdigest()
+
+    def validate_structure(
+        self,
+        atomic_numbers: torch.Tensor,
+        *,
+        cell: torch.Tensor | None = None,
+        pbc: torch.Tensor | None = None,
+        sample_id: str | None = None,
+    ) -> TemplateDomainValidation:
+        """Validate assignment without mutating structure or template tensors."""
+
+        if not isinstance(atomic_numbers, torch.Tensor):
+            raise TypeError("atomic_numbers must be a torch.Tensor")
+        if atomic_numbers.ndim != 1 or atomic_numbers.dtype != torch.long:
+            raise ValueError("atomic_numbers must be torch.long [N]")
+        num_atoms = int(atomic_numbers.numel())
+        if num_atoms > self.topology.num_sites:
+            raise ValueError(
+                f"N > M for sample {sample_id}" if sample_id else "N > M"
+            )
+        actual_species = set(
+            int(value) for value in atomic_numbers.detach().cpu().tolist()
+        )
+        if not actual_species.issubset(set(self.supported_species)):
+            raise ValueError(f"unknown species for template {self.template_id}")
+
+        if self.strict_domain is None:
+            return TemplateDomainValidation(
+                num_atoms,
+                self.topology.num_sites - num_atoms,
+                tuple(
+                    int(torch.sum(atomic_numbers.detach().cpu() == species))
+                    for species in self.supported_species
+                ),
+            )
+
+        result = self.strict_domain.validate_atomic_numbers(
+            atomic_numbers,
+            template_id=self.template_id,
+            sample_id=sample_id,
+        )
+        if pbc is not None:
+            if (
+                pbc.shape != (3,)
+                or pbc.dtype != torch.bool
+                or not bool(torch.all(pbc))
+            ):
+                raise ValueError("strict template domain requires full PBC")
+        if cell is None:
+            return result
+        if cell.shape != (3, 3) or cell.dtype not in (
+            torch.float32,
+            torch.float64,
+        ):
+            raise ValueError("strict template cell must be float32/float64 [3,3]")
+        if not bool(torch.all(torch.isfinite(cell))):
+            raise ValueError("strict template cell contains NaN or Inf")
+        singular_values = torch.linalg.svdvals(cell)
+        if bool(singular_values[-1] <= torch.finfo(cell.dtype).eps):
+            raise ValueError("strict template cell must be nonsingular")
+        topology = self.topology.to(device=cell.device, dtype=cell.dtype)
+        geometry = update_reference_edge_geometry(
+            topology,
+            cell,
+            edge_length_scale=1.0,
+        )
+        return TemplateDomainValidation(
+            result.num_atoms,
+            result.vacancy_mass,
+            result.composition,
+            float(geometry.maximum_strain_seen.detach().cpu()),
+        )
 
     def clone(self) -> "ReferenceTemplate":
         return ReferenceTemplate.snapshot(
@@ -185,6 +290,7 @@ class ReferenceTemplate:
             self.stabilizer,
             self.supported_species,
             self.convention_version,
+            self.strict_domain,
         )
 
 

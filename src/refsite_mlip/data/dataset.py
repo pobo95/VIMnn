@@ -24,13 +24,12 @@ class InMemoryStructureDataset(Sequence):
                 raise ValueError(f"duplicate sample_id: {sample.sample_id}")
             sample_ids.add(sample.sample_id)
             template = registry.resolve(sample.template_id)
-            if sample.num_atoms > template.topology.num_sites:
-                raise ValueError(f"N > M for sample {sample.sample_id}")
-            species = set(sample.atomic_numbers.detach().cpu().tolist())
-            if not species.issubset(set(template.supported_species)):
-                raise ValueError(
-                    f"unknown species for template {sample.template_id}"
-                )
+            template.validate_structure(
+                sample.atomic_numbers,
+                cell=sample.cell if template.strict_domain is not None else None,
+                pbc=sample.pbc if template.strict_domain is not None else None,
+                sample_id=sample.sample_id,
+            )
 
     def __len__(self) -> int:
         return len(self._samples)
