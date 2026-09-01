@@ -10,6 +10,14 @@ from .cost import (
     minimum_image_displacement_and_shift,
 )
 from .candidate import build_periodic_compact_transport_edges
+from .candidate_state import (
+    CANDIDATE_NEIGHBOR_STATE_SCHEMA_VERSION,
+    CandidateNeighborUpdate,
+    CandidateReuseDecision,
+    CompactCandidateNeighborState,
+    build_candidate_neighbor_state,
+    update_candidate_neighbor_state,
+)
 from .factory import EVAL_ADAPTIVE, TRAIN_FIXED, solve_atom_vacancy_ot
 from .edge_list import (
     CompactTransportEdges,
@@ -65,6 +73,10 @@ __all__ = [
     "DualVariables",
     "DensePlanMaterialization",
     "CompactTransportEdges",
+    "CompactCandidateNeighborState",
+    "CandidateNeighborUpdate",
+    "CandidateReuseDecision",
+    "CANDIDATE_NEIGHBOR_STATE_SCHEMA_VERSION",
     "MICImageDiagnostics",
     "EVAL_ADAPTIVE",
     "EvalOTConfig",
@@ -86,6 +98,7 @@ __all__ = [
     "atom_site_displacements",
     "build_compact_transport_edges",
     "build_compact_transport_edges_from_candidates",
+    "build_candidate_neighbor_state",
     "build_periodic_compact_transport_edges",
     "compact_c2_switch",
     "minimum_image_diagnostics",
@@ -112,4 +125,5 @@ __all__ = [
     "sparse_transport_plan",
     "sparse_zero_duals",
     "validate_compact_support_edges",
+    "update_candidate_neighbor_state",
 ]

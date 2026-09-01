@@ -481,13 +481,18 @@ def validate_compact_support_edges(
     processed_block_count: int = 0,
     maximum_pair_block_elements: int = 0,
     peak_temporary_geometry_elements: int = 0,
+    enforce_candidate_radius: bool = True,
 ) -> tuple[torch.Tensor, TransportSupportDiagnostics]:
     """Validate compact candidate edges using sparse adjacency only.
 
-    ``site_index``/``atom_index`` enumerate every ``d < r_candidate`` pair in
-    canonical site-major order.  Matching and total-support certification use
-    only the strictly positive ``d < r_off`` graph; the dense aggregate
-    vacancy reservoir is represented by implicit vacancy-clone columns.
+    By default, ``site_index``/``atom_index`` enumerate every
+    ``d < r_candidate`` pair in canonical site-major order.  A certified
+    neighbor-state reuse may instead supply a cached superset containing
+    currently more distant zero-switch pairs; that caller sets
+    ``enforce_candidate_radius=False``.  Matching and total-support
+    certification always use only the strictly positive ``d < r_off`` graph;
+    the dense aggregate vacancy reservoir is represented by implicit
+    vacancy-clone columns.
     """
 
     if not isinstance(config, TransportSupportConfig) or (
@@ -577,7 +582,9 @@ def validate_compact_support_edges(
             template_id=template_id,
             sample_id=sample_id,
         )
-    if edges and bool(
+    if not isinstance(enforce_candidate_radius, bool):
+        raise TypeError("enforce_candidate_radius must be bool")
+    if enforce_candidate_radius and edges and bool(
         torch.any(distances >= distances.new_tensor(config.r_candidate)).detach()
     ):
         raise TransportSupportError(
