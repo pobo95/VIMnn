@@ -7,11 +7,14 @@ from .cost import (
     atom_site_displacements,
     minimum_image_diagnostics,
     minimum_image_displacement,
+    minimum_image_displacement_and_shift,
 )
+from .candidate import build_periodic_compact_transport_edges
 from .factory import EVAL_ADAPTIVE, TRAIN_FIXED, solve_atom_vacancy_ot
 from .edge_list import (
     CompactTransportEdges,
     build_compact_transport_edges,
+    build_compact_transport_edges_from_candidates,
     materialize_dense_plan,
 )
 from .result import (
@@ -55,6 +58,7 @@ from .support import (
     TransportSupportDiagnostics,
     TransportSupportError,
     compact_c2_switch,
+    validate_compact_support_edges,
 )
 
 __all__ = [
@@ -81,9 +85,12 @@ __all__ = [
     "atom_site_cost",
     "atom_site_displacements",
     "build_compact_transport_edges",
+    "build_compact_transport_edges_from_candidates",
+    "build_periodic_compact_transport_edges",
     "compact_c2_switch",
     "minimum_image_diagnostics",
     "minimum_image_displacement",
+    "minimum_image_displacement_and_shift",
     "materialize_dense_plan",
     "solve_atom_vacancy_ot",
     "solve_ragged_atom_vacancy_ot",
@@ -104,4 +111,5 @@ __all__ = [
     "sparse_support_fingerprint",
     "sparse_transport_plan",
     "sparse_zero_duals",
+    "validate_compact_support_edges",
 ]

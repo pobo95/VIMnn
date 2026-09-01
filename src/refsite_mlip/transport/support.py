@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 import math
-from numbers import Real
+from numbers import Integral, Real
 from typing import Any, Mapping
 
 import torch
@@ -60,6 +60,9 @@ class TransportSupportConfig:
     candidate_skin: float = 0.2
     convention_version: str = TRANSPORT_SUPPORT_CONVENTION_VERSION
     backend: str = "dense"
+    candidate_backend: str = "dense"
+    site_block_size: int = 32
+    atom_block_size: int = 32
 
     def __post_init__(self) -> None:
         if self.kind not in ("dense", "compact_c2"):
@@ -74,6 +77,29 @@ class TransportSupportConfig:
             raise TransportSupportError(
                 "INVALID_SUPPORT_CONFIG",
                 "edge_list backend is supported only for compact_c2 transport",
+            )
+        if self.candidate_backend not in ("dense", "blocked"):
+            raise TransportSupportError(
+                "INVALID_SUPPORT_CONFIG",
+                "candidate_backend must be dense or blocked",
+            )
+        for name, value in (
+            ("site_block_size", self.site_block_size),
+            ("atom_block_size", self.atom_block_size),
+        ):
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, Integral)
+                or int(value) <= 0
+            ):
+                raise TransportSupportError(
+                    "INVALID_SUPPORT_CONFIG",
+                    f"{name} must be a positive integer",
+                )
+        if self.candidate_backend == "blocked" and self.backend != "edge_list":
+            raise TransportSupportError(
+                "INVALID_SUPPORT_CONFIG",
+                "blocked candidate extraction requires backend=edge_list",
             )
         cutoff = _finite_real(self.cutoff, "cutoff", positive=True)
         width = _finite_real(self.switch_width, "switch_width", positive=True)
@@ -93,6 +119,8 @@ class TransportSupportConfig:
         object.__setattr__(self, "cutoff", cutoff)
         object.__setattr__(self, "switch_width", width)
         object.__setattr__(self, "candidate_skin", skin)
+        object.__setattr__(self, "site_block_size", int(self.site_block_size))
+        object.__setattr__(self, "atom_block_size", int(self.atom_block_size))
 
     @property
     def r_on(self) -> float:
@@ -103,7 +131,7 @@ class TransportSupportConfig:
         return self.cutoff + self.candidate_skin
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        values = {
             "kind": self.kind,
             "cutoff": self.cutoff,
             "switch_width": self.switch_width,
@@ -111,6 +139,18 @@ class TransportSupportConfig:
             "backend": self.backend,
             "convention_version": self.convention_version,
         }
+        # Candidate blocking is an opt-in execution policy.  Omitting these
+        # keys for the legacy dense-candidate path preserves canonical payloads
+        # and checkpoint-resolved configs produced before S3C-1.
+        if self.candidate_backend == "blocked":
+            values.update(
+                {
+                    "candidate_backend": self.candidate_backend,
+                    "site_block_size": self.site_block_size,
+                    "atom_block_size": self.atom_block_size,
+                }
+            )
+        return values
 
     @classmethod
     def from_dict(cls, values: Mapping[str, Any] | None) -> "TransportSupportConfig":
@@ -149,6 +189,19 @@ class TransportSupportDiagnostics:
     maximum_switch_value: float
     effective_diagnostic_tolerance: float | None = None
     convention_version: str = TRANSPORT_SUPPORT_CONVENTION_VERSION
+    candidate_backend: str = "dense"
+    num_sites: int | None = None
+    num_atoms: int | None = None
+    site_block_size: int | None = None
+    atom_block_size: int | None = None
+    processed_block_count: int = 0
+    maximum_pair_block_elements: int = 0
+    theoretical_full_pair_elements: int = 0
+    peak_temporary_geometry_elements: int = 0
+    dense_candidate_allocation_observed: bool = True
+    mic_image_gap: float = math.inf
+    maximum_mic_image_count: int = 1
+    candidate_fingerprint: str | None = None
 
     def with_effective_tolerance(self, value: float) -> "TransportSupportDiagnostics":
         return replace(self, effective_diagnostic_tolerance=float(value))
@@ -181,6 +234,19 @@ class TransportSupportDiagnostics:
             "maximum_switch_value": self.maximum_switch_value,
             "effective_diagnostic_tolerance": self.effective_diagnostic_tolerance,
             "convention_version": self.convention_version,
+            "candidate_backend": self.candidate_backend,
+            "num_sites": self.num_sites,
+            "num_atoms": self.num_atoms,
+            "site_block_size": self.site_block_size,
+            "atom_block_size": self.atom_block_size,
+            "processed_block_count": self.processed_block_count,
+            "maximum_pair_block_elements": self.maximum_pair_block_elements,
+            "theoretical_full_pair_elements": self.theoretical_full_pair_elements,
+            "peak_temporary_geometry_elements": self.peak_temporary_geometry_elements,
+            "dense_candidate_allocation_observed": self.dense_candidate_allocation_observed,
+            "mic_image_gap": self.mic_image_gap,
+            "maximum_mic_image_count": self.maximum_mic_image_count,
+            "candidate_fingerprint": self.candidate_fingerprint,
         }
 
 
@@ -241,6 +307,36 @@ def _maximum_matching(mask: list[list[bool]]) -> tuple[int, list[int], list[int]
     return count, row_to_column, column_to_row
 
 
+def _maximum_matching_adjacency(
+    row_adjacency: list[list[int]], columns: int
+) -> tuple[int, list[int], list[int]]:
+    """Deterministic bipartite matching without a dense boolean matrix."""
+
+    column_to_row = [-1] * columns
+
+    def augment(row: int, seen: list[bool]) -> bool:
+        for column in row_adjacency[row]:
+            if column < 0 or column >= columns:
+                raise ValueError("sparse matching adjacency index is out of range")
+            if seen[column]:
+                continue
+            seen[column] = True
+            previous = column_to_row[column]
+            if previous < 0 or augment(previous, seen):
+                column_to_row[column] = row
+                return True
+        return False
+
+    count = 0
+    for row in range(len(row_adjacency)):
+        count += int(augment(row, [False] * columns))
+    row_to_column = [-1] * len(row_adjacency)
+    for column, row in enumerate(column_to_row):
+        if row >= 0:
+            row_to_column[row] = column
+    return count, row_to_column, column_to_row
+
+
 def _strong_components(adjacency: list[list[int]]) -> list[int]:
     index = 0
     stack: list[int] = []
@@ -295,6 +391,334 @@ def _has_total_support(mask: list[list[bool]], matching_size: int) -> bool:
             if components[row] != components[column_to_row[column]]:
                 return False
     return True
+
+
+def _has_total_support_adjacency(
+    row_adjacency: list[list[int]], size: int, matching_size: int
+) -> bool:
+    """Sparse equivalent of :func:`_has_total_support`."""
+
+    if matching_size != size or len(row_adjacency) != size:
+        return False
+    _, row_to_column, column_to_row = _maximum_matching_adjacency(
+        row_adjacency, size
+    )
+    adjacency: list[list[int]] = [[] for _ in range(size)]
+    for row, columns in enumerate(row_adjacency):
+        for column in columns:
+            matched_row = column_to_row[column]
+            if matched_row < 0:
+                return False
+            adjacency[row].append(matched_row)
+    components = _strong_components(adjacency)
+    for row, columns in enumerate(row_adjacency):
+        for column in columns:
+            if row_to_column[row] == column:
+                continue
+            if components[row] != components[column_to_row[column]]:
+                return False
+    return True
+
+
+def _has_total_support_with_dense_vacancy(
+    site_atomic_adjacency: list[list[int]],
+    atom_to_site: list[int],
+    num_sites: int,
+    num_atoms: int,
+) -> bool:
+    """Certify total support with implicit fully connected vacancy clones.
+
+    A complete atom matching leaves exactly ``K=M-N`` site rows for the
+    aggregate vacancy mass.  Dense vacancy-clone columns match those rows.  In
+    the alternating directed graph, every row connects to every vacancy row;
+    representing that complete relation by one root plus a vacancy-row star is
+    reachability-equivalent and costs ``O(E+M)`` rather than ``O(M*K)``.
+    """
+
+    vacancies = num_sites - num_atoms
+    if vacancies <= 0:
+        matching, _, _ = _maximum_matching_adjacency(
+            site_atomic_adjacency, num_atoms
+        )
+        return _has_total_support_adjacency(
+            site_atomic_adjacency, num_sites, matching
+        )
+    matched_sites = {site for site in atom_to_site if site >= 0}
+    vacancy_sites = [site for site in range(num_sites) if site not in matched_sites]
+    if len(vacancy_sites) != vacancies:
+        return False
+    root = vacancy_sites[0]
+    alternating: list[list[int]] = [[] for _ in range(num_sites)]
+    for site, atoms in enumerate(site_atomic_adjacency):
+        alternating[site].extend(atom_to_site[atom] for atom in atoms)
+        alternating[site].append(root)
+    # The complete vacancy relation makes all vacancy-matched rows mutually
+    # reachable.  This star has exactly the same transitive closure.
+    alternating[root].extend(vacancy_sites)
+    for site in vacancy_sites:
+        alternating[site].append(root)
+    components = _strong_components(alternating)
+    return len(set(components)) == 1
+
+
+def validate_compact_support_edges(
+    site_index: torch.Tensor,
+    atom_index: torch.Tensor,
+    distances: torch.Tensor,
+    switch: torch.Tensor,
+    num_sites: int,
+    num_atoms: int,
+    config: TransportSupportConfig,
+    *,
+    template_id: str | None = None,
+    sample_id: str | None = None,
+    cutoff_boundary_gap: float | None = None,
+    switch_on_boundary_gap: float | None = None,
+    candidate_boundary_gap: float | None = None,
+    mic_image_gap: float = math.inf,
+    maximum_mic_image_count: int = 1,
+    candidate_fingerprint: str | None = None,
+    processed_block_count: int = 0,
+    maximum_pair_block_elements: int = 0,
+    peak_temporary_geometry_elements: int = 0,
+) -> tuple[torch.Tensor, TransportSupportDiagnostics]:
+    """Validate compact candidate edges using sparse adjacency only.
+
+    ``site_index``/``atom_index`` enumerate every ``d < r_candidate`` pair in
+    canonical site-major order.  Matching and total-support certification use
+    only the strictly positive ``d < r_off`` graph; the dense aggregate
+    vacancy reservoir is represented by implicit vacancy-clone columns.
+    """
+
+    if not isinstance(config, TransportSupportConfig) or (
+        config.kind != "compact_c2" or config.backend != "edge_list"
+    ):
+        raise TransportSupportError(
+            "INVALID_SUPPORT_CONFIG",
+            "sparse support validation requires compact_c2 edge_list config",
+            template_id=template_id,
+            sample_id=sample_id,
+        )
+    if (
+        isinstance(num_sites, bool)
+        or isinstance(num_atoms, bool)
+        or not isinstance(num_sites, Integral)
+        or not isinstance(num_atoms, Integral)
+        or num_sites <= 0
+        or num_atoms < 0
+        or num_atoms > num_sites
+    ):
+        raise TransportSupportError(
+            "NO_TOTAL_SUPPORT",
+            f"invalid site/atom counts M={num_sites}, N={num_atoms}",
+            template_id=template_id,
+            sample_id=sample_id,
+        )
+    edges = int(site_index.numel())
+    if (
+        site_index.shape != (edges,)
+        or atom_index.shape != (edges,)
+        or site_index.dtype != torch.long
+        or atom_index.dtype != torch.long
+        or distances.shape != (edges,)
+        or switch.shape != (edges,)
+    ):
+        raise TransportSupportError(
+            "NONFINITE_SUPPORT_GEOMETRY",
+            "candidate indices/distances/switch have inconsistent edge shapes",
+            template_id=template_id,
+            sample_id=sample_id,
+        )
+    if (
+        site_index.device != distances.device
+        or atom_index.device != distances.device
+        or switch.device != distances.device
+        or switch.dtype != distances.dtype
+        or distances.dtype not in (torch.float32, torch.float64)
+    ):
+        raise TransportSupportError(
+            "UNSUPPORTED_DTYPE_DEVICE_CONFIG",
+            "candidate edge tensors must share float/index device and dtype",
+            template_id=template_id,
+            sample_id=sample_id,
+        )
+    if not bool(torch.all(torch.isfinite(distances)).detach()) or bool(
+        torch.any(distances < 0.0).detach()
+    ) or not bool(torch.all(torch.isfinite(switch)).detach()):
+        raise TransportSupportError(
+            "NONFINITE_SUPPORT_GEOMETRY",
+            "candidate edge geometry/switch is nonfinite or negative",
+            template_id=template_id,
+            sample_id=sample_id,
+        )
+    if edges and (
+        bool(torch.any((site_index < 0) | (site_index >= num_sites)).detach())
+        or bool(torch.any((atom_index < 0) | (atom_index >= num_atoms)).detach())
+    ):
+        raise TransportSupportError(
+            "NONFINITE_SUPPORT_GEOMETRY",
+            "candidate edge index lies outside the site/atom domain",
+            template_id=template_id,
+            sample_id=sample_id,
+        )
+    pair_key = site_index * max(num_atoms, 1) + atom_index
+    duplicate_count = edges - int(torch.unique(pair_key).numel())
+    if duplicate_count:
+        raise TransportSupportError(
+            "DUPLICATE_EDGE",
+            f"candidate list contains {duplicate_count} duplicate atom-site pairs",
+            template_id=template_id,
+            sample_id=sample_id,
+        )
+    if edges and bool(torch.any(pair_key[1:] <= pair_key[:-1]).detach()):
+        raise TransportSupportError(
+            "DUPLICATE_EDGE",
+            "candidate list is not in unique site-major canonical order",
+            template_id=template_id,
+            sample_id=sample_id,
+        )
+    if edges and bool(
+        torch.any(distances >= distances.new_tensor(config.r_candidate)).detach()
+    ):
+        raise TransportSupportError(
+            "CANDIDATE_BOUNDARY_INSTABILITY",
+            "candidate list contains an edge outside the strict candidate radius",
+            template_id=template_id,
+            sample_id=sample_id,
+        )
+
+    active = distances < distances.new_tensor(config.cutoff)
+    core = distances <= distances.new_tensor(config.r_on)
+    if bool(torch.any(active & (switch <= 0.0)).detach()) or bool(
+        torch.any((~active) & (switch != 0.0)).detach()
+    ):
+        raise TransportSupportError(
+            "NO_TOTAL_SUPPORT",
+            "compact switch does not match the positive-weight active graph",
+            template_id=template_id,
+            sample_id=sample_id,
+        )
+
+    candidate_site_cpu = site_index.detach().cpu().tolist()
+    candidate_atom_cpu = atom_index.detach().cpu().tolist()
+    active_cpu = active.detach().cpu().tolist()
+    core_cpu = core.detach().cpu().tolist()
+    site_candidate = [0] * num_sites
+    site_active = [0] * num_sites
+    site_core = [0] * num_sites
+    atom_candidate = [0] * num_atoms
+    atom_active = [0] * num_atoms
+    atom_core = [0] * num_atoms
+    atom_adjacency: list[list[int]] = [[] for _ in range(num_atoms)]
+    site_active_adjacency: list[list[int]] = [[] for _ in range(num_sites)]
+    for site, atom, is_active, is_core in zip(
+        candidate_site_cpu, candidate_atom_cpu, active_cpu, core_cpu
+    ):
+        site_candidate[site] += 1
+        atom_candidate[atom] += 1
+        if is_active:
+            site_active[site] += 1
+            atom_active[atom] += 1
+            atom_adjacency[atom].append(site)
+            site_active_adjacency[site].append(atom)
+        if is_core:
+            site_core[site] += 1
+            atom_core[atom] += 1
+    if num_atoms and min(atom_active) == 0:
+        atom = atom_active.index(0)
+        raise TransportSupportError(
+            "ATOM_WITHOUT_SUPPORT",
+            f"atom column {atom} has no active site edge",
+            template_id=template_id,
+            sample_id=sample_id,
+        )
+    atom_matching, atom_to_site, _ = _maximum_matching_adjacency(
+        atom_adjacency, num_sites
+    )
+    if atom_matching != num_atoms:
+        raise TransportSupportError(
+            "INCOMPLETE_ATOM_MATCHING",
+            f"maximum matching size {atom_matching} is smaller than N={num_atoms}",
+            template_id=template_id,
+            sample_id=sample_id,
+        )
+    total_matching = num_sites
+    total_support = _has_total_support_with_dense_vacancy(
+        site_active_adjacency,
+        atom_to_site,
+        num_sites,
+        num_atoms,
+    )
+    if total_matching != num_sites or not total_support:
+        raise TransportSupportError(
+            "NO_TOTAL_SUPPORT",
+            "atom plus dense vacancy support lacks total support for positive scaling",
+            template_id=template_id,
+            sample_id=sample_id,
+        )
+
+    def resolved_gap(value: float | None, boundary: float) -> float:
+        if value is not None:
+            return float(value)
+        if edges:
+            return float(torch.min(torch.abs(distances.detach() - boundary)).cpu())
+        return math.inf
+
+    dense_edges = num_sites * num_atoms
+    minimum_switch = (
+        0.0
+        if edges < dense_edges or not edges
+        else float(switch.detach().min().cpu())
+    )
+    maximum_switch = float(switch.detach().max().cpu()) if edges else 0.0
+    diagnostics = TransportSupportDiagnostics(
+        kind=config.kind,
+        backend=config.backend,
+        template_id=template_id,
+        sample_id=sample_id,
+        candidate_edge_count=edges,
+        active_edge_count=sum(site_active),
+        core_edge_count=sum(site_core),
+        atom_candidate_degrees=tuple(atom_candidate),
+        atom_active_degrees=tuple(atom_active),
+        atom_core_degrees=tuple(atom_core),
+        site_candidate_degrees=tuple(site_candidate),
+        site_active_degrees=tuple(site_active),
+        site_core_degrees=tuple(site_core),
+        duplicate_atom_site_edge_count=0,
+        maximum_atom_matching_size=atom_matching,
+        total_matching_size=total_matching,
+        total_support_feasible=True,
+        cutoff_boundary_gap=resolved_gap(cutoff_boundary_gap, config.cutoff),
+        switch_on_boundary_gap=resolved_gap(
+            switch_on_boundary_gap, config.r_on
+        ),
+        candidate_boundary_gap=resolved_gap(
+            candidate_boundary_gap, config.r_candidate
+        ),
+        active_dense_ratio=(sum(site_active) / dense_edges if dense_edges else 0.0),
+        candidate_dense_ratio=(edges / dense_edges if dense_edges else 0.0),
+        minimum_switch_value=minimum_switch,
+        maximum_switch_value=maximum_switch,
+        candidate_backend=config.candidate_backend,
+        num_sites=num_sites,
+        num_atoms=num_atoms,
+        site_block_size=(
+            config.site_block_size if config.candidate_backend == "blocked" else None
+        ),
+        atom_block_size=(
+            config.atom_block_size if config.candidate_backend == "blocked" else None
+        ),
+        processed_block_count=int(processed_block_count),
+        maximum_pair_block_elements=int(maximum_pair_block_elements),
+        theoretical_full_pair_elements=dense_edges,
+        peak_temporary_geometry_elements=int(peak_temporary_geometry_elements),
+        dense_candidate_allocation_observed=config.candidate_backend == "dense",
+        mic_image_gap=float(mic_image_gap),
+        maximum_mic_image_count=int(maximum_mic_image_count),
+        candidate_fingerprint=candidate_fingerprint,
+    )
+    return active, diagnostics
 
 
 def validate_compact_support(

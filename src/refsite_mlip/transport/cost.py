@@ -31,6 +31,30 @@ class MICImageDiagnostics:
     nearest_distance: torch.Tensor
     second_nearest_distance: torch.Tensor
     unique_image_gap: torch.Tensor
+    periodic_shift: torch.Tensor | None = None
+    maximum_image_count: int = 1
+
+
+def _selected_integer_shift(
+    displacement: torch.Tensor,
+    selected_displacement: torch.Tensor,
+    cell: torch.Tensor,
+    periodic: tuple[bool, bool, bool],
+) -> torch.Tensor:
+    """Recover the exact row-vector lattice shift of a selected MIC branch."""
+
+    if displacement.numel() == 0:
+        return torch.empty(
+            displacement.shape[:-1] + (3,),
+            dtype=torch.long,
+            device=displacement.device,
+        )
+    shift_cartesian = displacement - selected_displacement
+    shift_fractional = torch.linalg.solve(
+        cell.T, shift_cartesian.reshape(-1, 3).T
+    ).T.reshape(displacement.shape)
+    mask = displacement.new_tensor(periodic)
+    return (torch.round(shift_fractional) * mask).to(dtype=torch.long)
 
 
 def minimum_image_diagnostics(
@@ -52,6 +76,10 @@ def minimum_image_diagnostics(
         displacement, cell, pbc, image_range=image_range
     )
     periodic = _pbc_tuple(pbc)
+    periodic_shift = _selected_integer_shift(
+        displacement, nearest, cell, periodic
+    )
+    maximum_image_count = 1
     if minimum_unique_gap is not None and (
         isinstance(minimum_unique_gap, bool)
         or not isinstance(minimum_unique_gap, Real)
@@ -74,6 +102,21 @@ def minimum_image_diagnostics(
         base = torch.round(fractional) * mask
         base_residual = fractional - base
         smallest_singular_value = torch.linalg.svdvals(cell).min()
+        nearest_bound = torch.linalg.vector_norm(
+            base_residual @ cell, dim=-1
+        ).max()
+        nearest_radius = max(
+            int(image_range),
+            math.ceil(
+                float((nearest_bound / smallest_singular_value).detach().cpu())
+                + 0.5
+            ),
+        )
+        periodic_axes = sum(periodic)
+        maximum_image_count = max(
+            maximum_image_count,
+            (2 * nearest_radius + 1) ** periodic_axes,
+        )
 
         # A radius-one periodic stencil supplies an upper bound U on the
         # runner-up.  Any omitted integer offset k obeys
@@ -84,6 +127,9 @@ def minimum_image_diagnostics(
             list(itertools.product(*seed_axes)),
             dtype=displacement.dtype,
             device=displacement.device,
+        )
+        maximum_image_count = max(
+            maximum_image_count, int(seed_offsets.shape[0])
         )
         seed_candidates = (
             base_residual.unsqueeze(-2) - seed_offsets
@@ -107,6 +153,7 @@ def minimum_image_diagnostics(
             dtype=displacement.dtype,
             device=displacement.device,
         )
+        maximum_image_count = max(maximum_image_count, int(offsets.shape[0]))
         candidates = (base_residual.unsqueeze(-2) - offsets) @ cell
         distances = candidates.square().sum(dim=-1)
         best_two = torch.topk(distances, k=2, dim=-1, largest=False).values.sqrt()
@@ -125,7 +172,32 @@ def minimum_image_diagnostics(
         nearest_distance=nearest_distance,
         second_nearest_distance=second,
         unique_image_gap=gap,
+        periodic_shift=periodic_shift,
+        maximum_image_count=maximum_image_count,
     )
+
+
+def minimum_image_displacement_and_shift(
+    displacement: torch.Tensor,
+    cell: torch.Tensor,
+    pbc: Sequence[bool] | torch.Tensor,
+    *,
+    image_range: int = 2,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return the production MIC displacement and its integer row shift.
+
+    The displacement obeys ``raw - periodic_shift @ cell`` up to floating
+    arithmetic.  Shift selection is discrete control; callers that need live
+    derivatives should recompute the selected branch from their input tensors.
+    """
+
+    selected = minimum_image_displacement(
+        displacement, cell, pbc, image_range=image_range
+    )
+    shift = _selected_integer_shift(
+        displacement, selected, cell, _pbc_tuple(pbc)
+    )
+    return selected, shift
 
 
 def minimum_image_displacement(

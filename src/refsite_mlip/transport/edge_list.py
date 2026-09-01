@@ -41,6 +41,7 @@ class CompactTransportEdges:
     num_vacancies: int
     epsilon: torch.Tensor
     support_diagnostics: TransportSupportDiagnostics
+    periodic_shift: torch.Tensor | None = None
 
     def __post_init__(self) -> None:
         edges = int(self.site_index.numel())
@@ -52,6 +53,21 @@ class CompactTransportEdges:
             raise ValueError("edge indices must have shape [E]")
         if self.site_index.dtype != torch.long or self.atom_index.dtype != torch.long:
             raise ValueError("edge indices must use torch.long")
+        if self.periodic_shift is None:
+            object.__setattr__(
+                self,
+                "periodic_shift",
+                torch.zeros(
+                    (edges, 3), dtype=torch.long, device=self.site_index.device
+                ),
+            )
+        assert self.periodic_shift is not None
+        if (
+            self.periodic_shift.shape != (edges, 3)
+            or self.periodic_shift.dtype != torch.long
+            or self.periodic_shift.device != self.site_index.device
+        ):
+            raise ValueError("periodic_shift must be device-local long [E,3]")
         if self.active.shape != (edges,) or self.active.dtype != torch.bool:
             raise ValueError("active edge mask must be bool [E]")
         for name, value, shape in (
@@ -122,6 +138,131 @@ def _pointers(indices: torch.Tensor, size: int) -> torch.Tensor:
     return torch.cat((counts.new_zeros(1), torch.cumsum(counts, dim=0)))
 
 
+def build_compact_transport_edges_from_candidates(
+    site_index: torch.Tensor,
+    atom_index: torch.Tensor,
+    periodic_shift: torch.Tensor,
+    displacements: torch.Tensor,
+    *,
+    num_sites: int,
+    num_atoms: int,
+    epsilon_ot: float,
+    ell_ot: float,
+    config: TransportSupportConfig,
+    support_diagnostics: TransportSupportDiagnostics,
+    template_id: str | None = None,
+    sample_id: str | None = None,
+) -> CompactTransportEdges:
+    """Assemble live candidate arithmetic without any dense pair tensor."""
+
+    if not isinstance(config, TransportSupportConfig) or (
+        config.kind != "compact_c2" or config.backend != "edge_list"
+    ):
+        raise TransportSupportError(
+            "INVALID_SUPPORT_CONFIG",
+            "edge construction requires compact_c2 with backend=edge_list",
+            template_id=template_id,
+            sample_id=sample_id,
+        )
+    edges = int(site_index.numel())
+    if (
+        site_index.shape != (edges,)
+        or atom_index.shape != (edges,)
+        or periodic_shift.shape != (edges, 3)
+        or displacements.shape != (edges, 3)
+        or site_index.dtype != torch.long
+        or atom_index.dtype != torch.long
+        or periodic_shift.dtype != torch.long
+    ):
+        raise TransportSupportError(
+            "NONFINITE_SUPPORT_GEOMETRY",
+            "candidate indices, shifts, and displacements have invalid shapes",
+            template_id=template_id,
+            sample_id=sample_id,
+        )
+    if (
+        displacements.dtype not in (torch.float32, torch.float64)
+        or site_index.device != displacements.device
+        or atom_index.device != displacements.device
+        or periodic_shift.device != displacements.device
+        or not bool(torch.all(torch.isfinite(displacements)).detach())
+    ):
+        raise TransportSupportError(
+            "UNSUPPORTED_DTYPE_DEVICE_CONFIG",
+            "candidate edge geometry must be finite and share dtype/device",
+            template_id=template_id,
+            sample_id=sample_id,
+        )
+    if (
+        not math.isfinite(float(epsilon_ot))
+        or float(epsilon_ot) <= 0.0
+        or not math.isfinite(float(ell_ot))
+        or float(ell_ot) <= 0.0
+    ):
+        raise TransportSupportError(
+            "INVALID_SUPPORT_CONFIG",
+            "epsilon_ot and ell_ot must be finite and positive",
+            template_id=template_id,
+            sample_id=sample_id,
+        )
+
+    edge_distances = torch.linalg.vector_norm(displacements, dim=-1)
+    edge_switch = compact_c2_switch(edge_distances, config)
+    active = edge_distances < edge_distances.new_tensor(config.cutoff)
+    safe_switch = torch.where(active, edge_switch, torch.ones_like(edge_switch))
+    edge_cost = edge_distances.square() / edge_distances.new_tensor(
+        2.0 * float(ell_ot) ** 2
+    )
+    epsilon = edge_distances.new_tensor(float(epsilon_ot))
+    live_log_kernel = -edge_cost / epsilon + torch.log(safe_switch)
+    log_kernel = torch.where(
+        active, live_log_kernel, torch.full_like(live_log_kernel, -torch.inf)
+    )
+    if (
+        support_diagnostics.candidate_edge_count != edges
+        or support_diagnostics.active_edge_count
+        != int(active.detach().sum().cpu())
+    ):
+        raise TransportSupportError(
+            "NO_TOTAL_SUPPORT",
+            "support diagnostics do not match live candidate count/activity",
+            template_id=template_id,
+            sample_id=sample_id,
+        )
+    if edges:
+        pair_key = site_index * max(num_atoms, 1) + atom_index
+        if bool(torch.any(pair_key[1:] <= pair_key[:-1]).detach()):
+            raise TransportSupportError(
+                "DUPLICATE_EDGE",
+                "candidate edge ordering is not unique site-major",
+                template_id=template_id,
+                sample_id=sample_id,
+            )
+    site_ptr = _pointers(site_index, num_sites)
+    atom_key = atom_index * max(num_sites, 1) + site_index
+    atom_major = torch.argsort(atom_key, stable=True)
+    atom_ptr = _pointers(atom_index[atom_major], num_atoms)
+
+    return CompactTransportEdges(
+        site_index=site_index,
+        atom_index=atom_index,
+        displacements=displacements,
+        distances=edge_distances,
+        switch=edge_switch,
+        log_kernel=log_kernel,
+        active=active,
+        atom_major_permutation=atom_major,
+        site_ptr=site_ptr,
+        atom_ptr=atom_ptr,
+        num_sites=num_sites,
+        num_atoms=num_atoms,
+        num_vacancies=num_sites - num_atoms,
+        epsilon=epsilon,
+        support_diagnostics=support_diagnostics,
+        periodic_shift=periodic_shift,
+    )
+
+
 def build_compact_transport_edges(
     displacements: torch.Tensor,
     *,
@@ -139,6 +280,13 @@ def build_compact_transport_edges(
         raise TransportSupportError(
             "INVALID_SUPPORT_CONFIG",
             "edge construction requires compact_c2 with backend=edge_list",
+            template_id=template_id,
+            sample_id=sample_id,
+        )
+    if config.candidate_backend != "dense":
+        raise TransportSupportError(
+            "INVALID_SUPPORT_CONFIG",
+            "blocked candidates require build_periodic_compact_transport_edges",
             template_id=template_id,
             sample_id=sample_id,
         )
@@ -195,49 +343,23 @@ def build_compact_transport_edges(
     site_index = pairs[:, 0].to(dtype=torch.long)
     atom_index = pairs[:, 1].to(dtype=torch.long)
     edge_displacements = displacements[site_index, atom_index]
-    edge_distances = torch.linalg.vector_norm(edge_displacements, dim=-1)
-    edge_switch = compact_c2_switch(edge_distances, config)
-    active = edge_distances < edge_distances.new_tensor(config.cutoff)
-    safe_switch = torch.where(active, edge_switch, torch.ones_like(edge_switch))
-    edge_cost = edge_distances.square() / edge_distances.new_tensor(
-        2.0 * float(ell_ot) ** 2
-    )
-    epsilon = edge_distances.new_tensor(float(epsilon_ot))
-    live_log_kernel = -edge_cost / epsilon + torch.log(safe_switch)
-    log_kernel = torch.where(
-        active, live_log_kernel, torch.full_like(live_log_kernel, -torch.inf)
-    )
-
-    if site_index.numel():
-        pair_key = site_index * max(atoms, 1) + atom_index
-        if int(torch.unique(pair_key).numel()) != int(pair_key.numel()):
-            raise TransportSupportError(
-                "NO_TOTAL_SUPPORT",
-                "duplicate atom-site candidate edge",
-                template_id=template_id,
-                sample_id=sample_id,
-            )
-    site_ptr = _pointers(site_index, sites)
-    atom_key = atom_index * max(sites, 1) + site_index
-    atom_major = torch.argsort(atom_key, stable=True)
-    atom_ptr = _pointers(atom_index[atom_major], atoms)
-
-    return CompactTransportEdges(
+    return build_compact_transport_edges_from_candidates(
         site_index=site_index,
         atom_index=atom_index,
+        periodic_shift=torch.zeros(
+            (int(site_index.numel()), 3),
+            dtype=torch.long,
+            device=site_index.device,
+        ),
         displacements=edge_displacements,
-        distances=edge_distances,
-        switch=edge_switch,
-        log_kernel=log_kernel,
-        active=active,
-        atom_major_permutation=atom_major,
-        site_ptr=site_ptr,
-        atom_ptr=atom_ptr,
         num_sites=sites,
         num_atoms=atoms,
-        num_vacancies=sites - atoms,
-        epsilon=epsilon,
+        epsilon_ot=epsilon_ot,
+        ell_ot=ell_ot,
+        config=config,
         support_diagnostics=diagnostics,
+        template_id=template_id,
+        sample_id=sample_id,
     )
 
 
