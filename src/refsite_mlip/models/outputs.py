@@ -66,6 +66,16 @@ class EvaluationDiagnostics:
     transport_candidate_dense_ratio: float | None = None
     transport_support_fingerprint: str | None = None
     transport_dense_plan_materialized: bool = True
+    transport_candidate_backend: str = "dense"
+    transport_site_block_size: int | None = None
+    transport_atom_block_size: int | None = None
+    transport_processed_block_count: int = 0
+    transport_maximum_pair_block_elements: int = 0
+    transport_theoretical_full_pair_elements: int = 0
+    transport_peak_temporary_geometry_elements: int = 0
+    transport_dense_candidate_allocation_observed: bool = True
+    transport_mic_image_gap: float = float("inf")
+    transport_candidate_fingerprint: str | None = None
 
 
 @dataclass(frozen=True)

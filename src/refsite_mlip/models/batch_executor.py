@@ -192,13 +192,22 @@ def _raise_grouped_evaluation_error(
     sample_id: str,
     template_id: str,
     backend: str,
+    candidate_backend: str,
+    site_block_size: int,
+    atom_block_size: int,
 ) -> None:
     support_fingerprint = getattr(error, "support_fingerprint", None)
-    solver_stage = getattr(error, "stage", None)
+    solver_stage = getattr(
+        error,
+        "stage",
+        "candidate_extraction" if isinstance(error, TransportSupportError) else None,
+    )
     context = (
         f"structure_index={structure_index} sample_id={sample_id!r} "
         f"template_id={template_id!r} stage=single_structure_evaluation "
-        f"backend={backend!r} support_fingerprint={support_fingerprint!r} "
+        f"backend={backend!r} candidate_backend={candidate_backend!r} "
+        f"site_block_size={site_block_size} atom_block_size={atom_block_size} "
+        f"support_fingerprint={support_fingerprint!r} "
         f"solver_stage={solver_stage!r} original_exception="
         f"{type(error).__name__}: {error}"
     )
@@ -226,6 +235,37 @@ def _raise_grouped_evaluation_error(
         "STRUCTURE_EVALUATION_FAILED",
         context,
         template_id=template_id,
+    ) from error
+
+
+def _raise_grouped_blocked_transport_error(
+    error: TransportSupportError,
+    *,
+    structure_index: int,
+    sample_id: str,
+    template_id: str,
+    backend: str,
+    candidate_backend: str,
+    site_block_size: int,
+    atom_block_size: int,
+) -> None:
+    """Add ragged-structure context without changing the support reason code."""
+
+    support_fingerprint = getattr(error, "support_fingerprint", None)
+    solver_stage = getattr(error, "stage", "candidate_extraction")
+    context = (
+        f"structure_index={structure_index} sample_id={sample_id!r} "
+        f"template_id={template_id!r} stage={solver_stage!r} "
+        f"backend={backend!r} candidate_backend={candidate_backend!r} "
+        f"site_block_size={site_block_size} atom_block_size={atom_block_size} "
+        f"support_fingerprint={support_fingerprint!r} original_exception="
+        f"{type(error).__name__}: {error}"
+    )
+    raise TransportSupportError(
+        error.reason_code,
+        context,
+        template_id=template_id,
+        sample_id=sample_id,
     ) from error
 
 
@@ -299,6 +339,21 @@ def evaluate_structure_batch(
                 )
             except Exception as error:
                 if solver_path != EVAL_ADAPTIVE:
+                    support = model.config.transport_support
+                    if (
+                        support.candidate_backend == "blocked"
+                        and isinstance(error, TransportSupportError)
+                    ):
+                        _raise_grouped_blocked_transport_error(
+                            error,
+                            structure_index=structure_index,
+                            sample_id=batch.sample_ids[structure_index],
+                            template_id=group.template_id,
+                            backend=support.backend,
+                            candidate_backend=support.candidate_backend,
+                            site_block_size=support.site_block_size,
+                            atom_block_size=support.atom_block_size,
+                        )
                     raise
                 _raise_grouped_evaluation_error(
                     error,
@@ -306,6 +361,11 @@ def evaluate_structure_batch(
                     sample_id=batch.sample_ids[structure_index],
                     template_id=group.template_id,
                     backend=model.config.transport_support.backend,
+                    candidate_backend=(
+                        model.config.transport_support.candidate_backend
+                    ),
+                    site_block_size=model.config.transport_support.site_block_size,
+                    atom_block_size=model.config.transport_support.atom_block_size,
                 )
 
     if any(output is None for output in outputs):

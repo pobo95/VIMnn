@@ -20,7 +20,7 @@ from refsite_mlip.phase.newton import solve_training_phase
 from refsite_mlip.phase.objective import typed_reciprocal_fields
 from refsite_mlip.phase.stabilizer import validate_alias_matches_stabilizer
 from refsite_mlip.phase.types import EvaluationPhaseError
-from refsite_mlip.transport import TRAIN_FIXED,EVAL_ADAPTIVE,TrainSinkhornConfig,EvalOTConfig,SparseAdaptiveTransportError,TransportSupportError,atom_site_displacements,build_compact_transport_edges,solve_atom_vacancy_ot,solve_sparse_hybrid_eval,solve_sparse_sinkhorn_train_fixed,sparse_support_fingerprint
+from refsite_mlip.transport import TRAIN_FIXED,EVAL_ADAPTIVE,TrainSinkhornConfig,EvalOTConfig,SparseAdaptiveTransportError,TransportSupportError,atom_site_displacements,build_compact_transport_edges,build_periodic_compact_transport_edges,solve_atom_vacancy_ot,solve_sparse_hybrid_eval,solve_sparse_sinkhorn_train_fixed,sparse_support_fingerprint
 from .config import PotentialConfig
 from .evaluation_policy import EvaluationPolicy
 from .outputs import EvaluationDiagnostics, PotentialOutput
@@ -341,6 +341,46 @@ class ReferenceSitePotential(nn.Module):
             transport_dense_plan_materialized=bool(
                 getattr(ot, "dense_plan_materialized", True)
             ),
+            transport_candidate_backend=(
+                support.candidate_backend
+                if support is not None
+                else support_config.candidate_backend
+            ),
+            transport_site_block_size=(
+                support.site_block_size if support is not None else None
+            ),
+            transport_atom_block_size=(
+                support.atom_block_size if support is not None else None
+            ),
+            transport_processed_block_count=(
+                support.processed_block_count if support is not None else 0
+            ),
+            transport_maximum_pair_block_elements=(
+                support.maximum_pair_block_elements
+                if support is not None
+                else 0
+            ),
+            transport_theoretical_full_pair_elements=(
+                support.theoretical_full_pair_elements
+                if support is not None
+                else 0
+            ),
+            transport_peak_temporary_geometry_elements=(
+                support.peak_temporary_geometry_elements
+                if support is not None
+                else 0
+            ),
+            transport_dense_candidate_allocation_observed=(
+                support.dense_candidate_allocation_observed
+                if support is not None
+                else support_config.candidate_backend == "dense"
+            ),
+            transport_mic_image_gap=(
+                support.mic_image_gap if support is not None else math.inf
+            ),
+            transport_candidate_fingerprint=(
+                support.candidate_fingerprint if support is not None else None
+            ),
         )
 
     def energy(
@@ -430,20 +470,41 @@ class ReferenceSitePotential(nn.Module):
                 "selected refined phase is detached from the input geometry",
                 template_id=runtime.template_id,
             )
-        references=aligned_reference_sites(topology.reference_fractional,phase,origin,cell); displacements=atom_site_displacements(positions,references,cell,topology.pbc)
+        references=aligned_reference_sites(topology.reference_fractional,phase,origin,cell)
         edge_backend=(
             self.config.transport_support.kind == "compact_c2"
             and self.config.transport_support.backend == "edge_list"
         )
+        blocked_candidates=(
+            edge_backend
+            and self.config.transport_support.candidate_backend == "blocked"
+        )
         evaluation_ot_tolerance = None
         if edge_backend:
-            edges=build_compact_transport_edges(
-                displacements,
-                epsilon_ot=self.config.epsilon_ot,
-                ell_ot=self.config.ell_ot,
-                config=self.config.transport_support,
-                template_id=getattr(runtime, "template_id", None),
-            )
+            if blocked_candidates:
+                edges=build_periodic_compact_transport_edges(
+                    positions,
+                    references,
+                    cell,
+                    topology.pbc,
+                    origin=origin,
+                    epsilon_ot=self.config.epsilon_ot,
+                    ell_ot=self.config.ell_ot,
+                    config=self.config.transport_support,
+                    template_id=getattr(runtime, "template_id", None),
+                )
+            else:
+                # Preserve the legacy dense-candidate arithmetic exactly.
+                displacements=atom_site_displacements(
+                    positions,references,cell,topology.pbc
+                )
+                edges=build_compact_transport_edges(
+                    displacements,
+                    epsilon_ot=self.config.epsilon_ot,
+                    ell_ot=self.config.ell_ot,
+                    config=self.config.transport_support,
+                    template_id=getattr(runtime, "template_id", None),
+                )
             if solver_path == TRAIN_FIXED:
                 ot=solve_sparse_sinkhorn_train_fixed(
                     edges,TrainSinkhornConfig(self.config.train_sinkhorn_iterations)
@@ -464,6 +525,9 @@ class ReferenceSitePotential(nn.Module):
                     error.support_fingerprint = sparse_support_fingerprint(edges)
                     raise
         else:
+            displacements=atom_site_displacements(
+                positions,references,cell,topology.pbc
+            )
             cost=displacements.square().sum(-1)/(2*self.config.ell_ot**2)
         if solver_path==TRAIN_FIXED and not edge_backend:
             distances = (
