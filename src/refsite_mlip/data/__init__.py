@@ -24,6 +24,17 @@ from .reference_builder import (
     canonicalize_reference_atoms,
     nbc_rocksalt_template_builder_config,
 )
+from .reference_artifact import (
+    REFERENCE_STRUCTURE_ARTIFACT_SCHEMA_VERSION,
+    REFERENCE_STRUCTURE_ARTIFACT_SCOPE,
+    ReferenceStructureArtifact,
+    ReferenceStructureArtifactDiagnostics,
+    ReferenceStructureArtifactError,
+    assemble_reference_template_from_artifact,
+    capture_reference_structure_artifact,
+    load_reference_structure_artifact,
+    save_reference_structure_artifact,
+)
 from .extxyz import (
     EXTXYZ_LOADER_CONVENTION_VERSION,
     EXTXYZ_UNIT_CONVENTION_VERSION,
@@ -50,6 +61,11 @@ __all__ = [
     "LENGTH_UNIT",
     "NumericStatistics",
     "ReferenceTemplate",
+    "REFERENCE_STRUCTURE_ARTIFACT_SCHEMA_VERSION",
+    "REFERENCE_STRUCTURE_ARTIFACT_SCOPE",
+    "ReferenceStructureArtifact",
+    "ReferenceStructureArtifactDiagnostics",
+    "ReferenceStructureArtifactError",
     "ReferenceTemplateBuildDiagnostics",
     "ReferenceTemplateBuilderConfig",
     "ReferenceTemplateBuildResult",
@@ -65,9 +81,13 @@ __all__ = [
     "TemplateRegistry",
     "build_reference_template_from_atoms",
     "build_reference_template_from_poscar",
+    "assemble_reference_template_from_artifact",
+    "capture_reference_structure_artifact",
     "canonicalize_reference_atoms",
     "collate_structure_samples",
     "load_extxyz_dataset",
     "load_extxyz_samples",
+    "load_reference_structure_artifact",
     "nbc_rocksalt_template_builder_config",
+    "save_reference_structure_artifact",
 ]
