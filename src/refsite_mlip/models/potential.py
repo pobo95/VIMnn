@@ -1,5 +1,6 @@
 from __future__ import annotations
 import contextlib
+import hashlib
 import math
 import torch
 from torch import nn
@@ -20,13 +21,26 @@ from refsite_mlip.phase.newton import solve_training_phase
 from refsite_mlip.phase.objective import typed_reciprocal_fields
 from refsite_mlip.phase.stabilizer import validate_alias_matches_stabilizer
 from refsite_mlip.phase.types import EvaluationPhaseError
-from refsite_mlip.transport import TRAIN_FIXED,EVAL_ADAPTIVE,TrainSinkhornConfig,EvalOTConfig,SparseAdaptiveTransportError,TransportSupportError,atom_site_displacements,build_compact_transport_edges,build_periodic_compact_transport_edges,solve_atom_vacancy_ot,solve_sparse_hybrid_eval,solve_sparse_sinkhorn_train_fixed,sparse_support_fingerprint
+from refsite_mlip.transport import TRAIN_FIXED,EVAL_ADAPTIVE,TrainSinkhornConfig,EvalOTConfig,CompactCandidateNeighborState,SparseAdaptiveTransportError,TransportSupportError,atom_site_displacements,build_compact_transport_edges,build_periodic_compact_transport_edges,solve_atom_vacancy_ot,solve_sparse_hybrid_eval,solve_sparse_sinkhorn_train_fixed,sparse_support_fingerprint,update_candidate_neighbor_state
 from .config import PotentialConfig
 from .evaluation_policy import EvaluationPolicy
 from .outputs import EvaluationDiagnostics, PotentialOutput
 from .readout import SiteEnergyReadout
 from .residual_block import ResidualInteractionBlock
 from .template_context import TemplateExecutionContext
+
+
+def _fingerprint_text(digest, value):
+    encoded = str(value).encode("utf-8")
+    digest.update(len(encoded).to_bytes(8, "little"))
+    digest.update(encoded)
+
+
+def _fingerprint_tensor(digest, tensor):
+    value = tensor.detach().cpu().contiguous()
+    _fingerprint_text(digest, value.dtype)
+    _fingerprint_text(digest, tuple(value.shape))
+    digest.update(value.numpy().tobytes())
 
 class ReferenceSitePotential(nn.Module):
     def __init__(self,config:PotentialConfig,topology,phase_modes,phase_mode_weights,species_alignment_weights,site_alignment_weights,phase_channel_weights,atomic_baseline=None):
@@ -41,6 +55,175 @@ class ReferenceSitePotential(nn.Module):
         beta=1/math.sqrt(config.num_layers); self.layers=nn.ModuleList([ResidualInteractionBlock(self.irreps_hidden,self.central.irreps,higher,beta) for _ in range(config.num_layers)])
         scalar_dim=self.irreps_hidden[0].mul; self.scalar_slice=self.irreps_hidden.slices()[0]
         self.readout=SiteEnergyReadout(scalar_dim,self.central.num_channels,config.readout_hidden,config.energy_scale)
+
+    def _legacy_candidate_template_fingerprint(self):
+        """Content identity for legacy calls without a runtime context.
+
+        Runtime templates already carry their canonical SHA-256 fingerprint.
+        This path exists only for the backward-compatible topology/buffer API
+        and is evaluated exclusively when caller-owned candidate state is
+        requested.
+        """
+
+        digest = hashlib.sha256()
+        _fingerprint_text(digest, "legacy_reference_site_candidate_template_v1")
+        topology = self.topology
+        for tensor in (
+            topology.reference_fractional,
+            topology.site_types,
+            topology.edge_index,
+            topology.shifts,
+            topology.reference_cell,
+            self.phase_modes,
+            self.phase_mode_weights,
+            self.site_alignment_weights,
+            self.phase_channel_weights,
+            self.species_alignment_weights,
+        ):
+            _fingerprint_tensor(digest, tensor)
+        for value in (
+            topology.cutoff,
+            topology.skin,
+            topology.maximum_strain,
+            topology.minimum_edge_length,
+            topology.pbc,
+            self.config.species_vocabulary,
+        ):
+            _fingerprint_text(digest, value)
+        return digest.hexdigest()
+
+    @staticmethod
+    def _candidate_phase_branch_fingerprint(
+        template_fingerprint,
+        solver_path,
+        evaluation,
+    ):
+        digest = hashlib.sha256()
+        _fingerprint_text(digest, "candidate_phase_site_branch_v1")
+        _fingerprint_text(digest, template_fingerprint)
+        _fingerprint_text(digest, solver_path)
+        if solver_path == TRAIN_FIXED:
+            _fingerprint_text(digest, "training_fixed_phase_branch")
+        else:
+            _fingerprint_text(digest, "stabilizer_group")
+            _fingerprint_text(
+                digest, int(evaluation.selected_grouped_index.detach().cpu())
+            )
+        return digest.hexdigest()
+
+    def _validate_candidate_state_request(
+        self,
+        candidate_neighbor_state,
+        return_candidate_neighbor_state,
+    ):
+        if not isinstance(return_candidate_neighbor_state, bool):
+            raise TypeError("return_candidate_neighbor_state must be bool")
+        requested = (
+            candidate_neighbor_state is not None
+            or return_candidate_neighbor_state
+        )
+        if not requested:
+            return False
+        if candidate_neighbor_state is not None and not isinstance(
+            candidate_neighbor_state, CompactCandidateNeighborState
+        ):
+            raise TypeError(
+                "candidate_neighbor_state must be a CompactCandidateNeighborState or None"
+            )
+        support = self.config.transport_support
+        if not (
+            support.kind == "compact_c2"
+            and support.backend == "edge_list"
+            and support.candidate_backend == "blocked"
+        ):
+            raise TransportSupportError(
+                "INVALID_SUPPORT_CONFIG",
+                "candidate neighbor state requires compact_c2 transport with "
+                "backend='edge_list' and candidate_backend='blocked'",
+            )
+        if not support.candidate_skin > 0.0:
+            raise TransportSupportError(
+                "INVALID_SUPPORT_CONFIG",
+                "candidate neighbor state requires a positive candidate skin",
+            )
+        if candidate_neighbor_state is not None:
+            candidate_neighbor_state.validate_integrity()
+        return True
+
+    @staticmethod
+    def _validate_candidate_state_binding(
+        state,
+        *,
+        template_fingerprint,
+        support_config,
+        atomic_numbers,
+        num_sites,
+    ):
+        if state is None:
+            return
+        if state.template_fingerprint != template_fingerprint:
+            raise TransportSupportError(
+                "TEMPLATE_MISMATCH",
+                "candidate neighbor state is bound to a different template",
+                template_id=template_fingerprint,
+            )
+        if not state.matches_support_config(support_config):
+            raise TransportSupportError(
+                "SUPPORT_CONFIG_MISMATCH",
+                "candidate neighbor state is bound to different compact support content",
+                template_id=template_fingerprint,
+            )
+        if state.num_sites != num_sites or state.num_atoms != atomic_numbers.shape[0]:
+            raise TransportSupportError(
+                "ATOM_COUNT_CHANGED",
+                "candidate neighbor state M/N differs from the current structure",
+                template_id=template_fingerprint,
+            )
+        if not torch.equal(
+            state.build_atomic_numbers.detach().cpu(),
+            atomic_numbers.detach().cpu(),
+        ):
+            raise TransportSupportError(
+                "ATOM_ORDER_CHANGED",
+                "candidate neighbor state atomic species/order differs from the current structure",
+                template_id=template_fingerprint,
+            )
+        expected_identity = torch.arange(
+            atomic_numbers.shape[0], dtype=torch.long
+        )
+        if not torch.equal(
+            state.build_atom_order_identity.detach().cpu(), expected_identity
+        ):
+            raise TransportSupportError(
+                "ATOM_ORDER_CHANGED",
+                "candidate neighbor state uses an incompatible atom-order identity contract",
+                template_id=template_fingerprint,
+            )
+
+    @staticmethod
+    def _candidate_state_diagnostics(
+        *,
+        state_provided,
+        state,
+        decision,
+        support_config,
+    ):
+        diagnostics = decision.to_dict()
+        diagnostics.update(
+            {
+                "state_requested": True,
+                "state_provided": bool(state_provided),
+                "state_integrity_fingerprint": state.integrity_fingerprint,
+                "state_content_fingerprint": state.support_content_fingerprint,
+                "phase_site_branch_fingerprint": state.phase_site_branch_fingerprint,
+                "candidate_backend": support_config.candidate_backend,
+                "transport_backend": support_config.backend,
+                "site_block_size": support_config.site_block_size,
+                "atom_block_size": support_config.atom_block_size,
+                "dense_allocation_observed": False,
+            }
+        )
+        return diagnostics
     def _species_indices(self,atomic_numbers):
         vocab=torch.tensor(self.config.species_vocabulary,dtype=torch.long,device=atomic_numbers.device); match=atomic_numbers[:,None]==vocab[None,:]
         if bool(torch.any(match.sum(-1)!=1)): raise ValueError('unknown atomic species')
@@ -394,10 +577,16 @@ class ReferenceSitePotential(nn.Module):
         return_aux=False,
         template_context=None,
         evaluation_policy=None,
+        candidate_neighbor_state=None,
+        return_candidate_neighbor_state=False,
         _evaluation_derivative_request=False,
         _forces_requested=False,
         _stress_requested=False,
     ):
+        candidate_state_requested = self._validate_candidate_state_request(
+            candidate_neighbor_state,
+            return_candidate_neighbor_state,
+        )
         if solver_path == TRAIN_FIXED:
             if evaluation_policy is not None:
                 raise ValueError(
@@ -480,19 +669,59 @@ class ReferenceSitePotential(nn.Module):
             and self.config.transport_support.candidate_backend == "blocked"
         )
         evaluation_ot_tolerance = None
+        next_candidate_state = None
+        candidate_reuse_decision = None
         if edge_backend:
             if blocked_candidates:
-                edges=build_periodic_compact_transport_edges(
-                    positions,
-                    references,
-                    cell,
-                    topology.pbc,
-                    origin=origin,
-                    epsilon_ot=self.config.epsilon_ot,
-                    ell_ot=self.config.ell_ot,
-                    config=self.config.transport_support,
-                    template_id=getattr(runtime, "template_id", None),
-                )
+                if candidate_state_requested:
+                    template_fingerprint = (
+                        runtime.fingerprint
+                        if runtime is not None
+                        else self._legacy_candidate_template_fingerprint()
+                    )
+                    phase_branch_fingerprint = (
+                        self._candidate_phase_branch_fingerprint(
+                            template_fingerprint,
+                            solver_path,
+                            evaluation,
+                        )
+                    )
+                    self._validate_candidate_state_binding(
+                        candidate_neighbor_state,
+                        template_fingerprint=template_fingerprint,
+                        support_config=self.config.transport_support,
+                        atomic_numbers=atomic_numbers,
+                        num_sites=topology.num_sites,
+                    )
+                    candidate_update = update_candidate_neighbor_state(
+                        candidate_neighbor_state,
+                        positions,
+                        references,
+                        cell,
+                        topology.pbc,
+                        origin=origin,
+                        atomic_numbers=atomic_numbers,
+                        template_fingerprint=template_fingerprint,
+                        phase_site_branch_fingerprint=phase_branch_fingerprint,
+                        epsilon_ot=self.config.epsilon_ot,
+                        ell_ot=self.config.ell_ot,
+                        config=self.config.transport_support,
+                    )
+                    edges = candidate_update.edges
+                    next_candidate_state = candidate_update.state
+                    candidate_reuse_decision = candidate_update.decision
+                else:
+                    edges=build_periodic_compact_transport_edges(
+                        positions,
+                        references,
+                        cell,
+                        topology.pbc,
+                        origin=origin,
+                        epsilon_ot=self.config.epsilon_ot,
+                        ell_ot=self.config.ell_ot,
+                        config=self.config.transport_support,
+                        template_id=getattr(runtime, "template_id", None),
+                    )
             else:
                 # Preserve the legacy dense-candidate arithmetic exactly.
                 displacements=atom_site_displacements(
@@ -639,6 +868,15 @@ class ReferenceSitePotential(nn.Module):
             aux={'phase':phase,'ot':ot,'q':ot.q,'multipoles':features,'correlations':correlations}
             if ot.support_diagnostics is not None:
                 aux['transport_support']=ot.support_diagnostics
+            if candidate_state_requested:
+                aux['candidate_neighbor_diagnostics']=(
+                    self._candidate_state_diagnostics(
+                        state_provided=candidate_neighbor_state is not None,
+                        state=next_candidate_state,
+                        decision=candidate_reuse_decision,
+                        support_config=self.config.transport_support,
+                    )
+                )
             if evaluation is not None:
                 aux['evaluation_diagnostics']=self._compact_evaluation_diagnostics(
                     runtime,
@@ -654,8 +892,46 @@ class ReferenceSitePotential(nn.Module):
                 )
         else:
             aux=None
-        return PotentialOutput(total,site_energy,baseline,residual,h,c_raw,auxiliary=aux)
-    def forward(self,positions,atomic_numbers,cell,origin,*,solver_path=TRAIN_FIXED,compute_forces=False,compute_stress=False,create_graph=False,return_aux=False,template_context=None,evaluation_policy=None):
+        return PotentialOutput(
+            total,
+            site_energy,
+            baseline,
+            residual,
+            h,
+            c_raw,
+            auxiliary=aux,
+            candidate_neighbor_state=next_candidate_state,
+            candidate_reuse_decision=candidate_reuse_decision,
+        )
+    def forward(
+        self,
+        positions,
+        atomic_numbers,
+        cell,
+        origin,
+        *,
+        solver_path=TRAIN_FIXED,
+        compute_forces=False,
+        compute_stress=False,
+        create_graph=False,
+        return_aux=False,
+        template_context=None,
+        evaluation_policy=None,
+        candidate_neighbor_state=None,
+        return_candidate_neighbor_state=False,
+    ):
+        """Evaluate one structure, optionally threading caller-owned neighbors.
+
+        Candidate neighbor state is purely functional: when supplied, the
+        returned :class:`PotentialOutput` always contains the next immutable
+        state.  Omitting both state keywords preserves the stateless blocked
+        candidate path and does no state snapshot or integrity hashing.
+        """
+
+        self._validate_candidate_state_request(
+            candidate_neighbor_state,
+            return_candidate_neighbor_state,
+        )
         derivative_requested = compute_forces or compute_stress
         if solver_path == EVAL_ADAPTIVE and create_graph:
             raise EvaluationPhaseError(
@@ -674,7 +950,18 @@ class ReferenceSitePotential(nn.Module):
                 template_id=getattr(template_context, "template_id", None),
             )
         if not derivative_requested:
-            return self.energy(positions,atomic_numbers,cell,origin,solver_path=solver_path,return_aux=return_aux,template_context=template_context,evaluation_policy=evaluation_policy)
+            return self.energy(
+                positions,
+                atomic_numbers,
+                cell,
+                origin,
+                solver_path=solver_path,
+                return_aux=return_aux,
+                template_context=template_context,
+                evaluation_policy=evaluation_policy,
+                candidate_neighbor_state=candidate_neighbor_state,
+                return_candidate_neighbor_state=return_candidate_neighbor_state,
+            )
 
         grad_context = (
             torch.enable_grad()
@@ -691,6 +978,10 @@ class ReferenceSitePotential(nn.Module):
                 derivative_positions = positions.detach().clone().requires_grad_(True)
             strain=torch.zeros((3,3),dtype=positions.dtype,device=positions.device,requires_grad=compute_stress)
             F=torch.eye(3,dtype=positions.dtype,device=positions.device)+strain
+            # Candidate-state control is evaluated at eta=0 (the externally
+            # supplied base cell).  The selected cached pair identities then
+            # receive live p/H/o tensors, so affine stress derivatives still
+            # traverse the current displacement, switch, OT, and energy graph.
             p=derivative_positions@F; H=cell@F; o=origin@F
             out=self.energy(
                 p,atomic_numbers,H,o,
@@ -698,6 +989,8 @@ class ReferenceSitePotential(nn.Module):
                 return_aux=return_aux,
                 template_context=template_context,
                 evaluation_policy=evaluation_policy,
+                candidate_neighbor_state=candidate_neighbor_state,
+                return_candidate_neighbor_state=return_candidate_neighbor_state,
                 _evaluation_derivative_request=(solver_path == EVAL_ADAPTIVE),
                 _forces_requested=compute_forces,
                 _stress_requested=compute_stress,
@@ -737,4 +1030,17 @@ class ReferenceSitePotential(nn.Module):
                         "evaluation stress is nonfinite",
                         template_id=getattr(template_context, "template_id", None),
                     )
-            return PotentialOutput(out.energy,out.site_energy,out.baseline_energy,out.residual_energy,out.site_features,out.raw_c,forces,stress,voigt,out.auxiliary)
+            return PotentialOutput(
+                out.energy,
+                out.site_energy,
+                out.baseline_energy,
+                out.residual_energy,
+                out.site_features,
+                out.raw_c,
+                forces,
+                stress,
+                voigt,
+                out.auxiliary,
+                out.candidate_neighbor_state,
+                out.candidate_reuse_decision,
+            )

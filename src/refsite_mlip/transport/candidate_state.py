@@ -685,6 +685,21 @@ class CompactCandidateNeighborState:
                 "candidate state tensor or metadata was mutated",
             )
 
+    def matches_support_config(self, config: TransportSupportConfig) -> bool:
+        """Return whether ``config`` has the same physical support content.
+
+        Candidate block sizes are execution details and intentionally do not
+        participate.  Consumers can therefore reject a stale physical binding
+        before doing a fresh traversal while still permitting block-size
+        changes during reuse.
+        """
+
+        self.validate_integrity()
+        _validate_support_config(config)
+        return self.support_content_fingerprint == _support_content_fingerprint(
+            config
+        )
+
     def to(
         self,
         *,

@@ -1,6 +1,12 @@
 from dataclasses import dataclass
+from collections.abc import Mapping
 from typing import Any
 import torch
+
+from refsite_mlip.transport import (
+    CandidateReuseDecision,
+    CompactCandidateNeighborState,
+)
 
 
 @dataclass(frozen=True)
@@ -81,7 +87,7 @@ class EvaluationDiagnostics:
 @dataclass(frozen=True)
 class PotentialOutput:
     def __getitem__(self,key): return getattr(self,key)
-    energy:torch.Tensor; site_energy:torch.Tensor; baseline_energy:torch.Tensor; residual_energy:torch.Tensor; site_features:torch.Tensor; raw_c:torch.Tensor; forces:torch.Tensor|None=None; stress:torch.Tensor|None=None; stress_voigt:torch.Tensor|None=None; auxiliary:dict[str,Any]|None=None
+    energy:torch.Tensor; site_energy:torch.Tensor; baseline_energy:torch.Tensor; residual_energy:torch.Tensor; site_features:torch.Tensor; raw_c:torch.Tensor; forces:torch.Tensor|None=None; stress:torch.Tensor|None=None; stress_voigt:torch.Tensor|None=None; auxiliary:dict[str,Any]|None=None; candidate_neighbor_state:CompactCandidateNeighborState|None=None; candidate_reuse_decision:CandidateReuseDecision|None=None
 
 
 @dataclass(frozen=True)
@@ -100,6 +106,10 @@ class BatchedPotentialOutput:
     sample_ids: tuple[str, ...]
     template_ids: tuple[str, ...]
     auxiliary: tuple[dict[str, Any] | None, ...] | None = None
+    candidate_neighbor_states: Mapping[
+        str, CompactCandidateNeighborState
+    ] | None = None
+    candidate_reuse_decisions: Mapping[str, CandidateReuseDecision] | None = None
 
     def __getitem__(self, key):
         return getattr(self, key)

@@ -9,6 +9,8 @@ import torch
 from refsite_mlip.data import StructureBatch
 from refsite_mlip.phase.types import EvaluationPhaseError
 from refsite_mlip.transport import (
+    CandidateReuseDecision,
+    CompactCandidateNeighborState,
     EVAL_ADAPTIVE,
     SparseAdaptiveTransportError,
     TRAIN_FIXED,
@@ -185,6 +187,78 @@ def _preflight_runtime_bindings(
     return contexts, policies
 
 
+def _preflight_candidate_neighbor_states(
+    model: ReferenceSitePotential,
+    batch: StructureBatch,
+    contexts: Mapping[str, TemplateExecutionContext],
+    candidate_neighbor_states: Mapping[
+        str, CompactCandidateNeighborState
+    ] | None,
+    *,
+    requested: bool,
+    solver_path: str,
+) -> dict[str, CompactCandidateNeighborState | None]:
+    """Resolve only used sample IDs and reject static state faults pre-forward."""
+
+    if not requested:
+        return {}
+    support = model.config.transport_support
+    if not (
+        support.kind == "compact_c2"
+        and support.backend == "edge_list"
+        and support.candidate_backend == "blocked"
+        and support.candidate_skin > 0.0
+    ):
+        raise TransportSupportError(
+            "INVALID_SUPPORT_CONFIG",
+            "grouped candidate neighbor state requires compact_c2 edge_list blocked support with positive skin",
+        )
+
+    resolved: dict[str, CompactCandidateNeighborState | None] = {}
+    for structure_index, sample_id in enumerate(batch.sample_ids):
+        state = (
+            None
+            if candidate_neighbor_states is None
+            else candidate_neighbor_states.get(sample_id)
+        )
+        if state is not None and not isinstance(
+            state, CompactCandidateNeighborState
+        ):
+            raise TypeError(
+                "candidate_neighbor_states values for used sample IDs must be CompactCandidateNeighborState objects"
+            )
+        if state is not None:
+            template_id = batch.template_ids[structure_index]
+            atom_start = int(batch.atom_ptr[structure_index])
+            atom_stop = int(batch.atom_ptr[structure_index + 1])
+            context = contexts[template_id]
+            try:
+                state.validate_integrity()
+                model._validate_candidate_state_binding(
+                    state,
+                    template_fingerprint=batch.template_fingerprints[
+                        structure_index
+                    ],
+                    support_config=support,
+                    atomic_numbers=batch.atomic_numbers[atom_start:atom_stop],
+                    num_sites=context.topology.num_sites,
+                )
+            except TransportSupportError as error:
+                raise TransportSupportError(
+                    error.reason_code,
+                    "grouped candidate-state preflight failed: "
+                    f"structure_index={structure_index} sample_id={sample_id!r} "
+                    f"template_id={template_id!r} solver_path={solver_path!r} "
+                    "phase_branch='unresolved' candidate_backend='blocked' "
+                    "rebuild_stage='state_preflight' original_exception="
+                    f"{type(error).__name__}: {error}",
+                    template_id=template_id,
+                    sample_id=sample_id,
+                ) from error
+        resolved[sample_id] = state
+    return resolved
+
+
 def _raise_grouped_evaluation_error(
     error: Exception,
     *,
@@ -195,18 +269,29 @@ def _raise_grouped_evaluation_error(
     candidate_backend: str,
     site_block_size: int,
     atom_block_size: int,
+    candidate_state_requested: bool = False,
+    phase_branch: str | None = None,
 ) -> None:
     support_fingerprint = getattr(error, "support_fingerprint", None)
     solver_stage = getattr(
         error,
         "stage",
-        "candidate_extraction" if isinstance(error, TransportSupportError) else None,
+        (
+            "candidate_neighbor_state_update"
+            if candidate_state_requested
+            and isinstance(error, TransportSupportError)
+            else "candidate_extraction"
+            if isinstance(error, TransportSupportError)
+            else None
+        ),
     )
     context = (
         f"structure_index={structure_index} sample_id={sample_id!r} "
         f"template_id={template_id!r} stage=single_structure_evaluation "
         f"backend={backend!r} candidate_backend={candidate_backend!r} "
         f"site_block_size={site_block_size} atom_block_size={atom_block_size} "
+        f"phase_branch={phase_branch!r} "
+        f"rebuild_stage={('state_update' if candidate_state_requested else None)!r} "
         f"support_fingerprint={support_fingerprint!r} "
         f"solver_stage={solver_stage!r} original_exception="
         f"{type(error).__name__}: {error}"
@@ -248,16 +333,27 @@ def _raise_grouped_blocked_transport_error(
     candidate_backend: str,
     site_block_size: int,
     atom_block_size: int,
+    solver_path: str = TRAIN_FIXED,
+    candidate_state_requested: bool = False,
+    phase_branch: str | None = None,
 ) -> None:
     """Add ragged-structure context without changing the support reason code."""
 
     support_fingerprint = getattr(error, "support_fingerprint", None)
-    solver_stage = getattr(error, "stage", "candidate_extraction")
+    solver_stage = getattr(
+        error,
+        "stage",
+        "candidate_neighbor_state_update"
+        if candidate_state_requested
+        else "candidate_extraction",
+    )
     context = (
         f"structure_index={structure_index} sample_id={sample_id!r} "
         f"template_id={template_id!r} stage={solver_stage!r} "
         f"backend={backend!r} candidate_backend={candidate_backend!r} "
         f"site_block_size={site_block_size} atom_block_size={atom_block_size} "
+        f"solver_path={solver_path!r} phase_branch={phase_branch!r} "
+        f"rebuild_stage={('state_update' if candidate_state_requested else None)!r} "
         f"support_fingerprint={support_fingerprint!r} original_exception="
         f"{type(error).__name__}: {error}"
     )
@@ -280,6 +376,10 @@ def evaluate_structure_batch(
     compute_stress: bool = False,
     create_graph: bool = False,
     return_aux: bool = False,
+    candidate_neighbor_states: Mapping[
+        str, CompactCandidateNeighborState
+    ] | None = None,
+    return_candidate_neighbor_states: bool = False,
 ) -> BatchedPotentialOutput:
     """Evaluate independent structures using one shared model instance.
 
@@ -288,6 +388,11 @@ def evaluate_structure_batch(
     incoming ragged batch order.  For force evaluation, ``batch.positions``
     must already require gradients; this preserves the direct tensor-view path
     and gradients with respect to the caller-owned flattened positions.
+
+    Candidate neighbor states are opt-in and keyed only by stable ``sample_id``.
+    Used entries are threaded independently through the single-structure model;
+    unused mapping entries are never resolved.  Any state input implies that a
+    complete next-state mapping is returned in original sample order.
     """
 
     if not isinstance(model, ReferenceSitePotential):
@@ -300,6 +405,16 @@ def evaluate_structure_batch(
         evaluation_policies, Mapping
     ):
         raise TypeError("evaluation_policies must be a mapping")
+    if candidate_neighbor_states is not None and not isinstance(
+        candidate_neighbor_states, Mapping
+    ):
+        raise TypeError("candidate_neighbor_states must be a mapping")
+    if not isinstance(return_candidate_neighbor_states, bool):
+        raise TypeError("return_candidate_neighbor_states must be bool")
+    candidate_state_requested = (
+        candidate_neighbor_states is not None
+        or return_candidate_neighbor_states
+    )
     batch.validate()
     if compute_forces and not batch.positions.requires_grad:
         raise ValueError(
@@ -315,6 +430,23 @@ def evaluate_structure_batch(
         compute_stress=compute_stress,
         create_graph=create_graph,
     )
+    try:
+        resolved_candidate_states = _preflight_candidate_neighbor_states(
+            model,
+            batch,
+            contexts,
+            candidate_neighbor_states,
+            requested=candidate_state_requested,
+            solver_path=solver_path,
+        )
+    except TransportSupportError as error:
+        if solver_path != EVAL_ADAPTIVE:
+            raise
+        raise EvaluationPhaseError(
+            error.reason_code,
+            str(error),
+            template_id=error.template_id,
+        ) from error
 
     outputs: list[PotentialOutput | None] = [None] * batch.num_structures
     for group in batch.template_groups:
@@ -323,6 +455,12 @@ def evaluate_structure_batch(
         for structure_index, atom_slice in zip(
             group.structure_indices.tolist(), group.atom_slices
         ):
+            sample_id = batch.sample_ids[structure_index]
+            input_candidate_state = (
+                resolved_candidate_states[sample_id]
+                if candidate_state_requested
+                else None
+            )
             try:
                 outputs[structure_index] = model(
                     batch.positions[atom_slice],
@@ -336,6 +474,8 @@ def evaluate_structure_batch(
                     return_aux=return_aux,
                     template_context=context,
                     evaluation_policy=policy,
+                    candidate_neighbor_state=input_candidate_state,
+                    return_candidate_neighbor_state=candidate_state_requested,
                 )
             except Exception as error:
                 if solver_path != EVAL_ADAPTIVE:
@@ -353,6 +493,13 @@ def evaluate_structure_batch(
                             candidate_backend=support.candidate_backend,
                             site_block_size=support.site_block_size,
                             atom_block_size=support.atom_block_size,
+                            solver_path=solver_path,
+                            candidate_state_requested=candidate_state_requested,
+                            phase_branch=(
+                                input_candidate_state.phase_site_branch_fingerprint
+                                if input_candidate_state is not None
+                                else None
+                            ),
                         )
                     raise
                 _raise_grouped_evaluation_error(
@@ -366,6 +513,12 @@ def evaluate_structure_batch(
                     ),
                     site_block_size=model.config.transport_support.site_block_size,
                     atom_block_size=model.config.transport_support.atom_block_size,
+                    candidate_state_requested=candidate_state_requested,
+                    phase_branch=(
+                        input_candidate_state.phase_site_branch_fingerprint
+                        if input_candidate_state is not None
+                        else None
+                    ),
                 )
 
     if any(output is None for output in outputs):
@@ -429,6 +582,25 @@ def evaluate_structure_batch(
     auxiliary = (
         tuple(output.auxiliary for output in ordered) if return_aux else None
     )
+    next_candidate_states = None
+    candidate_reuse_decisions = None
+    if candidate_state_requested:
+        if any(
+            output.candidate_neighbor_state is None
+            or output.candidate_reuse_decision is None
+            for output in ordered
+        ):
+            raise RuntimeError(
+                "model omitted requested candidate neighbor state output"
+            )
+        next_candidate_states = {
+            sample_id: output.candidate_neighbor_state
+            for sample_id, output in zip(batch.sample_ids, ordered)
+        }
+        candidate_reuse_decisions = {
+            sample_id: output.candidate_reuse_decision
+            for sample_id, output in zip(batch.sample_ids, ordered)
+        }
     return BatchedPotentialOutput(
         energy=energy,
         baseline_energy=baseline_energy,
@@ -442,4 +614,6 @@ def evaluate_structure_batch(
         sample_ids=batch.sample_ids,
         template_ids=batch.template_ids,
         auxiliary=auxiliary,
+        candidate_neighbor_states=next_candidate_states,
+        candidate_reuse_decisions=candidate_reuse_decisions,
     )
