@@ -68,7 +68,7 @@ class OTResult:
 
 @dataclass(frozen=True)
 class SparseOTResult:
-    """Fixed compact transport retained in canonical candidate-edge form."""
+    """Compact transport retained in canonical candidate-edge form."""
 
     edges: "CompactTransportEdges"
     edge_plan: torch.Tensor
@@ -92,6 +92,8 @@ class SparseOTResult:
     accepted_damping: Optional[float] = None
     warmup_sinkhorn_iterations: int = 0
     fallback_sinkhorn_iterations: int = 0
+    vacancy_residual: Optional[torch.Tensor] = None
+    adaptive_diagnostics: Optional["SparseAdaptiveDiagnostics"] = None
 
 
 @dataclass(frozen=True)
@@ -123,3 +125,66 @@ class NewtonOutcome:
     final_linear_residual: Optional[torch.Tensor]
     failure_reason: Optional[str]
     accepted_damping: Optional[float] = None
+
+
+@dataclass(frozen=True)
+class SparsePCGDiagnostics:
+    """Matrix-free projected-PCG diagnostics for one sparse Newton step."""
+
+    converged: bool
+    iterations: int
+    initial_projected_residual: torch.Tensor
+    final_projected_residual: torch.Tensor
+    breakdown_reason: Optional[str]
+    last_curvature: Optional[torch.Tensor]
+    preconditioner_min: torch.Tensor
+    preconditioner_max: torch.Tensor
+
+
+@dataclass(frozen=True)
+class SparsePCGOutcome:
+    solution: torch.Tensor
+    diagnostics: SparsePCGDiagnostics
+
+
+@dataclass(frozen=True)
+class SparseLineSearchDiagnostics:
+    attempted_dampings: tuple[float, ...]
+    accepted_damping: Optional[float]
+    reductions: int
+    objective_before: torch.Tensor
+    objective_after: Optional[torch.Tensor]
+    directional_derivative: torch.Tensor
+    failure_reason: Optional[str]
+
+
+@dataclass(frozen=True)
+class SparseAdaptiveDiagnostics:
+    """Compact solver history without any dense plan or Hessian payload."""
+
+    support_fingerprint: str
+    initial_projected_residual: torch.Tensor
+    final_projected_residual: torch.Tensor
+    q_mass_error: torch.Tensor
+    pcg_steps: tuple[SparsePCGDiagnostics, ...]
+    line_search_steps: tuple[SparseLineSearchDiagnostics, ...]
+    fallback_reason: Optional[str]
+    fallback_residual: Optional[torch.Tensor]
+    dense_plan_materialized: bool = False
+
+
+@dataclass(frozen=True)
+class SparseNewtonOutcome:
+    f: torch.Tensor
+    g: torch.Tensor
+    converged: bool
+    iterations: int
+    cg_iterations: int
+    line_search_reductions: int
+    final_linear_residual: Optional[torch.Tensor]
+    failure_reason: Optional[str]
+    accepted_damping: Optional[float]
+    initial_projected_residual: torch.Tensor
+    final_projected_residual: torch.Tensor
+    pcg_steps: tuple[SparsePCGDiagnostics, ...]
+    line_search_steps: tuple[SparseLineSearchDiagnostics, ...]

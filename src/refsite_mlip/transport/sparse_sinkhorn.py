@@ -9,7 +9,7 @@ import torch
 
 from .edge_list import CompactTransportEdges
 from .gauge import project_duals
-from .result import SparseOTResult, TrainSinkhornConfig
+from .result import DualVariables, SparseOTResult, TrainSinkhornConfig
 
 
 def _segmented_logsumexp(
@@ -52,6 +52,19 @@ def _segmented_sum(
     return values.new_zeros((num_segments,)).index_add(0, index, values)
 
 
+def _atom_major_segmented_sum(
+    edges: CompactTransportEdges, values: torch.Tensor
+) -> torch.Tensor:
+    """Reduce edge values in canonical atom-major, then site-major order."""
+
+    permutation = edges.atom_major_permutation
+    return _segmented_sum(
+        values[permutation],
+        edges.atom_index[permutation],
+        edges.num_atoms,
+    )
+
+
 def sparse_sinkhorn_full_update(
     edges: CompactTransportEdges,
     f: torch.Tensor,
@@ -60,7 +73,14 @@ def sparse_sinkhorn_full_update(
     """One exact-zero-aware update without constructing a dense kernel."""
 
     epsilon = edges.epsilon
-    atomic_values = g[edges.atom_index] / epsilon + edges.log_kernel
+    atomic_live = g[edges.atom_index] / epsilon
+    atomic_values = torch.where(
+        edges.active,
+        atomic_live + torch.where(
+            edges.active, edges.log_kernel, torch.zeros_like(edges.log_kernel)
+        ),
+        torch.full_like(atomic_live, -torch.inf),
+    )
     vacancy_values = (
         g[edges.num_atoms].expand(edges.num_sites) / epsilon
         if edges.num_vacancies > 0
@@ -74,7 +94,14 @@ def sparse_sinkhorn_full_update(
     )
     updated_f = -epsilon * row_lse
 
-    column_values = updated_f[edges.site_index] / epsilon + edges.log_kernel
+    column_live = updated_f[edges.site_index] / epsilon
+    column_values = torch.where(
+        edges.active,
+        column_live + torch.where(
+            edges.active, edges.log_kernel, torch.zeros_like(edges.log_kernel)
+        ),
+        torch.full_like(column_live, -torch.inf),
+    )
     atom_lse = _segmented_logsumexp(
         column_values, edges.atom_index, edges.num_atoms
     )
@@ -94,7 +121,9 @@ def sparse_transport_plan(
     edges: CompactTransportEdges, f: torch.Tensor, g: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
     live = f[edges.site_index] / edges.epsilon + g[edges.atom_index] / edges.epsilon
-    active_log_plan = live + edges.log_kernel
+    active_log_plan = live + torch.where(
+        edges.active, edges.log_kernel, torch.zeros_like(edges.log_kernel)
+    )
     safe = torch.where(edges.active, active_log_plan, torch.zeros_like(active_log_plan))
     edge_plan = torch.where(edges.active, torch.exp(safe), torch.zeros_like(safe))
     if edges.num_vacancies > 0:
@@ -124,6 +153,67 @@ def sparse_marginal_residuals(
     return site_mass - 1.0, column
 
 
+def sparse_marginal_residual_components(
+    edges: CompactTransportEdges,
+    edge_plan: torch.Tensor,
+    q: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return site, atomic-column, and aggregate-vacancy residuals."""
+
+    site_mass = _segmented_sum(edge_plan, edges.site_index, edges.num_sites) + q
+    atom_mass = _atom_major_segmented_sum(edges, edge_plan)
+    vacancy = (
+        q.sum() - q.new_tensor(float(edges.num_vacancies))
+        if edges.num_vacancies > 0
+        else q.new_zeros(())
+    )
+    return site_mass - 1.0, atom_mass - 1.0, vacancy
+
+
+def sparse_zero_duals(edges: CompactTransportEdges) -> DualVariables:
+    return DualVariables(
+        f=edges.distances.new_zeros(edges.num_sites),
+        g=edges.distances.new_zeros(
+            edges.num_atoms + int(edges.num_vacancies > 0)
+        ),
+    )
+
+
+def validate_sparse_duals(
+    edges: CompactTransportEdges, initial: DualVariables | None
+) -> DualVariables:
+    duals = sparse_zero_duals(edges) if initial is None else initial
+    expected_f = (edges.num_sites,)
+    expected_g = (edges.num_atoms + int(edges.num_vacancies > 0),)
+    if duals.f.shape != expected_f or duals.g.shape != expected_g:
+        raise ValueError("initial sparse dual has incorrect shape")
+    for value in (duals.f, duals.g):
+        if value.dtype != edges.distances.dtype or value.device != edges.distances.device:
+            raise ValueError("initial sparse dual dtype/device must match edges")
+        if not bool(torch.all(torch.isfinite(value)).detach()):
+            raise ValueError("initial sparse dual contains NaN or Inf")
+    return duals
+
+
+def sparse_fixed_sinkhorn_updates(
+    edges: CompactTransportEdges,
+    iterations: int,
+    initial: DualVariables | None = None,
+) -> DualVariables:
+    if (
+        isinstance(iterations, bool)
+        or not isinstance(iterations, Integral)
+        or int(iterations) < 0
+    ):
+        raise ValueError("Sinkhorn iterations must be a nonnegative integer")
+    duals = validate_sparse_duals(edges, initial)
+    f, g = duals.f, duals.g
+    with torch.autocast(device_type=edges.distances.device.type, enabled=False):
+        for _ in range(int(iterations)):
+            f, g = sparse_sinkhorn_full_update(edges, f, g)
+    return DualVariables(f=f, g=g)
+
+
 def solve_sparse_sinkhorn_train_fixed(
     edges: CompactTransportEdges, config: TrainSinkhornConfig
 ) -> SparseOTResult:
@@ -142,17 +232,8 @@ def solve_sparse_sinkhorn_train_fixed(
     )
     if not math.isfinite(tolerance) or tolerance <= 0.0:
         raise ValueError("diagnostic_tolerance must be finite and positive")
-    f = edges.distances.new_zeros(edges.num_sites)
-    g = edges.distances.new_zeros(
-        edges.num_atoms + int(edges.num_vacancies > 0)
-    )
-    with torch.autocast(device_type=edges.distances.device.type, enabled=False):
-        for _ in range(int(config.iterations)):
-            f, g = sparse_sinkhorn_full_update(
-                edges,
-                f,
-                g,
-            )
+    duals = sparse_fixed_sinkhorn_updates(edges, int(config.iterations))
+    f, g = duals.f, duals.g
     edge_plan, q = sparse_transport_plan(edges, f, g)
     row, column = sparse_marginal_residuals(
         edges,
