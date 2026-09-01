@@ -24,13 +24,31 @@ from .reference_builder import (
     canonicalize_reference_atoms,
     nbc_rocksalt_template_builder_config,
 )
+from .extxyz import (
+    EXTXYZ_LOADER_CONVENTION_VERSION,
+    EXTXYZ_UNIT_CONVENTION_VERSION,
+    ExtXYZLoadConfig,
+    ExtXYZLoadDiagnostics,
+    ExtXYZLoadError,
+    ExtXYZLoadResult,
+    NumericStatistics,
+    load_extxyz_dataset,
+    load_extxyz_samples,
+)
 
 __all__ = [
     "ENERGY_UNIT",
+    "EXTXYZ_LOADER_CONVENTION_VERSION",
+    "EXTXYZ_UNIT_CONVENTION_VERSION",
+    "ExtXYZLoadConfig",
+    "ExtXYZLoadDiagnostics",
+    "ExtXYZLoadError",
+    "ExtXYZLoadResult",
     "FORCE_UNIT",
     "CanonicalReferenceStructure",
     "InMemoryStructureDataset",
     "LENGTH_UNIT",
+    "NumericStatistics",
     "ReferenceTemplate",
     "ReferenceTemplateBuildDiagnostics",
     "ReferenceTemplateBuilderConfig",
@@ -49,5 +67,7 @@ __all__ = [
     "build_reference_template_from_poscar",
     "canonicalize_reference_atoms",
     "collate_structure_samples",
+    "load_extxyz_dataset",
+    "load_extxyz_samples",
     "nbc_rocksalt_template_builder_config",
 ]
