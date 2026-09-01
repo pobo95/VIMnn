@@ -10,6 +10,7 @@ from refsite_mlip.data import StructureBatch
 from refsite_mlip.phase.types import EvaluationPhaseError
 from refsite_mlip.transport import (
     EVAL_ADAPTIVE,
+    SparseAdaptiveTransportError,
     TRAIN_FIXED,
     TransportSupportError,
 )
@@ -110,6 +111,12 @@ def _preflight_runtime_bindings(
             )
         if not isinstance(evaluation_policies, Mapping):
             raise TypeError("evaluation_policies must be a mapping")
+        support = model.config.transport_support
+        if support.backend == "edge_list" and support.kind != "compact_c2":
+            raise EvaluationPhaseError(
+                "INVALID_SUPPORT_CONFIG",
+                "edge-list EVAL_ADAPTIVE requires compact_c2 support",
+            )
     else:
         raise ValueError("unsupported solver path")
 
@@ -184,15 +191,21 @@ def _raise_grouped_evaluation_error(
     structure_index: int,
     sample_id: str,
     template_id: str,
+    backend: str,
 ) -> None:
+    support_fingerprint = getattr(error, "support_fingerprint", None)
+    solver_stage = getattr(error, "stage", None)
     context = (
         f"structure_index={structure_index} sample_id={sample_id!r} "
-        f"template_id={template_id!r} stage=single_structure_evaluation"
+        f"template_id={template_id!r} stage=single_structure_evaluation "
+        f"backend={backend!r} support_fingerprint={support_fingerprint!r} "
+        f"solver_stage={solver_stage!r} original_exception="
+        f"{type(error).__name__}: {error}"
     )
     if isinstance(error, EvaluationPhaseError):
         raise EvaluationPhaseError(
             error.reason_code,
-            f"{context}: {error}",
+            context,
             template_id=template_id,
             observed=error.observed,
             threshold=error.threshold,
@@ -200,12 +213,18 @@ def _raise_grouped_evaluation_error(
     if isinstance(error, TransportSupportError):
         raise EvaluationPhaseError(
             error.reason_code,
-            f"{context}: {error}",
+            context,
+            template_id=template_id,
+        ) from error
+    if isinstance(error, SparseAdaptiveTransportError):
+        raise EvaluationPhaseError(
+            error.reason_code,
+            context,
             template_id=template_id,
         ) from error
     raise EvaluationPhaseError(
         "STRUCTURE_EVALUATION_FAILED",
-        f"{context}: {type(error).__name__}: {error}",
+        context,
         template_id=template_id,
     ) from error
 
@@ -286,6 +305,7 @@ def evaluate_structure_batch(
                     structure_index=structure_index,
                     sample_id=batch.sample_ids[structure_index],
                     template_id=group.template_id,
+                    backend=model.config.transport_support.backend,
                 )
 
     if any(output is None for output in outputs):

@@ -61,6 +61,11 @@ class EvaluationDiagnostics:
     derivative_order: int
     forces_requested: bool
     stress_requested: bool
+    transport_backend: str = "dense"
+    transport_active_dense_ratio: float | None = None
+    transport_candidate_dense_ratio: float | None = None
+    transport_support_fingerprint: str | None = None
+    transport_dense_plan_materialized: bool = True
 
 
 @dataclass(frozen=True)

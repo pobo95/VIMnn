@@ -8,7 +8,6 @@ import torch
 from refsite_mlip.models import ReferenceSitePotential, evaluate_structure_batch
 from refsite_mlip.transport import (
     EVAL_ADAPTIVE,
-    TransportSupportError,
     materialize_dense_plan,
 )
 from test_compact_support_potential import _compact, _model, _numbers
@@ -130,7 +129,7 @@ def test_edge_list_potential_oracle_no_implicit_dense_plan_fd_and_double_backwar
     assert torch.linalg.vector_norm(sparse_out.forces.sum(0)) < 2e-11
 
 
-def test_edge_list_potential_symmetry_state_and_eval_rejection(typed_crystal):
+def test_edge_list_potential_symmetry_state_and_eval_support(typed_crystal):
     sparse = _model(typed_crystal, _edge_support())
     positions = typed_crystal["positions"][:5].clone().requires_grad_(True)
     numbers = _numbers(typed_crystal)
@@ -153,18 +152,24 @@ def test_edge_list_potential_symmetry_state_and_eval_rejection(typed_crystal):
     assert tuple(id(value) for value in sparse.parameters()) == parameter_ids
     assert all(torch.equal(sparse.state_dict()[key], value) for key, value in state.items())
 
-    template = make_template(typed_crystal, template_id="edge-eval-unsupported")
-    with pytest.raises(TransportSupportError) as failure:
-        sparse(
-            positions.detach(),
-            numbers,
-            typed_crystal["cell"],
-            typed_crystal["origin"],
-            solver_path=EVAL_ADAPTIVE,
-            template_context=make_context(template),
-            evaluation_policy=_policy(template),
-        )
-    assert failure.value.reason_code == "EDGE_LIST_EVAL_ADAPTIVE_UNSUPPORTED"
+    template = make_template(typed_crystal, template_id="edge-eval-supported")
+    evaluated = sparse(
+        positions.detach(),
+        numbers,
+        typed_crystal["cell"],
+        typed_crystal["origin"],
+        solver_path=EVAL_ADAPTIVE,
+        template_context=make_context(template),
+        evaluation_policy=_policy(template),
+        return_aux=True,
+    )
+    assert torch.isfinite(evaluated.energy)
+    assert not hasattr(evaluated.auxiliary["ot"], "P")
+    assert not evaluated.auxiliary["ot"].dense_plan_materialized
+    diagnostics = evaluated.auxiliary["evaluation_diagnostics"]
+    assert diagnostics.transport_backend == "edge_list"
+    assert diagnostics.transport_solver_name == "edge_list_hybrid"
+    assert not diagnostics.transport_dense_plan_materialized
 
 
 def test_edge_list_normal_path_never_calls_dense_transport_or_feature(monkeypatch, typed_crystal):

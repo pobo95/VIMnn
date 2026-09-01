@@ -20,7 +20,7 @@ from refsite_mlip.phase.newton import solve_training_phase
 from refsite_mlip.phase.objective import typed_reciprocal_fields
 from refsite_mlip.phase.stabilizer import validate_alias_matches_stabilizer
 from refsite_mlip.phase.types import EvaluationPhaseError
-from refsite_mlip.transport import TRAIN_FIXED,EVAL_ADAPTIVE,TrainSinkhornConfig,EvalOTConfig,TransportSupportError,atom_site_displacements,build_compact_transport_edges,solve_atom_vacancy_ot,solve_sparse_sinkhorn_train_fixed
+from refsite_mlip.transport import TRAIN_FIXED,EVAL_ADAPTIVE,TrainSinkhornConfig,EvalOTConfig,SparseAdaptiveTransportError,TransportSupportError,atom_site_displacements,build_compact_transport_edges,solve_atom_vacancy_ot,solve_sparse_hybrid_eval,solve_sparse_sinkhorn_train_fixed,sparse_support_fingerprint
 from .config import PotentialConfig
 from .evaluation_policy import EvaluationPolicy
 from .outputs import EvaluationDiagnostics, PotentialOutput
@@ -227,7 +227,12 @@ class ReferenceSitePotential(nn.Module):
         maximum_curvature = curvature[..., -1]
         support = ot.support_diagnostics
         compact = support_config.kind == "compact_c2"
-        expected_q_mass = runtime.topology.num_sites - ot.P.shape[1]
+        expected_q_mass = (
+            ot.edges.num_vacancies
+            if hasattr(ot, "edges")
+            else runtime.topology.num_sites - ot.P.shape[1]
+        )
+        adaptive = getattr(ot, "adaptive_diagnostics", None)
         return EvaluationDiagnostics(
             template_id=runtime.template_id,
             template_fingerprint=runtime.fingerprint,
@@ -323,6 +328,19 @@ class ReferenceSitePotential(nn.Module):
             derivative_order=1 if derivative_requested else 0,
             forces_requested=forces_requested,
             stress_requested=stress_requested,
+            transport_backend=support_config.backend,
+            transport_active_dense_ratio=(
+                support.active_dense_ratio if support is not None else None
+            ),
+            transport_candidate_dense_ratio=(
+                support.candidate_dense_ratio if support is not None else None
+            ),
+            transport_support_fingerprint=(
+                adaptive.support_fingerprint if adaptive is not None else None
+            ),
+            transport_dense_plan_materialized=bool(
+                getattr(ot, "dense_plan_materialized", True)
+            ),
         )
 
     def energy(
@@ -359,15 +377,6 @@ class ReferenceSitePotential(nn.Module):
                 raise TypeError("evaluation_policy must be an EvaluationPolicy")
         else:
             raise ValueError("unsupported solver path")
-        if (
-            self.config.transport_support.backend == "edge_list"
-            and solver_path == EVAL_ADAPTIVE
-        ):
-            raise TransportSupportError(
-                "EDGE_LIST_EVAL_ADAPTIVE_UNSUPPORTED",
-                "edge_list compact transport currently supports TRAIN_FIXED only; use backend=dense for EVAL_ADAPTIVE",
-                template_id=getattr(template_context, "template_id", None),
-            )
         runtime = None
         if template_context is None:
             topology=self.topology.to(device=positions.device,dtype=positions.dtype); phase_modes=self.phase_modes; phase_mode_weights=self.phase_mode_weights.to(positions); site_alignment_weights=self.site_alignment_weights.to(positions); phase_channel_weights=self.phase_channel_weights.to(positions)
@@ -426,6 +435,7 @@ class ReferenceSitePotential(nn.Module):
             self.config.transport_support.kind == "compact_c2"
             and self.config.transport_support.backend == "edge_list"
         )
+        evaluation_ot_tolerance = None
         if edge_backend:
             edges=build_compact_transport_edges(
                 displacements,
@@ -434,9 +444,25 @@ class ReferenceSitePotential(nn.Module):
                 config=self.config.transport_support,
                 template_id=getattr(runtime, "template_id", None),
             )
-            ot=solve_sparse_sinkhorn_train_fixed(
-                edges,TrainSinkhornConfig(self.config.train_sinkhorn_iterations)
-            )
+            if solver_path == TRAIN_FIXED:
+                ot=solve_sparse_sinkhorn_train_fixed(
+                    edges,TrainSinkhornConfig(self.config.train_sinkhorn_iterations)
+                )
+            else:
+                evaluation_ot_tolerance = (
+                    1.0e-6 if edges.distances.dtype == torch.float32 else 1.0e-12
+                )
+                try:
+                    ot=solve_sparse_hybrid_eval(
+                        edges,
+                        EvalOTConfig(
+                            sinkhorn_iterations=self.config.eval_sinkhorn_warmup_iterations,
+                            convergence_tolerance=evaluation_ot_tolerance,
+                        ),
+                    )
+                except SparseAdaptiveTransportError as error:
+                    error.support_fingerprint = sparse_support_fingerprint(edges)
+                    raise
         else:
             cost=displacements.square().sum(-1)/(2*self.config.ell_ot**2)
         if solver_path==TRAIN_FIXED and not edge_backend:
@@ -452,7 +478,7 @@ class ReferenceSitePotential(nn.Module):
                 atom_distances=distances,
                 template_id=getattr(runtime, "template_id", None),
             )
-        elif solver_path==EVAL_ADAPTIVE:
+        elif solver_path==EVAL_ADAPTIVE and not edge_backend:
             evaluation_ot_tolerance = (
                 1.0e-6 if cost.dtype == torch.float32 else 1.0e-12
             )
@@ -474,22 +500,58 @@ class ReferenceSitePotential(nn.Module):
                 atom_distances=distances,
                 template_id=runtime.template_id,
             )
-            if _evaluation_derivative_request and ot.fallback_used:
-                raise EvaluationPhaseError(
-                    "DERIVATIVE_FALLBACK_UNSUPPORTED",
-                    "the selected adaptive transport fallback is not certified for derivatives",
+        if solver_path==EVAL_ADAPTIVE:
+            if edge_backend and (
+                not bool(torch.all(torch.isfinite(ot.edge_plan)).detach())
+                or not bool(torch.all(torch.isfinite(ot.q)).detach())
+            ):
+                error = EvaluationPhaseError(
+                    "NONFINITE_OUTPUT",
+                    "sparse adaptive transport returned nonfinite edge_plan or q",
                     template_id=runtime.template_id,
                 )
+                error.support_fingerprint = sparse_support_fingerprint(edges)
+                error.stage = "transport_result"
+                raise error
+            if _evaluation_derivative_request and ot.fallback_used:
+                adaptive = getattr(ot, "adaptive_diagnostics", None)
+                fingerprint = (
+                    adaptive.support_fingerprint if adaptive is not None else None
+                )
+                fallback_residual = (
+                    adaptive.fallback_residual if adaptive is not None else None
+                )
+                residual_text = (
+                    "None"
+                    if fallback_residual is None
+                    else f"{float(fallback_residual.detach().cpu()):.9e}"
+                )
+                error = EvaluationPhaseError(
+                    "DERIVATIVE_FALLBACK_UNSUPPORTED",
+                    "the selected adaptive transport fallback is not certified "
+                    f"for derivatives: reason={ot.failure_reason!r}, "
+                    f"residual={residual_text}, support_fingerprint={fingerprint!r}",
+                    template_id=runtime.template_id,
+                )
+                error.support_fingerprint = fingerprint
+                error.stage = "transport_fallback"
+                raise error
             vacancy_present = topology.num_sites > positions.shape[0]
+            selected_plan = ot.edge_plan if edge_backend else ot.P
             if _evaluation_derivative_request and (
-                not ot.P.requires_grad
+                not selected_plan.requires_grad
                 or (vacancy_present and not ot.q.requires_grad)
             ):
-                raise EvaluationPhaseError(
+                representation = "edge_plan" if edge_backend else "P"
+                error = EvaluationPhaseError(
                     "GRAPH_DISCONNECTED",
-                    "adaptive transport P or q is detached from the selected geometry branch",
+                    f"adaptive transport {representation} or q is detached from the selected geometry branch",
                     template_id=runtime.template_id,
                 )
+                if edge_backend:
+                    error.support_fingerprint = sparse_support_fingerprint(edges)
+                    error.stage = "transport_graph_validation"
+                raise error
         if edge_backend:
             features=build_sparse_probability_multipoles(
                 ot.edge_plan,ot.q,ot.edges,atomic_numbers,self.config.feature,topology.site_types
