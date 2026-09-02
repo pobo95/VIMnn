@@ -8,6 +8,9 @@ version = "0.1.0"
 requires-python = ">=3.10"
 dependencies = ["torch==2.6.0", "e3nn==0.4.4"]
 
+[project.scripts]
+refsite-mlip = "refsite_mlip.cli.main:main"
+
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
