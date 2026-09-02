@@ -16,6 +16,13 @@ class CLIError(RuntimeError):
         *,
         stage: str,
         bundle_path: str | PathLike[str] | None = None,
+        path: str | PathLike[str] | None = None,
+        frame_index: int | None = None,
+        sample_id: str | None = None,
+        template_id: str | None = None,
+        solver_path: str | None = None,
+        prediction_stage: str | None = None,
+        predictor_reason_code: str | None = None,
         original_error: BaseException | None = None,
     ) -> None:
         if not isinstance(reason_code, str) or not reason_code:
@@ -27,6 +34,17 @@ class CLIError(RuntimeError):
         self.reason_code = reason_code
         self.stage = stage
         self.bundle_path = None if bundle_path is None else str(bundle_path)
+        self.path = (
+            str(path)
+            if path is not None
+            else self.bundle_path
+        )
+        self.frame_index = frame_index
+        self.sample_id = sample_id
+        self.template_id = template_id
+        self.solver_path = solver_path
+        self.prediction_stage = prediction_stage
+        self.predictor_reason_code = predictor_reason_code
         self.message = message
         self.original_error = original_error
         self.original_exception_type = (
@@ -35,11 +53,22 @@ class CLIError(RuntimeError):
         self.original_exception_message = (
             None if original_error is None else str(original_error)
         )
-        path_context = (
-            "" if self.bundle_path is None else f" path={self.bundle_path!r}"
-        )
+        context = []
+        for name in (
+            "path",
+            "frame_index",
+            "sample_id",
+            "template_id",
+            "solver_path",
+            "prediction_stage",
+            "predictor_reason_code",
+        ):
+            value = getattr(self, name)
+            if value is not None:
+                context.append(f"{name}={value!r}")
+        context_text = "" if not context else " " + " ".join(context)
         super().__init__(
-            f"[{self.reason_code}]{path_context} stage={self.stage!r} {message}"
+            f"[{self.reason_code}]{context_text} stage={self.stage!r} {message}"
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -47,20 +76,40 @@ class CLIError(RuntimeError):
 
         return {
             "bundle_path": self.bundle_path,
+            "frame_index": self.frame_index,
             "message": self.message,
             "original_exception_type": self.original_exception_type,
+            "path": self.path,
+            "prediction_stage": self.prediction_stage,
+            "predictor_reason_code": self.predictor_reason_code,
             "reason_code": self.reason_code,
+            "sample_id": self.sample_id,
+            "solver_path": self.solver_path,
             "stage": self.stage,
+            "template_id": self.template_id,
         }
 
 
 def format_cli_error(error: CLIError) -> str:
     """Format one escaped, single-line diagnostic for stderr."""
 
-    path = "" if error.bundle_path is None else f" path={error.bundle_path!r}"
+    context = []
+    for name in (
+        "path",
+        "frame_index",
+        "sample_id",
+        "template_id",
+        "solver_path",
+        "prediction_stage",
+        "predictor_reason_code",
+    ):
+        value = getattr(error, name)
+        if value is not None:
+            context.append(f"{name}={value!r}")
+    context_text = "" if not context else " " + " ".join(context)
     return (
         "refsite-mlip: error:"
-        f"{path} stage={error.stage!r} reason={error.reason_code!r}: "
+        f"{context_text} stage={error.stage!r} reason={error.reason_code!r}: "
         f"{error.message}"
     )
 

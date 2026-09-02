@@ -20,6 +20,33 @@ def _add_debug_argument(parser: argparse.ArgumentParser, *, hidden: bool = False
     )
 
 
+def _properties_argument(value: str) -> tuple[str, ...]:
+    from .predict import normalize_properties
+
+    try:
+        return normalize_properties(value)
+    except (TypeError, ValueError) as error:
+        raise argparse.ArgumentTypeError(str(error)) from error
+
+
+def _positive_integer(value: str) -> int:
+    try:
+        result = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("must be a positive integer") from error
+    if result <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return result
+
+
+def _device_argument(value: str) -> str:
+    import re
+
+    if re.fullmatch(r"(?:cpu|cuda(?::[0-9]+)?)", value) is None:
+        raise argparse.ArgumentTypeError("must be cpu, cuda, or cuda:N")
+    return value
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="refsite-mlip",
@@ -49,6 +76,74 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_debug_argument(inspect, hidden=True)
     inspect.set_defaults(command_handler=_run_inspect_bundle)
+
+    predict = commands.add_parser(
+        "predict",
+        help="predict energy/forces/stress for extxyz frames",
+        description=(
+            "Load one portable bundle runtime, predict ordered extxyz frames, "
+            "and atomically write ASE SinglePointCalculator results."
+        ),
+    )
+    predict.add_argument("--bundle", required=True, dest="bundle_path")
+    predict.add_argument("--input", required=True, dest="input_path")
+    predict.add_argument("--output", required=True, dest="output_path")
+    predict.add_argument(
+        "--index",
+        default=":",
+        help="ASE extxyz index expression (default: :)",
+    )
+    templates = predict.add_mutually_exclusive_group()
+    templates.add_argument(
+        "--template-id",
+        help="one exact bundle template ID for every selected frame",
+    )
+    templates.add_argument(
+        "--template-key",
+        help="Atoms.info key containing each frame's exact template ID",
+    )
+    predict.add_argument(
+        "--solver",
+        choices=("train-fixed", "eval-adaptive"),
+        default="train-fixed",
+    )
+    predict.add_argument(
+        "--properties",
+        type=_properties_argument,
+        default=("energy", "forces"),
+        metavar="LIST",
+        help="comma-separated energy,forces,stress (default: energy,forces)",
+    )
+    predict.add_argument(
+        "--device",
+        type=_device_argument,
+        default="cpu",
+        metavar="DEVICE",
+    )
+    predict.add_argument(
+        "--dtype",
+        choices=("float32", "float64"),
+        default="float64",
+    )
+    predict.add_argument(
+        "--batch-size",
+        type=_positive_integer,
+        default=8,
+        metavar="INTEGER",
+    )
+    predict.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="atomically replace an existing regular output file",
+    )
+    predict.add_argument(
+        "--json",
+        action="store_true",
+        dest="json_output",
+        help="emit deterministic compact JSON summary",
+    )
+    _add_debug_argument(predict, hidden=True)
+    predict.set_defaults(command_handler=_run_predict)
     return parser
 
 
@@ -65,6 +160,38 @@ def _run_inspect_bundle(args: argparse.Namespace) -> int:
 
     report = inspect_bundle(args.bundle_path)
     output = render_json(report) if args.json_output else render_human(report)
+    print(output)
+    return 0
+
+
+def _run_predict(args: argparse.Namespace) -> int:
+    from .predict import (
+        ExtXYZPredictionConfig,
+        predict_extxyz,
+        render_prediction_human,
+        render_prediction_json,
+    )
+
+    config = ExtXYZPredictionConfig(
+        bundle_path=args.bundle_path,
+        input_path=args.input_path,
+        output_path=args.output_path,
+        index=args.index,
+        template_id=args.template_id,
+        template_key=args.template_key,
+        solver_path=args.solver,
+        properties=args.properties,
+        device=args.device,
+        dtype=args.dtype,
+        batch_size=args.batch_size,
+        overwrite=args.overwrite,
+    )
+    report = predict_extxyz(config)
+    output = (
+        render_prediction_json(report)
+        if args.json_output
+        else render_prediction_human(report)
+    )
     print(output)
     return 0
 
