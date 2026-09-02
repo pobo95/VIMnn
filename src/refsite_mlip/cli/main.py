@@ -254,6 +254,26 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_debug_argument(evaluate, hidden=True)
     evaluate.set_defaults(command_handler=_run_evaluate)
+
+    validate_train = commands.add_parser(
+        "validate-train-config",
+        help="validate a canonical training-run config without training",
+        description=(
+            "Safely verify a portable initial bundle, extxyz data, radii, and "
+            "training controls without model execution or filesystem writes."
+        ),
+    )
+    validate_train.add_argument(
+        "config_path", help="canonical training-run JSON configuration path"
+    )
+    validate_train.add_argument(
+        "--json",
+        action="store_true",
+        dest="json_output",
+        help="emit deterministic compact JSON preflight metadata",
+    )
+    _add_debug_argument(validate_train, hidden=True)
+    validate_train.set_defaults(command_handler=_run_validate_train_config)
     return parser
 
 
@@ -346,6 +366,23 @@ def _run_evaluate(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_validate_train_config(args: argparse.Namespace) -> int:
+    from .validate_train_config import (
+        render_train_config_human,
+        render_train_config_json,
+        validate_train_config,
+    )
+
+    resolved = validate_train_config(args.config_path)
+    output = (
+        render_train_config_json(resolved)
+        if args.json_output
+        else render_train_config_human(resolved)
+    )
+    print(output)
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the CLI and return its process exit code."""
 
@@ -366,6 +403,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "command failed unexpectedly",
             stage=f"command.{args.command}",
             bundle_path=getattr(args, "bundle_path", None),
+            path=getattr(args, "config_path", None),
             original_error=error,
         )
         print(format_cli_error(wrapped), file=sys.stderr)

@@ -26,7 +26,12 @@ from refsite_mlip.data import (
     StructureSample,
     collate_structure_samples,
 )
-from refsite_mlip.data.extxyz import ExtXYZLoadError, _extract_label
+from refsite_mlip.data.extxyz import (
+    ExtXYZLoadError,
+    _extract_component_mask,
+    _extract_label,
+    _independent_stress_mask,
+)
 from refsite_mlip.training import LossConfig, compute_potential_loss
 from refsite_mlip.transport import EVAL_ADAPTIVE, TRAIN_FIXED
 
@@ -329,149 +334,6 @@ def _preflight_report_output(
     target = Path(config.output_path).expanduser()
     _validate_report_target(target, source=source, config=config)
     return target
-
-
-def _canonical_mask(
-    value: Any,
-    *,
-    term: str,
-    num_atoms: int,
-    frame_index: int,
-    sample_id: str,
-) -> torch.Tensor:
-    import numpy as np
-
-    try:
-        array = np.asarray(value)
-    except Exception as error:
-        raise ExtXYZLoadError(
-            "MALFORMED_MASK",
-            f"{term} component mask could not be converted",
-            frame_index=frame_index,
-            sample_id=sample_id,
-            label=term,
-        ) from error
-    if np.issubdtype(array.dtype, np.bool_):
-        boolean = np.array(array, dtype=np.bool_, copy=True)
-    elif np.issubdtype(array.dtype, np.number):
-        numeric = np.array(array, dtype=np.float64, copy=True)
-        if not np.all(np.isfinite(numeric)) or not np.all(
-            np.logical_or(numeric == 0.0, numeric == 1.0)
-        ):
-            raise ExtXYZLoadError(
-                "MALFORMED_MASK",
-                f"{term} component mask must contain only 0/1 values",
-                frame_index=frame_index,
-                sample_id=sample_id,
-                label=term,
-            )
-        boolean = numeric.astype(np.bool_)
-    else:
-        raise ExtXYZLoadError(
-            "MALFORMED_MASK",
-            f"{term} component mask must be boolean or numeric 0/1",
-            frame_index=frame_index,
-            sample_id=sample_id,
-            label=term,
-        )
-    if term == "forces":
-        expected = (num_atoms, 3)
-        if boolean.shape != expected:
-            raise ExtXYZLoadError(
-                "MALFORMED_MASK",
-                f"force_mask must have shape [{num_atoms},3], got {boolean.shape}",
-                frame_index=frame_index,
-                sample_id=sample_id,
-                label=term,
-            )
-    else:
-        if boolean.shape == (6,):
-            xx, yy, zz, yz, xz, xy = boolean.tolist()
-            boolean = np.array(
-                [[xx, xy, xz], [xy, yy, yz], [xz, yz, zz]], dtype=np.bool_
-            )
-        elif boolean.shape == (9,):
-            boolean = boolean.reshape(3, 3)
-        elif boolean.shape != (3, 3):
-            raise ExtXYZLoadError(
-                "MALFORMED_MASK",
-                f"stress_mask must have shape [6] or [3,3], got {boolean.shape}",
-                frame_index=frame_index,
-                sample_id=sample_id,
-                label=term,
-            )
-        if not np.array_equal(boolean, boolean.T):
-            raise ExtXYZLoadError(
-                "MALFORMED_MASK",
-                "stress_mask must be symmetric",
-                frame_index=frame_index,
-                sample_id=sample_id,
-                label=term,
-            )
-    return torch.tensor(boolean, dtype=torch.bool)
-
-
-def _extract_component_mask(
-    atoms: Any,
-    *,
-    term: str,
-    label_present: bool,
-    frame_index: int,
-    sample_id: str,
-) -> torch.Tensor | None:
-    key = f"{term[:-1] if term == 'forces' else term}_mask"
-    results = (
-        atoms.calc.results
-        if atoms.calc is not None and isinstance(atoms.calc.results, Mapping)
-        else {}
-    )
-    sources = []
-    if key in results:
-        sources.append(("atoms.calc.results", results[key]))
-    if key in atoms.info:
-        sources.append(("Atoms.info", atoms.info[key]))
-    if key in atoms.arrays:
-        sources.append(("Atoms.arrays", atoms.arrays[key]))
-    if not sources:
-        return None
-    if not label_present:
-        raise ExtXYZLoadError(
-            "MASK_WITHOUT_LABEL",
-            f"{key} is present without its {term} label",
-            frame_index=frame_index,
-            sample_id=sample_id,
-            label=term,
-        )
-    canonical = _canonical_mask(
-        sources[0][1],
-        term=term,
-        num_atoms=len(atoms),
-        frame_index=frame_index,
-        sample_id=sample_id,
-    )
-    for source_name, value in sources[1:]:
-        duplicate = _canonical_mask(
-            value,
-            term=term,
-            num_atoms=len(atoms),
-            frame_index=frame_index,
-            sample_id=sample_id,
-        )
-        if not torch.equal(canonical, duplicate):
-            raise ExtXYZLoadError(
-                "CONFLICTING_MASK",
-                f"component mask conflicts with {source_name}",
-                frame_index=frame_index,
-                sample_id=sample_id,
-                label=term,
-            )
-    return canonical
-
-
-def _independent_stress_mask(mask: torch.Tensor) -> torch.Tensor:
-    return torch.stack(
-        (mask[0, 0], mask[1, 1], mask[2, 2], mask[1, 2], mask[0, 2], mask[0, 1])
-    )
 
 
 def _sample_term_valid_count(sample: StructureSample, term: str) -> int:

@@ -441,6 +441,155 @@ def _extract_label(
     return canonical
 
 
+def _canonical_component_mask(
+    value: Any,
+    *,
+    term: str,
+    num_atoms: int,
+    frame_index: int,
+    sample_id: str,
+) -> torch.Tensor:
+    """Canonicalize optional force/stress masks shared by data consumers."""
+
+    import numpy as np
+
+    try:
+        array = np.asarray(value)
+    except Exception as error:
+        raise ExtXYZLoadError(
+            "MALFORMED_MASK",
+            f"{term} component mask could not be converted",
+            frame_index=frame_index,
+            sample_id=sample_id,
+            label=term,
+        ) from error
+    if np.issubdtype(array.dtype, np.bool_):
+        boolean = np.array(array, dtype=np.bool_, copy=True)
+    elif np.issubdtype(array.dtype, np.number):
+        numeric = np.array(array, dtype=np.float64, copy=True)
+        if not np.all(np.isfinite(numeric)) or not np.all(
+            np.logical_or(numeric == 0.0, numeric == 1.0)
+        ):
+            raise ExtXYZLoadError(
+                "MALFORMED_MASK",
+                f"{term} component mask must contain only 0/1 values",
+                frame_index=frame_index,
+                sample_id=sample_id,
+                label=term,
+            )
+        boolean = numeric.astype(np.bool_)
+    else:
+        raise ExtXYZLoadError(
+            "MALFORMED_MASK",
+            f"{term} component mask must be boolean or numeric 0/1",
+            frame_index=frame_index,
+            sample_id=sample_id,
+            label=term,
+        )
+    if term == "forces":
+        expected = (num_atoms, 3)
+        if boolean.shape != expected:
+            raise ExtXYZLoadError(
+                "MALFORMED_MASK",
+                f"force_mask must have shape [{num_atoms},3], got {boolean.shape}",
+                frame_index=frame_index,
+                sample_id=sample_id,
+                label=term,
+            )
+    elif term == "stress":
+        if boolean.shape == (6,):
+            xx, yy, zz, yz, xz, xy = boolean.tolist()
+            boolean = np.array(
+                [[xx, xy, xz], [xy, yy, yz], [xz, yz, zz]], dtype=np.bool_
+            )
+        elif boolean.shape == (9,):
+            boolean = boolean.reshape(3, 3)
+        elif boolean.shape != (3, 3):
+            raise ExtXYZLoadError(
+                "MALFORMED_MASK",
+                f"stress_mask must have shape [6] or [3,3], got {boolean.shape}",
+                frame_index=frame_index,
+                sample_id=sample_id,
+                label=term,
+            )
+        if not np.array_equal(boolean, boolean.T):
+            raise ExtXYZLoadError(
+                "MALFORMED_MASK",
+                "stress_mask must be symmetric",
+                frame_index=frame_index,
+                sample_id=sample_id,
+                label=term,
+            )
+    else:  # pragma: no cover - internal invariant
+        raise RuntimeError(f"unsupported component-mask term {term!r}")
+    return torch.tensor(boolean, dtype=torch.bool)
+
+
+def _extract_component_mask(
+    atoms: Any,
+    *,
+    term: str,
+    label_present: bool,
+    frame_index: int,
+    sample_id: str,
+) -> torch.Tensor | None:
+    """Read an optional component mask with duplicate-source validation."""
+
+    key = f"{term[:-1] if term == 'forces' else term}_mask"
+    results = (
+        atoms.calc.results
+        if atoms.calc is not None and isinstance(atoms.calc.results, Mapping)
+        else {}
+    )
+    sources = []
+    if key in results:
+        sources.append(("atoms.calc.results", results[key]))
+    if key in atoms.info:
+        sources.append(("Atoms.info", atoms.info[key]))
+    if key in atoms.arrays:
+        sources.append(("Atoms.arrays", atoms.arrays[key]))
+    if not sources:
+        return None
+    if not label_present:
+        raise ExtXYZLoadError(
+            "MASK_WITHOUT_LABEL",
+            f"{key} is present without its {term} label",
+            frame_index=frame_index,
+            sample_id=sample_id,
+            label=term,
+        )
+    canonical = _canonical_component_mask(
+        sources[0][1],
+        term=term,
+        num_atoms=len(atoms),
+        frame_index=frame_index,
+        sample_id=sample_id,
+    )
+    for source_name, value in sources[1:]:
+        duplicate = _canonical_component_mask(
+            value,
+            term=term,
+            num_atoms=len(atoms),
+            frame_index=frame_index,
+            sample_id=sample_id,
+        )
+        if not torch.equal(canonical, duplicate):
+            raise ExtXYZLoadError(
+                "CONFLICTING_MASK",
+                f"component mask conflicts with {source_name}",
+                frame_index=frame_index,
+                sample_id=sample_id,
+                label=term,
+            )
+    return canonical
+
+
+def _independent_stress_mask(mask: torch.Tensor) -> torch.Tensor:
+    return torch.stack(
+        (mask[0, 0], mask[1, 1], mask[2, 2], mask[1, 2], mask[0, 2], mask[0, 1])
+    )
+
+
 def _hash_text(digest: Any, value: str) -> None:
     raw = value.encode("utf-8")
     digest.update(len(raw).to_bytes(8, "little"))
@@ -493,18 +642,17 @@ def _semantic_digest(
             _hash_text(digest, f"{name}_present:{value is not None}")
             if value is not None:
                 _hash_tensor(digest, name, value)
-        _hash_text(
-            digest,
-            "force_mask:implicit_all_true"
-            if sample.forces is not None
-            else "force_mask:missing",
-        )
-        _hash_text(
-            digest,
-            "stress_mask:implicit_all_true"
-            if sample.stress is not None
-            else "stress_mask:missing",
-        )
+        for term in ("forces", "stress"):
+            label = getattr(sample, term)
+            mask_name = "force_mask" if term == "forces" else "stress_mask"
+            mask = getattr(sample, mask_name)
+            if label is None:
+                _hash_text(digest, f"{mask_name}:missing")
+            elif mask is None:
+                _hash_text(digest, f"{mask_name}:implicit_all_true")
+            else:
+                _hash_text(digest, f"{mask_name}:explicit")
+                _hash_tensor(digest, mask_name, mask)
     return digest.hexdigest()
 
 
@@ -628,6 +776,16 @@ def load_extxyz_samples(
                 )
                 for name in ("energy", "forces", "stress")
             }
+            masks = {
+                term: _extract_component_mask(
+                    atoms,
+                    term=term,
+                    label_present=labels[term] is not None,
+                    frame_index=frame_index,
+                    sample_id=sample_id,
+                )
+                for term in ("forces", "stress")
+            }
             for name, value in labels.items():
                 if value is None:
                     missing[name] += 1
@@ -667,6 +825,12 @@ def load_extxyz_samples(
                 ),
                 stress=(
                     None if labels["stress"] is None else floating(labels["stress"])
+                ),
+                force_mask=(
+                    None if masks["forces"] is None else fixed(masks["forces"])
+                ),
+                stress_mask=(
+                    None if masks["stress"] is None else fixed(masks["stress"])
                 ),
             )
             samples.append(sample)

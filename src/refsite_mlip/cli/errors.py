@@ -21,9 +21,12 @@ class CLIError(RuntimeError):
         sample_id: str | None = None,
         template_id: str | None = None,
         term: str | None = None,
+        config_field: str | None = None,
+        split: str | None = None,
         solver_path: str | None = None,
         prediction_stage: str | None = None,
         predictor_reason_code: str | None = None,
+        underlying_reason_code: str | None = None,
         original_error: BaseException | None = None,
     ) -> None:
         if not isinstance(reason_code, str) or not reason_code:
@@ -44,9 +47,12 @@ class CLIError(RuntimeError):
         self.sample_id = sample_id
         self.template_id = template_id
         self.term = term
+        self.config_field = config_field
+        self.split = split
         self.solver_path = solver_path
         self.prediction_stage = prediction_stage
         self.predictor_reason_code = predictor_reason_code
+        self.underlying_reason_code = underlying_reason_code
         self.message = message
         self.original_error = original_error
         self.original_exception_type = (
@@ -62,9 +68,12 @@ class CLIError(RuntimeError):
             "sample_id",
             "template_id",
             "term",
+            "config_field",
+            "split",
             "solver_path",
             "prediction_stage",
             "predictor_reason_code",
+            "underlying_reason_code",
         ):
             value = getattr(self, name)
             if value is not None:
@@ -79,6 +88,7 @@ class CLIError(RuntimeError):
 
         return {
             "bundle_path": self.bundle_path,
+            "config_field": self.config_field,
             "frame_index": self.frame_index,
             "message": self.message,
             "original_exception_type": self.original_exception_type,
@@ -88,9 +98,11 @@ class CLIError(RuntimeError):
             "reason_code": self.reason_code,
             "sample_id": self.sample_id,
             "solver_path": self.solver_path,
+            "split": self.split,
             "stage": self.stage,
             "template_id": self.template_id,
             "term": self.term,
+            "underlying_reason_code": self.underlying_reason_code,
         }
 
 
@@ -104,9 +116,12 @@ def format_cli_error(error: CLIError) -> str:
         "sample_id",
         "template_id",
         "term",
+        "config_field",
+        "split",
         "solver_path",
         "prediction_stage",
         "predictor_reason_code",
+        "underlying_reason_code",
     ):
         value = getattr(error, name)
         if value is not None:
