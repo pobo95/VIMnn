@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Sequence
+import math
 import sys
 
 from refsite_mlip import __version__
@@ -37,6 +38,35 @@ def _positive_integer(value: str) -> int:
     if result <= 0:
         raise argparse.ArgumentTypeError("must be a positive integer")
     return result
+
+
+def _terms_argument(value: str) -> tuple[str, ...]:
+    from .evaluate import normalize_terms
+
+    try:
+        return normalize_terms(value)
+    except (TypeError, ValueError) as error:
+        raise argparse.ArgumentTypeError(str(error)) from error
+
+
+def _finite_float(value: str, *, positive: bool) -> float:
+    try:
+        result = float(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("must be a finite number") from error
+    invalid = result <= 0.0 if positive else result < 0.0
+    if not math.isfinite(result) or invalid:
+        qualifier = "positive" if positive else "nonnegative"
+        raise argparse.ArgumentTypeError(f"must be finite and {qualifier}")
+    return result
+
+
+def _positive_float(value: str) -> float:
+    return _finite_float(value, positive=True)
+
+
+def _nonnegative_float(value: str) -> float:
+    return _finite_float(value, positive=False)
 
 
 def _device_argument(value: str) -> str:
@@ -144,6 +174,86 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_debug_argument(predict, hidden=True)
     predict.set_defaults(command_handler=_run_predict)
+
+    evaluate = commands.add_parser(
+        "evaluate",
+        help="evaluate labeled extxyz frames without training",
+        description=(
+            "Run one portable bundle predictor over labeled extxyz frames and "
+            "report masked physical metrics and normalized loss."
+        ),
+    )
+    evaluate.add_argument("--bundle", required=True, dest="bundle_path")
+    evaluate.add_argument("--input", required=True, dest="input_path")
+    evaluate.add_argument(
+        "--index", default=":", help="ASE extxyz index expression (default: :)"
+    )
+    evaluation_templates = evaluate.add_mutually_exclusive_group()
+    evaluation_templates.add_argument(
+        "--template-id",
+        help="one exact bundle template ID for every selected frame",
+    )
+    evaluation_templates.add_argument(
+        "--template-key",
+        help="Atoms.info key containing each frame's exact template ID",
+    )
+    evaluate.add_argument(
+        "--solver",
+        choices=("train-fixed", "eval-adaptive"),
+        default="train-fixed",
+    )
+    evaluate.add_argument(
+        "--terms",
+        type=_terms_argument,
+        default=("energy", "forces"),
+        metavar="LIST",
+        help="comma-separated energy,forces,stress (default: energy,forces)",
+    )
+    evaluate.add_argument(
+        "--device", type=_device_argument, default="cpu", metavar="DEVICE"
+    )
+    evaluate.add_argument(
+        "--dtype", choices=("float32", "float64"), default="float64"
+    )
+    evaluate.add_argument(
+        "--batch-size", type=_positive_integer, default=8, metavar="INTEGER"
+    )
+    evaluate.add_argument(
+        "--energy-mode",
+        choices=("per-structure", "per-atom"),
+        default="per-structure",
+    )
+    for term in ("energy", "force", "stress"):
+        evaluate.add_argument(
+            f"--{term}-scale",
+            type=_positive_float,
+            default=1.0,
+            metavar="FLOAT",
+        )
+        evaluate.add_argument(
+            f"--{term}-weight",
+            type=_nonnegative_float,
+            default=1.0,
+            metavar="FLOAT",
+        )
+    evaluate.add_argument(
+        "--output",
+        dest="output_path",
+        help="atomically write the deterministic JSON report to PATH",
+    )
+    evaluate.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="atomically replace an existing regular report file",
+    )
+    evaluate.add_argument(
+        "--json",
+        action="store_true",
+        dest="json_output",
+        help="emit deterministic compact JSON when writing to stdout",
+    )
+    _add_debug_argument(evaluate, hidden=True)
+    evaluate.set_defaults(command_handler=_run_evaluate)
     return parser
 
 
@@ -193,6 +303,46 @@ def _run_predict(args: argparse.Namespace) -> int:
         else render_prediction_human(report)
     )
     print(output)
+    return 0
+
+
+def _run_evaluate(args: argparse.Namespace) -> int:
+    from .evaluate import (
+        ExtXYZEvaluationConfig,
+        evaluate_extxyz,
+        render_evaluation_human,
+        render_evaluation_json,
+    )
+
+    config = ExtXYZEvaluationConfig(
+        bundle_path=args.bundle_path,
+        input_path=args.input_path,
+        index=args.index,
+        template_id=args.template_id,
+        template_key=args.template_key,
+        solver_path=args.solver,
+        terms=args.terms,
+        device=args.device,
+        dtype=args.dtype,
+        batch_size=args.batch_size,
+        energy_mode=args.energy_mode,
+        energy_scale=args.energy_scale,
+        force_scale=args.force_scale,
+        stress_scale=args.stress_scale,
+        energy_weight=args.energy_weight,
+        force_weight=args.force_weight,
+        stress_weight=args.stress_weight,
+        output_path=args.output_path,
+        overwrite=args.overwrite,
+    )
+    report = evaluate_extxyz(config)
+    if args.output_path is None:
+        output = (
+            render_evaluation_json(report)
+            if args.json_output
+            else render_evaluation_human(report)
+        )
+        print(output)
     return 0
 
 

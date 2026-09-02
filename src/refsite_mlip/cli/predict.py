@@ -152,6 +152,32 @@ class ExtXYZPredictionConfig:
     def compute_stress(self) -> bool:
         return "stress" in self.properties
 
+    @property
+    def operation_name(self) -> str:
+        return "prediction"
+
+    @property
+    def sample_id_prefix(self) -> str:
+        return "predict"
+
+
+def _operation_name(config: Any) -> str:
+    return getattr(config, "operation_name", "prediction")
+
+
+def _operation_stage(config: Any, stage: str) -> str:
+    return f"{_operation_name(config)}.{stage}"
+
+
+def _sample_id(config: Any, frame_index: int) -> str:
+    prefix = getattr(config, "sample_id_prefix", "predict")
+    return f"{prefix}:{frame_index:06d}"
+
+
+def _term_context(config: Any) -> str | None:
+    terms = getattr(config, "terms", None)
+    return None if terms is None else ",".join(terms)
+
 
 def _file_error(
     reason_code: str,
@@ -185,11 +211,12 @@ def _prediction_error(
     return CLIError(
         reason_code,
         message,
-        stage=f"prediction.{prediction_stage}",
+        stage=_operation_stage(config, prediction_stage),
         path=input_path,
         frame_index=frame_index,
         sample_id=sample_id,
         template_id=template_id,
+        term=_term_context(config),
         solver_path=config.solver_path,
         prediction_stage=prediction_stage,
         predictor_reason_code=reason_code,
@@ -208,7 +235,8 @@ def _preflight_device(config: ExtXYZPredictionConfig) -> torch.device:
         raise CLIError(
             "UNAVAILABLE_CUDA_DEVICE",
             "CUDA availability could not be established",
-            stage="prediction.device_preflight",
+            stage=_operation_stage(config, "device_preflight"),
+            term=_term_context(config),
             solver_path=config.solver_path,
             prediction_stage="device_preflight",
             predictor_reason_code="UNAVAILABLE_CUDA_DEVICE",
@@ -219,7 +247,8 @@ def _preflight_device(config: ExtXYZPredictionConfig) -> torch.device:
         raise CLIError(
             "UNAVAILABLE_CUDA_DEVICE",
             f"requested CUDA device {config.device!r} is unavailable",
-            stage="prediction.device_preflight",
+            stage=_operation_stage(config, "device_preflight"),
+            term=_term_context(config),
             solver_path=config.solver_path,
             prediction_stage="device_preflight",
             predictor_reason_code="UNAVAILABLE_CUDA_DEVICE",
@@ -227,7 +256,7 @@ def _preflight_device(config: ExtXYZPredictionConfig) -> torch.device:
     return device
 
 
-def _preflight_paths(config: ExtXYZPredictionConfig) -> tuple[Path, Path]:
+def _resolve_input_path(config: Any) -> Path:
     source = Path(config.input_path).expanduser()
     try:
         resolved_source = source.resolve(strict=True)
@@ -235,7 +264,7 @@ def _preflight_paths(config: ExtXYZPredictionConfig) -> tuple[Path, Path]:
         raise _file_error(
             "INPUT_NOT_FOUND",
             "input extxyz does not exist",
-            stage="prediction.input_path",
+            stage=_operation_stage(config, "input_path"),
             path=source,
             original_error=error,
         ) from error
@@ -243,7 +272,7 @@ def _preflight_paths(config: ExtXYZPredictionConfig) -> tuple[Path, Path]:
         raise _file_error(
             "INPUT_PATH_ERROR",
             "input extxyz path could not be resolved",
-            stage="prediction.input_path",
+            stage=_operation_stage(config, "input_path"),
             path=source,
             original_error=error,
         ) from error
@@ -251,9 +280,14 @@ def _preflight_paths(config: ExtXYZPredictionConfig) -> tuple[Path, Path]:
         raise _file_error(
             "INVALID_INPUT_PATH",
             "input extxyz path must be a regular file",
-            stage="prediction.input_path",
+            stage=_operation_stage(config, "input_path"),
             path=source,
         )
+    return resolved_source
+
+
+def _preflight_paths(config: ExtXYZPredictionConfig) -> tuple[Path, Path]:
+    resolved_source = _resolve_input_path(config)
 
     target = Path(config.output_path).expanduser()
     parent = target.parent
@@ -261,7 +295,7 @@ def _preflight_paths(config: ExtXYZPredictionConfig) -> tuple[Path, Path]:
         raise _file_error(
             "INVALID_OUTPUT_DIRECTORY",
             "output parent must be an existing directory",
-            stage="prediction.output_path",
+            stage=_operation_stage(config, "output_path"),
             path=target,
         )
     _validate_output_target(
@@ -333,8 +367,9 @@ def _load_predictor(config: ExtXYZPredictionConfig):
         raise CLIError(
             error.reason_code,
             "portable bundle load or runtime instantiation failed",
-            stage=error.validation_stage or "prediction.predictor_load",
+            stage=error.validation_stage or _operation_stage(config, "predictor_load"),
             bundle_path=error.bundle_path or config.bundle_path,
+            term=_term_context(config),
             solver_path=config.solver_path,
             prediction_stage="predictor_load",
             predictor_reason_code=error.reason_code,
@@ -344,8 +379,9 @@ def _load_predictor(config: ExtXYZPredictionConfig):
         raise CLIError(
             "BUNDLE_NOT_FOUND",
             "portable bundle does not exist",
-            stage="prediction.predictor_load",
+            stage=_operation_stage(config, "predictor_load"),
             bundle_path=config.bundle_path,
+            term=_term_context(config),
             solver_path=config.solver_path,
             prediction_stage="predictor_load",
             predictor_reason_code="BUNDLE_NOT_FOUND",
@@ -356,8 +392,12 @@ def _load_predictor(config: ExtXYZPredictionConfig):
         raise CLIError(
             reason,
             "portable bundle predictor could not be loaded",
-            stage=getattr(error, "validation_stage", "prediction.predictor_load"),
+            stage=(
+                getattr(error, "validation_stage", None)
+                or _operation_stage(config, "predictor_load")
+            ),
             bundle_path=config.bundle_path,
+            term=_term_context(config),
             solver_path=config.solver_path,
             prediction_stage="predictor_load",
             predictor_reason_code=reason,
@@ -374,8 +414,8 @@ def _read_frames(
     except ImportError as error:  # pragma: no cover - optional dependency
         raise _file_error(
             "ASE_UNAVAILABLE",
-            "ASE is required for extxyz prediction",
-            stage="prediction.input_parse",
+            f"ASE is required for extxyz {_operation_name(config)}",
+            stage=_operation_stage(config, "input_parse"),
             path=source,
             original_error=error,
         ) from error
@@ -395,10 +435,11 @@ def _read_frames(
                 raise CLIError(
                     "MALFORMED_EXTXYZ",
                     "ASE could not parse an extxyz frame",
-                    stage="prediction.input_parse",
+                    stage=_operation_stage(config, "input_parse"),
                     path=source,
                     frame_index=frame_index,
-                    sample_id=f"predict:{frame_index:06d}",
+                    sample_id=_sample_id(config, frame_index),
+                    term=_term_context(config),
                     solver_path=config.solver_path,
                     prediction_stage="input_parse",
                     original_error=error,
@@ -409,7 +450,7 @@ def _read_frames(
         raise _file_error(
             "MALFORMED_EXTXYZ",
             "ASE could not open or parse the extxyz input",
-            stage="prediction.input_parse",
+            stage=_operation_stage(config, "input_parse"),
             path=source,
             original_error=error,
         ) from error
@@ -417,7 +458,7 @@ def _read_frames(
         raise _file_error(
             "EMPTY_INPUT",
             "selected extxyz input contains no frames",
-            stage="prediction.input_parse",
+            stage=_operation_stage(config, "input_parse"),
             path=source,
         )
     return tuple(frames)
@@ -631,7 +672,7 @@ def _prepare_samples(
     samples = []
     first_by_template: dict[str, tuple[int, str]] = {}
     for frame_index, atoms in enumerate(frames):
-        sample_id = f"predict:{frame_index:06d}"
+        sample_id = _sample_id(config, frame_index)
         template_id = _selected_template_id(
             atoms,
             frame_index=frame_index,

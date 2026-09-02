@@ -20,6 +20,7 @@ class CLIError(RuntimeError):
         frame_index: int | None = None,
         sample_id: str | None = None,
         template_id: str | None = None,
+        term: str | None = None,
         solver_path: str | None = None,
         prediction_stage: str | None = None,
         predictor_reason_code: str | None = None,
@@ -42,6 +43,7 @@ class CLIError(RuntimeError):
         self.frame_index = frame_index
         self.sample_id = sample_id
         self.template_id = template_id
+        self.term = term
         self.solver_path = solver_path
         self.prediction_stage = prediction_stage
         self.predictor_reason_code = predictor_reason_code
@@ -59,6 +61,7 @@ class CLIError(RuntimeError):
             "frame_index",
             "sample_id",
             "template_id",
+            "term",
             "solver_path",
             "prediction_stage",
             "predictor_reason_code",
@@ -87,6 +90,7 @@ class CLIError(RuntimeError):
             "solver_path": self.solver_path,
             "stage": self.stage,
             "template_id": self.template_id,
+            "term": self.term,
         }
 
 
@@ -99,6 +103,7 @@ def format_cli_error(error: CLIError) -> str:
         "frame_index",
         "sample_id",
         "template_id",
+        "term",
         "solver_path",
         "prediction_stage",
         "predictor_reason_code",
