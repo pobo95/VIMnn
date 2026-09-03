@@ -1,3 +1,5 @@
+"""Integration coverage for portable checkpoint bundle export."""
+
 from __future__ import annotations
 
 import importlib
