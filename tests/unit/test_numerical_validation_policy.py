@@ -16,6 +16,9 @@ from refsite_mlip.transport import (
     TransportSupportConfig,
     solve_atom_vacancy_ot,
 )
+from refsite_mlip.transport.diagnostics import build_result
+from refsite_mlip.transport.dual import transport_plan
+from refsite_mlip.transport.problem import build_ot_problem
 
 
 def _float32_transport():
@@ -85,6 +88,59 @@ def test_float64_default_and_explicit_probability_contract_round_trip():
     assert automatic.probability_tolerance is None
     assert ProbabilityMultipoleConfig.from_dict(automatic.to_dict()) == automatic
     assert ProbabilityMultipoleConfig.from_dict(explicit.to_dict()) == explicit
+
+
+def test_float32_result_stabilizes_only_converged_storage_roundoff():
+    seed = torch.tensor(
+        [[0.4, 0.6], [0.6, 0.40000024]], dtype=torch.float32
+    )
+    cost = -torch.log(seed)
+    problem = build_ot_problem(cost, 1.0)
+    f = torch.zeros(2, dtype=torch.float32)
+    g = torch.zeros(2, dtype=torch.float32)
+    raw = transport_plan(problem, f, g)
+    raw_error = torch.maximum(
+        (raw.to(torch.float64).sum(0) - 1.0).abs().max(),
+        (raw.to(torch.float64).sum(1) - 1.0).abs().max(),
+    )
+    assert raw_error > 1.0e-7
+
+    stabilized = build_result(
+        problem,
+        f,
+        g,
+        converged=True,
+        sinkhorn_iterations=1,
+        newton_iterations=0,
+        cg_iterations=0,
+        line_search_reductions=0,
+        fallback_used=False,
+        solver_name="fixture",
+        path_name=TRAIN_FIXED,
+    )
+    stored_error = torch.maximum(
+        (stabilized.gamma.to(torch.float64).sum(0) - 1.0).abs().max(),
+        (stabilized.gamma.to(torch.float64).sum(1) - 1.0).abs().max(),
+    )
+    assert stored_error < 1.0e-7
+    assert (stabilized.gamma - raw).abs().max() <= 2.0 * torch.finfo(
+        torch.float32
+    ).eps
+
+    nonconverged = build_result(
+        problem,
+        f,
+        g,
+        converged=False,
+        sinkhorn_iterations=1,
+        newton_iterations=0,
+        cg_iterations=0,
+        line_search_reductions=0,
+        fallback_used=False,
+        solver_name="fixture",
+        path_name=TRAIN_FIXED,
+    )
+    assert torch.equal(nonconverged.gamma, raw)
 
 
 def test_support_diagnostics_separate_switch_boundaries():
