@@ -15,6 +15,8 @@ from typing import Any, Mapping
 
 import torch
 
+from refsite_mlip._atomic import commit_temporary_file
+
 from refsite_mlip.graph import ReferenceGraphTopology
 from refsite_mlip.phase.stabilizer import (
     torus_difference,
@@ -854,9 +856,7 @@ def save_reference_structure_artifact(
             os.fsync(handle.fileno())
         if target.is_symlink():
             raise ValueError("artifact target became a symbolic link")
-        if target.exists() and not overwrite:
-            raise FileExistsError(f"artifact already exists: {target}")
-        os.replace(temporary, target)
+        commit_temporary_file(temporary, target, overwrite=overwrite)
         try:
             directory_descriptor = os.open(parent, os.O_RDONLY)
             try:

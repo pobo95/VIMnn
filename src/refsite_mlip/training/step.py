@@ -14,6 +14,7 @@ from refsite_mlip.models import evaluate_structure_batch
 from refsite_mlip.transport import TRAIN_FIXED
 
 from .losses import LossConfig, LossTerm, compute_potential_loss
+from .optimizer import validate_optimizer_binding
 
 
 def _positive_optional_real(name: str, value: Real | None) -> float | None:
@@ -193,6 +194,7 @@ def train_step(
         raise TypeError("loss_config must be a LossConfig")
     if not isinstance(step_config, TrainStepConfig):
         raise TypeError("step_config must be a TrainStepConfig")
+    validate_optimizer_binding(model, optimizer)
 
     model.train()
     optimizer.zero_grad(set_to_none=True)

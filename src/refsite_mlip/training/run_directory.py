@@ -11,6 +11,8 @@ from pathlib import Path
 import tempfile
 from typing import Any
 
+from refsite_mlip._atomic import commit_temporary_file
+
 
 RUN_STATUS_SCHEMA_VERSION = "refsite_training_run_status_v1"
 RESUME_LOCK_FILENAME = ".resume.lock"
@@ -189,14 +191,20 @@ def _atomic_write_text(
                 stage=stage,
                 path=target,
             )
-        if target.exists() and not overwrite:
+        try:
+            commit_temporary_file(
+                temporary,
+                target,
+                overwrite=overwrite,
+            )
+        except FileExistsError as error:
             raise RunDirectoryError(
                 "RUNTIME_FILE_ALREADY_EXISTS",
                 "immutable runtime metadata target appeared before commit",
                 stage=stage,
                 path=target,
-            )
-        os.replace(temporary, target)
+                original_error=error,
+            ) from error
         temporary = None
     except RunDirectoryError:
         raise

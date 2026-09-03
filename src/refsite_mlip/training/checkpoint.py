@@ -18,9 +18,12 @@ from typing import Any
 import numpy as np
 import torch
 
+from refsite_mlip._atomic import commit_temporary_file
+
 from refsite_mlip.data import StructureBatch
 
 from .fit import FitConfig, FitEpochRecord
+from .optimizer import validate_optimizer_binding
 from .selection import ModelSelectionState
 
 
@@ -660,6 +663,7 @@ def capture_training_checkpoint(
         raise TypeError("model must be a torch.nn.Module")
     if not isinstance(optimizer, torch.optim.Optimizer):
         raise TypeError("optimizer must be a torch optimizer")
+    validate_optimizer_binding(model, optimizer)
     if not hasattr(scheduler, "state_dict"):
         raise TypeError("scheduler must provide state_dict")
     if not isinstance(selection_state, ModelSelectionState):
@@ -768,7 +772,7 @@ def save_training_checkpoint(
     *,
     overwrite: bool = False,
 ) -> None:
-    """Write completely, fsync, then atomically replace the target path."""
+    """Write completely, then atomically create or replace the target path."""
 
     if not isinstance(checkpoint, TrainingCheckpoint):
         raise TypeError("checkpoint must be a TrainingCheckpoint")
@@ -792,9 +796,7 @@ def save_training_checkpoint(
             torch.save(checkpoint.to_dict(), handle)
             handle.flush()
             os.fsync(handle.fileno())
-        if target.exists() and not overwrite:
-            raise FileExistsError(f"checkpoint already exists: {target}")
-        os.replace(temporary, target)
+        commit_temporary_file(temporary, target, overwrite=overwrite)
         try:
             directory_descriptor = os.open(parent, os.O_RDONLY)
             try:

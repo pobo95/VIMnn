@@ -33,6 +33,7 @@ from .checkpoint import (
 )
 from .fit import FitConfig
 from .scheduler import SchedulerConfig, _validate_scheduler_binding
+from .optimizer import validate_optimizer_binding
 from .selection import ModelSelectionState
 
 
@@ -327,32 +328,13 @@ def _validate_model_state(checkpoint: TrainingCheckpoint, model: torch.nn.Module
             )
 
 
-def _optimizer_parameters(optimizer: torch.optim.Optimizer) -> tuple[torch.nn.Parameter, ...]:
-    return tuple(
-        parameter
-        for group in optimizer.param_groups
-        for parameter in group["params"]
-    )
-
-
 def _validate_optimizer_binding(
     model: torch.nn.Module, optimizer: torch.optim.Optimizer
 ) -> None:
-    if not isinstance(optimizer, torch.optim.Optimizer):
-        raise TypeError("optimizer must be a torch optimizer")
-    optimizer_parameters = _optimizer_parameters(optimizer)
-    if len({id(parameter) for parameter in optimizer_parameters}) != len(
-        optimizer_parameters
-    ):
-        _compatibility_error("optimizer contains a parameter more than once")
-    model_parameters = tuple(
-        parameter for parameter in model.parameters() if parameter.requires_grad
-    )
-    if tuple(map(id, optimizer_parameters)) != tuple(map(id, model_parameters)):
-        _compatibility_error(
-            "optimizer parameters are not the current model trainable parameters "
-            "in exact order"
-        )
+    try:
+        validate_optimizer_binding(model, optimizer)
+    except (TypeError, ValueError) as error:
+        _compatibility_error(str(error))
 
 
 def _validate_optimizer_structure(

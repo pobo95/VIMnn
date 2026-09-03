@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+from dataclasses import replace
 import json
 from pathlib import Path
 
@@ -43,6 +44,7 @@ from refsite_mlip.training import (
     TrainStepConfig,
     ValidationStepConfig,
 )
+from refsite_mlip.transport import TransportSupportConfig
 
 from test_cli_inspect_bundle import _typed_crystal_data
 from test_model_bundle_runtime import _capture_case
@@ -54,6 +56,24 @@ def training_bundle(tmp_path_factory):
     _, model, registry, samples, _, _, _, original = _capture_case(
         _typed_crystal_data()
     )
+    support = TransportSupportConfig(
+        kind="compact_c2",
+        cutoff=4.0,
+        switch_width=0.5,
+        candidate_skin=0.2,
+    )
+    configured = type(model)(
+        replace(model.config, transport_support=support),
+        model.topology,
+        model.phase_modes,
+        model.phase_mode_weights,
+        model.species_alignment_weights,
+        model.site_alignment_weights,
+        model.phase_channel_weights,
+        model.atomic_baseline,
+    ).to(model.atomic_baseline)
+    configured.load_state_dict(model.state_dict(), strict=True)
+    model = configured
     original_bindings = {
         binding.template_id: binding for binding in original.template_bindings
     }
@@ -372,8 +392,8 @@ def test_mixed_template_key_partial_masks_digests_order_and_plain_metadata(
         ),
         (
             lambda payload: payload["radii"].update({"r_mp": 3.1}),
-            "RADIUS_ARTIFACT_MISMATCH",
-            "alpha",
+            "RADIUS_MODEL_MISMATCH",
+            None,
         ),
         (
             lambda payload: payload["data"]["train"][0].update(

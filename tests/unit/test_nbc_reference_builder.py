@@ -278,6 +278,71 @@ def test_explicit_phase_required_rank_and_alias_contract():
         )
 
 
+@pytest.mark.parametrize(
+    ("modes", "message"),
+    (
+        (torch.eye(3, dtype=torch.bool), "bool"),
+        (
+            torch.tensor(
+                [[0.5, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                dtype=torch.float64,
+            ),
+            "fractional",
+        ),
+        (
+            torch.tensor(
+                [[float("nan"), 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                dtype=torch.float64,
+            ),
+            "NaN or Inf",
+        ),
+        (
+            torch.tensor(
+                [[float("inf"), 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                dtype=torch.float64,
+            ),
+            "NaN or Inf",
+        ),
+        (
+            torch.tensor(
+                [[2**63, 0, 0], [0, 1, 0], [0, 0, 1]],
+                dtype=torch.uint64,
+            ),
+            "represented exactly",
+        ),
+    ),
+)
+def test_phase_modes_reject_noninteger_bool_and_nonfinite_before_cast(
+    modes, message
+):
+    with pytest.raises((TypeError, ValueError), match=message):
+        PhaseSpecification(
+            modes,
+            torch.ones(3),
+            torch.eye(2),
+            torch.ones(2),
+            "provisional",
+        )
+
+
+def test_phase_payload_fractional_mode_is_not_silently_truncated():
+    payload = _phase(1).to_dict()
+    payload["modes"][0][0] = 0.25
+    with pytest.raises(ValueError, match="fractional"):
+        PhaseSpecification.from_dict(payload)
+
+    integral_float = torch.eye(3, dtype=torch.float64)
+    phase = PhaseSpecification(
+        integral_float,
+        torch.ones(3),
+        torch.eye(2),
+        torch.ones(2),
+        "provisional",
+    )
+    assert phase.modes.dtype == torch.long
+    assert torch.equal(phase.modes, torch.eye(3, dtype=torch.long))
+
+
 def test_typed_stabilizer_sizes_and_canonical_permutation_consistency():
     for size, expected in ((2, 32), (3, 108)):
         canonical = canonicalize_reference_atoms(

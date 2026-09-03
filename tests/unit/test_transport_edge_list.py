@@ -18,7 +18,10 @@ from refsite_mlip.transport import (
     materialize_dense_plan,
     solve_atom_vacancy_ot,
     solve_sparse_sinkhorn_train_fixed,
+    sparse_transport_plan,
 )
+from refsite_mlip.transport.dual import transport_plan
+from refsite_mlip.transport.problem import build_ot_problem
 
 
 def _dense_config():
@@ -169,6 +172,70 @@ def test_sparse_fixed_matches_dense_masked_oracle_and_features():
         assert torch.equal(getattr(sparse, name), getattr(repeated, name))
 
 
+@pytest.mark.parametrize("dtype", (torch.float32, torch.float64))
+@pytest.mark.parametrize(
+    "device",
+    (
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available(), reason="CUDA unavailable"
+            ),
+        ),
+    ),
+)
+def test_dense_sparse_fixed_results_come_from_their_returned_duals(dtype, device):
+    displacements = _displacements(dtype=dtype, device=device)
+    distances = torch.linalg.vector_norm(displacements, dim=-1)
+    dense = _solve_dense(displacements)
+    sparse = _solve_sparse(displacements)
+
+    problem = build_ot_problem(
+        distances.square() / (2.0 * 1.5**2),
+        0.5,
+        support_config=_dense_config(),
+        atom_distances=distances,
+    )
+    reconstructed_dense = transport_plan(problem, dense.f, dense.g)
+    reconstructed_edges, reconstructed_q = sparse_transport_plan(
+        sparse.edges, sparse.f, sparse.g
+    )
+    assert torch.equal(dense.gamma, reconstructed_dense)
+    assert torch.equal(dense.P, reconstructed_dense[:, :2])
+    assert torch.equal(dense.q, reconstructed_dense[:, 2])
+    assert torch.equal(sparse.edge_plan, reconstructed_edges)
+    assert torch.equal(sparse.q, reconstructed_q)
+
+    materialized = materialize_dense_plan(sparse).plan
+    tolerance = 8.0 * torch.finfo(dtype).eps
+    torch.testing.assert_close(
+        materialized,
+        dense.P,
+        atol=tolerance,
+        rtol=tolerance,
+    )
+    torch.testing.assert_close(
+        sparse.q,
+        dense.q,
+        atol=tolerance,
+        rtol=tolerance,
+    )
+    for value in (
+        dense.P,
+        dense.q,
+        dense.f,
+        dense.g,
+        sparse.edge_plan,
+        sparse.q,
+        sparse.f,
+        sparse.g,
+    ):
+        assert value.dtype == dtype
+        assert value.device.type == device
+        assert bool(torch.all(torch.isfinite(value)))
+
+
 def test_edge_list_all_vacancy_reservoir_is_dense_and_analytic():
     displacements = torch.empty((3, 0, 3), dtype=torch.float64)
     result = _solve_sparse(displacements)
@@ -226,15 +293,29 @@ def test_sparse_fixed_dtype_and_marginals(dtype):
         result.q.sum(), result.q.new_tensor(1.0), atol=2e-6 if dtype == torch.float32 else 2e-14, rtol=0
     )
     if dtype == torch.float32:
+        strict_config = ProbabilityMultipoleConfig(
+            (6, 41), 1, 2, 1.0, 3.0, probability_tolerance=1e-9
+        )
+        features = build_sparse_probability_multipoles(
+            result.edge_plan,
+            result.q,
+            result.edges,
+            torch.tensor([6, 41]),
+            strict_config,
+        )
+        effective = features.config_metadata[
+            "effective_probability_validation_tolerances"
+        ]
+        assert effective["simplex"] > torch.finfo(torch.float32).eps
+        invalid_q = result.q.clone()
+        invalid_q[0] += 20.0 * effective["simplex"]
         with pytest.raises(ValueError, match="balanced probability-field contract"):
             build_sparse_probability_multipoles(
                 result.edge_plan,
-                result.q,
+                invalid_q,
                 result.edges,
                 torch.tensor([6, 41]),
-                ProbabilityMultipoleConfig(
-                    (6, 41), 1, 2, 1.0, 3.0, probability_tolerance=1e-9
-                ),
+                strict_config,
             )
 
 

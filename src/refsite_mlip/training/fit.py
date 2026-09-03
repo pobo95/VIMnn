@@ -15,6 +15,7 @@ from refsite_mlip.models.batch_executor import _validated_context
 
 from .epoch import EpochResult, run_training_epoch, run_validation_epoch
 from .losses import LossConfig
+from .optimizer import validate_optimizer_binding
 from .scheduler import SchedulerConfig, _validate_scheduler_binding
 from .selection import (
     ModelSelectionConfig,
@@ -277,6 +278,7 @@ def _validate_monitor_supervision(
 
 
 def _preflight(
+    model,
     optimizer,
     scheduler,
     train_batches,
@@ -290,6 +292,7 @@ def _preflight(
     selection_state,
     fit_config,
 ) -> tuple[Sequence[StructureBatch], Sequence[StructureBatch]]:
+    validate_optimizer_binding(model, optimizer)
     if not isinstance(optimizer, torch.optim.Optimizer):
         raise TypeError("optimizer must be a torch optimizer")
     for value, cls, name in (
@@ -355,6 +358,7 @@ def run_fit(
     """Run ordered train/validation/selection events until max epoch or stop."""
 
     train_batches, validation_batches = _preflight(
+        model,
         optimizer,
         scheduler,
         train_batches,

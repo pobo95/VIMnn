@@ -267,6 +267,45 @@ def test_invalid_start_state_fails_before_parameter_change(monkeypatch):
     assert scheduler.state_dict() == {"validation_steps": 0}
 
 
+def test_fit_rejects_optimizer_from_another_model_before_epoch_or_mode_change(
+    monkeypatch,
+):
+    model = TinyModel()
+    foreign = TinyModel()
+    optimizer = torch.optim.AdamW(foreign.parameters(), lr=0.1)
+    config = SchedulerConfig()
+    scheduler = build_scheduler(optimizer, config)
+    model.eval()
+    model.weight.grad = torch.tensor(9.0, dtype=torch.float64)
+    before = model.weight.grad.clone()
+    monkeypatch.setattr(
+        fit_module,
+        "run_training_epoch",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("optimizer preflight must precede epochs")
+        ),
+    )
+    with pytest.raises(ValueError, match="optimizer parameters"):
+        run_fit(
+            model,
+            optimizer,
+            scheduler,
+            (_batch(),),
+            (_batch(),),
+            {},
+            LossConfig(),
+            TrainStepConfig(),
+            ValidationStepConfig(),
+            config,
+            ModelSelectionConfig(),
+            ModelSelectionState(),
+            FitConfig(1),
+        )
+    assert not model.training
+    assert torch.equal(model.weight.grad, before)
+    assert optimizer.state == {}
+
+
 def test_empty_generator_and_missing_context_preflight():
     model = TinyModel()
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.1)

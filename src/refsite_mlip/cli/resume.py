@@ -878,6 +878,24 @@ def _validate_status(
             stage="resume.metadata.status",
             path=directory.status_path,
         )
+    run_state = status.get("status")
+    if run_state == "running":
+        raise CLIError(
+            "RUN_STATUS_ACTIVE_OR_UNCERTAIN",
+            "run_status.json is running but no active lock ownership can be established; "
+            "resume refuses to take over automatically",
+            stage="resume.metadata.status",
+            path=directory.status_path,
+            config_field="status",
+        )
+    if run_state not in {"completed", "failed", "interrupted"}:
+        raise CLIError(
+            "INVALID_RUN_STATUS",
+            "run_status.json must be completed, failed, or interrupted before resume",
+            stage="resume.metadata.status",
+            path=directory.status_path,
+            config_field="status",
+        )
     for field, expected in (
         ("config_fingerprint", stored.config_fingerprint),
         ("bundle_fingerprint", stored.bundle_fingerprint),
@@ -1401,46 +1419,69 @@ def _resolved_checkpoint_configs(
     }
 
 
+def _recheck_resume_sources(preflight: _ResumePreflight) -> None:
+    """Revalidate immutable run metadata after acquiring exclusive ownership."""
+
+    current_config = _load_config(preflight.directory)
+    if not _canonical_equal(current_config.to_dict(), preflight.config.to_dict()):
+        raise CLIError(
+            "RESOLVED_CONFIG_TOCTOU_MISMATCH",
+            "resolved_config.json changed between preflight and lock acquisition",
+            stage="resume.config.toctou",
+            path=preflight.directory.resolved_config_path,
+        )
+    current_preflight = load_runtime_json(
+        preflight.directory.preflight_path,
+        stage="resume.metadata.preflight_toctou",
+    )
+    if not _canonical_equal(current_preflight, preflight.stored_preflight):
+        raise CLIError(
+            "PREFLIGHT_TOCTOU_MISMATCH",
+            "preflight.json changed between preflight and lock acquisition",
+            stage="resume.preflight.toctou",
+            path=preflight.directory.preflight_path,
+        )
+    current_status = load_runtime_json(
+        preflight.directory.status_path,
+        stage="resume.metadata.status_toctou",
+    )
+    if not _canonical_equal(current_status, preflight.stored_status):
+        raise CLIError(
+            "RUN_STATUS_TOCTOU_MISMATCH",
+            "run_status.json changed between preflight and lock acquisition",
+            stage="resume.status.toctou",
+            path=preflight.directory.status_path,
+        )
+    try:
+        current = preflight.manager.load_latest()
+    except Exception as error:
+        raise CLIError(
+            "LATEST_CHECKPOINT_TOCTOU_MISMATCH",
+            "latest checkpoint could not be reloaded after lock acquisition",
+            stage="resume.checkpoint.toctou",
+            path=preflight.directory.checkpoints / "latest.pt",
+            original_error=error,
+        ) from error
+    if not _tree_equal(current.to_dict(), preflight.checkpoint.to_dict()):
+        raise CLIError(
+            "LATEST_CHECKPOINT_TOCTOU_MISMATCH",
+            "latest checkpoint changed between preflight and lock acquisition",
+            stage="resume.checkpoint.toctou",
+            path=preflight.directory.checkpoints / "latest.pt",
+        )
+
+
 def _execute_resume(
     preflight: _ResumePreflight,
     *,
     progress: Callable[[str], None] | None,
 ) -> dict[str, Any]:
     max_epochs = int(preflight.report["requested_max_epochs"])
-    phase = "checkpoint.toctou"
+    _recheck_resume_sources(preflight)
+    phase = "runtime.seed"
     prepared: _PreparedTrainingRuntime | None = None
     training_executed = False
     try:
-        current_config = _load_config(preflight.directory)
-        if not _canonical_equal(
-            current_config.to_dict(), preflight.config.to_dict()
-        ):
-            raise CLIError(
-                "RESOLVED_CONFIG_TOCTOU_MISMATCH",
-                "resolved_config.json changed between preflight and lock acquisition",
-                stage="resume.config.toctou",
-                path=preflight.directory.resolved_config_path,
-            )
-        current_preflight = load_runtime_json(
-            preflight.directory.preflight_path,
-            stage="resume.metadata.preflight_toctou",
-        )
-        if not _canonical_equal(current_preflight, preflight.stored_preflight):
-            raise CLIError(
-                "PREFLIGHT_TOCTOU_MISMATCH",
-                "preflight.json changed between preflight and lock acquisition",
-                stage="resume.preflight.toctou",
-                path=preflight.directory.preflight_path,
-            )
-        current = preflight.manager.load_latest()
-        if not _tree_equal(current.to_dict(), preflight.checkpoint.to_dict()):
-            raise CLIError(
-                "LATEST_CHECKPOINT_TOCTOU_MISMATCH",
-                "latest checkpoint changed between preflight and lock acquisition",
-                stage="resume.checkpoint.toctou",
-                path=preflight.directory.checkpoints / "latest.pt",
-            )
-        phase = "runtime.seed"
         seed_training_runtime(preflight.config.runtime.seed)
         phase = "metadata.running_status"
         preflight.directory.write_status(

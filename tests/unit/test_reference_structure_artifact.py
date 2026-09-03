@@ -581,6 +581,28 @@ def test_symlink_is_rejected_for_save_and_load(tmp_path, tiny_artifact):
     assert caught.value.reason_code == "SYMLINK_REJECTED"
 
 
+def test_no_overwrite_race_never_clobbers_competing_artifact(
+    tmp_path, tiny_artifact, monkeypatch
+):
+    import refsite_mlip.data.reference_artifact as module
+
+    target = tmp_path / "raced-artifact.pt"
+
+    def competing_link(source, destination, *args, **kwargs):
+        del source, args, kwargs
+        path = type(target)(destination)
+        path.write_bytes(b"competitor")
+        raise FileExistsError(f"competing artifact won: {path}")
+
+    monkeypatch.setattr(module.os, "link", competing_link)
+    with pytest.raises(FileExistsError, match="competing artifact"):
+        save_reference_structure_artifact(
+            target, tiny_artifact, overwrite=False
+        )
+    assert target.read_bytes() == b"competitor"
+    assert not list(tmp_path.glob(".raced-artifact.pt.*.tmp"))
+
+
 def test_weights_only_safe_globals_and_rng_are_unchanged(tmp_path, tiny_artifact):
     path = tmp_path / "artifact.pt"
     python_state = random.getstate()

@@ -30,18 +30,17 @@ def effective_probability_validation_tolerances(
 ) -> dict[str, float]:
     """Return validation-only roundoff limits without changing feature arithmetic.
 
-    An explicitly configured tolerance is authoritative.  The automatic float64
-    contract remains 1e-7.  For float32, the bound follows the pairwise reduction
-    depth of the atom and site reductions, plus final additions.  Solver
-    residuals, non-finiteness, and the actual P/q/features are never altered by
-    this helper.
+    The automatic float64 contract remains 1e-7.  For float32, the bound follows
+    the pairwise reduction depth of the atom and site reductions, plus final
+    additions.  An explicit value may tighten the semantic check only down to
+    that representational roundoff floor.  Solver residuals, non-finiteness, and
+    the actual P/q/features are never altered by this helper.
     """
 
-    if configured_tolerance is not None:
-        value = float(configured_tolerance)
-        return {"simplex": value, "species_count": value, "vacancy_mass": value}
     base = 1.0e-7
     if P.dtype == torch.float64:
+        if configured_tolerance is not None:
+            base = float(configured_tolerance)
         return {"simplex": base, "species_count": base, "vacancy_mass": base}
     if P.dtype != torch.float32:
         raise ValueError("probability validation supports float32 and float64")
@@ -55,7 +54,12 @@ def effective_probability_validation_tolerances(
     local_depth = math.ceil(math.log2(max(atoms, 2))) + 3
     local = max(base, local_depth * epsilon)
     count = max(base, global_reduction_depth * epsilon)
-    return {"simplex": local, "species_count": count, "vacancy_mass": local}
+    requested = 0.0 if configured_tolerance is None else float(configured_tolerance)
+    return {
+        "simplex": max(requested, local),
+        "species_count": max(requested, count),
+        "vacancy_mass": max(requested, local),
+    }
 
 
 def _effective_sparse_tolerances(
@@ -65,11 +69,13 @@ def _effective_sparse_tolerances(
     dtype: torch.dtype,
     configured_tolerance: float | None,
 ) -> dict[str, float]:
-    if configured_tolerance is not None:
-        value = float(configured_tolerance)
-        return {"simplex": value, "species_count": value, "vacancy_mass": value}
     if dtype == torch.float64:
-        return {"simplex": 1.0e-7, "species_count": 1.0e-7, "vacancy_mass": 1.0e-7}
+        value = (
+            1.0e-7
+            if configured_tolerance is None
+            else float(configured_tolerance)
+        )
+        return {"simplex": value, "species_count": value, "vacancy_mass": value}
     if dtype != torch.float32:
         raise ValueError("probability validation supports float32 and float64")
     epsilon = torch.finfo(dtype).eps
@@ -85,10 +91,15 @@ def _effective_sparse_tolerances(
     # term in addition to the pairwise feature-reduction depth.  Local site and
     # atom invariants retain the stricter depth-only bound below.
     species_count_depth = atoms + global_depth
+    requested = (
+        1.0e-7
+        if configured_tolerance is None
+        else float(configured_tolerance)
+    )
     return {
-        "simplex": max(1.0e-7, local_depth * epsilon),
-        "species_count": max(1.0e-7, species_count_depth * epsilon),
-        "vacancy_mass": max(1.0e-7, local_depth * epsilon),
+        "simplex": max(requested, local_depth * epsilon),
+        "species_count": max(requested, species_count_depth * epsilon),
+        "vacancy_mass": max(requested, local_depth * epsilon),
     }
 
 
@@ -119,10 +130,8 @@ def _validate_inputs(
             raise ValueError("feature input contains NaN or Inf")
     if atomic_numbers.device != P.device:
         raise ValueError("atomic_numbers must share P device")
-    if bool(torch.any(P < 0.0)) or bool(torch.any(q < 0.0)) or bool(
-        torch.any(q > 1.0)
-    ):
-        raise ValueError("P and q must be nonnegative and q must not exceed one")
+    if bool(torch.any(P < 0.0)):
+        raise ValueError("P must be nonnegative")
     if site_types is not None:
         if site_types.shape != (sites,) or site_types.dtype != torch.long:
             raise ValueError("site_types must be long with shape [M]")
@@ -208,6 +217,13 @@ def build_probability_multipoles(
     tolerances = effective_probability_validation_tolerances(
         P, config.probability_tolerance
     )
+    q_bound_tolerance = tolerances["simplex"]
+    if bool(torch.any(q < -q_bound_tolerance)) or bool(
+        torch.any(q > 1.0 + q_bound_tolerance)
+    ):
+        raise ValueError(
+            "q contains a value outside the numerical probability bounds [0,1]"
+        )
     # Validation reductions use float64 for float32 inputs, while the returned
     # probability/features retain the requested dtype and exact arithmetic.
     # This separates stored-plan error from an avoidable second reduction error.
@@ -226,7 +242,11 @@ def build_probability_multipoles(
     vacancy_error = (
         validation_q.sum() - float(P.shape[0] - P.shape[1])
     ).abs()
-    atom_column_error = (validation_P.sum(dim=0) - 1.0).abs().max()
+    atom_column_error = (
+        (validation_P.sum(dim=0) - 1.0).abs().max()
+        if P.shape[1]
+        else validation_P.new_zeros(())
+    )
     if (
         bool(simplex_error > tolerances["simplex"])
         or bool(count_error > tolerances["species_count"])
@@ -234,7 +254,12 @@ def build_probability_multipoles(
         or bool(atom_column_error > tolerances["simplex"])
     ):
         raise ValueError(
-            "P/q do not satisfy the balanced probability-field contract"
+            "P/q do not satisfy the balanced probability-field contract: "
+            f"simplex_error={float(simplex_error.detach().cpu()):.9e}, "
+            f"species_count_error={float(count_error.detach().cpu()):.9e}, "
+            f"vacancy_mass_error={float(vacancy_error.detach().cpu()):.9e}, "
+            f"atom_column_error={float(atom_column_error.detach().cpu()):.9e}, "
+            f"tolerances={tolerances!r}"
         )
 
     y = displacements / displacements.new_tensor(config.ell_feature)
@@ -313,10 +338,8 @@ def build_sparse_probability_multipoles(
             raise ValueError("sparse feature input contains NaN or Inf")
     if atomic_numbers.device != edge_plan.device:
         raise ValueError("atomic_numbers must share edge_plan device")
-    if bool(torch.any(edge_plan < 0.0)) or bool(torch.any(q < 0.0)) or bool(
-        torch.any(q > 1.0)
-    ):
-        raise ValueError("edge_plan and q must satisfy probability bounds")
+    if bool(torch.any(edge_plan < 0.0)):
+        raise ValueError("edge_plan must be nonnegative")
     if site_types is not None:
         if site_types.shape != (edges.num_sites,) or site_types.dtype != torch.long:
             raise ValueError("site_types must be long with shape [M]")
@@ -343,6 +366,13 @@ def build_sparse_probability_multipoles(
         dtype=edge_plan.dtype,
         configured_tolerance=config.probability_tolerance,
     )
+    q_bound_tolerance = tolerances["simplex"]
+    if bool(torch.any(q < -q_bound_tolerance)) or bool(
+        torch.any(q > 1.0 + q_bound_tolerance)
+    ):
+        raise ValueError(
+            "q contains a value outside the numerical probability bounds [0,1]"
+        )
     validation_dtype = torch.float64 if edge_plan.dtype == torch.float32 else edge_plan.dtype
     validation_plan = edge_plan.to(validation_dtype)
     validation_q = q.to(validation_dtype)
@@ -378,7 +408,14 @@ def build_sparse_probability_multipoles(
         or bool(vacancy_error > tolerances["vacancy_mass"])
         or bool(atom_error > tolerances["simplex"])
     ):
-        raise ValueError("edge_plan/q do not satisfy the balanced probability-field contract")
+        raise ValueError(
+            "edge_plan/q do not satisfy the balanced probability-field contract: "
+            f"simplex_error={float(simplex_error.detach().cpu()):.9e}, "
+            f"species_count_error={float(count_error.detach().cpu()):.9e}, "
+            f"vacancy_mass_error={float(vacancy_error.detach().cpu()):.9e}, "
+            f"atom_column_error={float(atom_error.detach().cpu()):.9e}, "
+            f"tolerances={tolerances!r}"
+        )
 
     y = edges.displacements / edges.displacements.new_tensor(config.ell_feature)
     xi = torch.sum(y * y, dim=-1)

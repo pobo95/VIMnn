@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import numpy as np
@@ -415,6 +416,31 @@ def test_output_collision_symlink_corrupt_inputs_and_structured_errors(
     collision = capsys.readouterr()
     assert collision.out == ""
     assert "INPUT_OUTPUT_COLLISION" in collision.err
+
+    bundle = prediction_bundle["mixed"]
+    bundle_before = bundle.read_bytes()
+    bundle_args = list(base)
+    bundle_args[bundle_args.index(str(source), bundle_args.index("--output"))] = str(
+        bundle
+    )
+    bundle_args.append("--overwrite")
+    assert main(bundle_args) == 1
+    bundle_collision = capsys.readouterr()
+    assert bundle_collision.out == ""
+    assert "BUNDLE_OUTPUT_COLLISION" in bundle_collision.err
+    assert bundle.read_bytes() == bundle_before
+
+    bundle_hardlink = tmp_path / "bundle-hardlink.pt"
+    os.link(bundle, bundle_hardlink)
+    hardlink_args = list(bundle_args)
+    hardlink_args[
+        hardlink_args.index(str(bundle), hardlink_args.index("--output"))
+    ] = str(bundle_hardlink)
+    assert main(hardlink_args) == 1
+    hardlink_collision = capsys.readouterr()
+    assert hardlink_collision.out == ""
+    assert "BUNDLE_OUTPUT_COLLISION" in hardlink_collision.err
+    assert bundle.read_bytes() == bundle_before
 
     existing = tmp_path / "existing.xyz"
     existing.write_text("keep")

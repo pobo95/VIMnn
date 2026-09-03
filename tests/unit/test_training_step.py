@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import copy
 from dataclasses import fields, replace
 import importlib
+import random
 
+import numpy as np
 import pytest
 import torch
 
@@ -13,6 +16,7 @@ from refsite_mlip.training import (
     TrainStepConfig,
     build_optimizer,
     train_step,
+    validate_optimizer_binding,
 )
 from refsite_mlip.transport import TRAIN_FIXED
 
@@ -108,6 +112,64 @@ def test_optimizer_contract_config_round_trip_and_rng_preservation():
         OptimizerConfig(learning_rate=0.0)
     with pytest.raises(ValueError, match="betas"):
         OptimizerConfig(betas=(0.9, 1.0))
+
+
+@pytest.mark.parametrize("mutation", ("missing", "additional", "duplicate", "other"))
+def test_optimizer_binding_mismatch_is_rejected_before_any_step_mutation(
+    monkeypatch, mutation
+):
+    model = TinyModel()
+    optimizer = build_optimizer(model, OptimizerConfig(weight_decay=0.0))
+    foreign = torch.nn.Parameter(torch.tensor(3.0, dtype=torch.float64))
+    parameters = optimizer.param_groups[0]["params"]
+    if mutation == "missing":
+        parameters.clear()
+    elif mutation == "additional":
+        parameters.append(foreign)
+    elif mutation == "duplicate":
+        parameters.append(model.weight)
+    else:
+        parameters[0] = foreign
+
+    model.eval()
+    model.weight.grad = torch.tensor(17.0, dtype=torch.float64)
+    gradient_before = model.weight.grad.clone()
+    optimizer_before = copy.deepcopy(optimizer.state_dict())
+    python_before = random.getstate()
+    numpy_before = np.random.get_state()
+    torch_before = torch.random.get_rng_state().clone()
+    monkeypatch.setattr(
+        step_module,
+        "evaluate_structure_batch",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("binding failure must precede model evaluation")
+        ),
+    )
+
+    with pytest.raises(ValueError, match="optimizer"):
+        train_step(
+            model,
+            optimizer,
+            _batch(),
+            {},
+            LossConfig(),
+            TrainStepConfig(),
+        )
+    assert not model.training
+    assert torch.equal(model.weight.grad, gradient_before)
+    assert optimizer.state_dict() == optimizer_before
+    assert random.getstate() == python_before
+    numpy_after = np.random.get_state()
+    assert numpy_after[0] == numpy_before[0]
+    assert np.array_equal(numpy_after[1], numpy_before[1])
+    assert numpy_after[2:] == numpy_before[2:]
+    assert torch.equal(torch.random.get_rng_state(), torch_before)
+
+
+def test_optimizer_binding_accepts_exact_current_trainable_identity_order():
+    model = TinyModel()
+    optimizer = build_optimizer(model, OptimizerConfig())
+    assert validate_optimizer_binding(model, optimizer) is None
 
 
 def test_energy_step_zeroes_stale_gradient_updates_once_and_detaches_result(monkeypatch):

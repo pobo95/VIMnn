@@ -92,3 +92,78 @@ def build_optimizer(model: torch.nn.Module, config: OptimizerConfig) -> torch.op
         weight_decay=config.weight_decay,
         amsgrad=config.amsgrad,
     )
+
+
+def optimizer_parameters(
+    optimizer: torch.optim.Optimizer,
+) -> tuple[torch.nn.Parameter, ...]:
+    """Return optimizer parameters in persisted parameter-group order."""
+
+    if not isinstance(optimizer, torch.optim.Optimizer):
+        raise TypeError("optimizer must be a torch optimizer")
+    parameters = []
+    for group_index, group in enumerate(optimizer.param_groups):
+        if not isinstance(group, Mapping) or "params" not in group:
+            raise ValueError(
+                f"optimizer parameter group {group_index} has no params sequence"
+            )
+        for parameter_index, parameter in enumerate(group["params"]):
+            if not isinstance(parameter, torch.nn.Parameter):
+                raise TypeError(
+                    "optimizer parameters must be torch.nn.Parameter objects; "
+                    f"group={group_index}, index={parameter_index}"
+                )
+            parameters.append(parameter)
+    return tuple(parameters)
+
+
+def validate_optimizer_binding(
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+) -> None:
+    """Require one exact ordered identity binding to every trainable parameter.
+
+    Ordering is part of the checkpoint optimizer-state contract.  The function
+    is read-only and can therefore be called before any mode, gradient, state,
+    or RNG mutation at every parameter-update and checkpoint boundary.
+    """
+
+    if not isinstance(model, torch.nn.Module):
+        raise TypeError("model must be a torch.nn.Module")
+    actual = optimizer_parameters(optimizer)
+    expected_named = tuple(
+        (name, parameter)
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad
+    )
+    expected = tuple(parameter for _, parameter in expected_named)
+    if not expected:
+        raise ValueError("model has no trainable parameters")
+
+    actual_ids = tuple(id(parameter) for parameter in actual)
+    duplicate_count = len(actual_ids) - len(set(actual_ids))
+    if duplicate_count:
+        raise ValueError(
+            "optimizer binding contains duplicate parameter identities; "
+            f"duplicate_count={duplicate_count}"
+        )
+
+    expected_ids = tuple(id(parameter) for parameter in expected)
+    actual_set = set(actual_ids)
+    expected_set = set(expected_ids)
+    missing = tuple(
+        name
+        for name, parameter in expected_named
+        if id(parameter) not in actual_set
+    )
+    additional = sum(identity not in expected_set for identity in actual_ids)
+    if missing or additional:
+        raise ValueError(
+            "optimizer parameters do not exactly match current model trainable "
+            f"parameters by identity; missing={missing!r}, additional={additional}"
+        )
+    if actual_ids != expected_ids:
+        raise ValueError(
+            "optimizer parameters match by identity but not in current model "
+            "trainable parameter order"
+        )

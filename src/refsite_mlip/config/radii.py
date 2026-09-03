@@ -577,7 +577,14 @@ def _target_value(target: Any, field: str, *, stage: str) -> Any:
     return getattr(target, field)
 
 
-def _compatibility_real(value: Any, *, field: str, stage: str) -> float:
+def _compatibility_real(
+    value: Any,
+    *,
+    field: str,
+    stage: str,
+    positive: bool = False,
+    nonnegative: bool = False,
+) -> float:
     if isinstance(value, bool) or not isinstance(value, Real):
         raise _radius_error(
             "INVALID_COMPATIBILITY_FIELD",
@@ -587,10 +594,18 @@ def _compatibility_real(value: Any, *, field: str, stage: str) -> float:
             actual=value,
         )
     result = float(value)
-    if not math.isfinite(result):
+    invalid = (positive and result <= 0.0) or (nonnegative and result < 0.0)
+    if not math.isfinite(result) or invalid:
+        qualifier = (
+            "finite and positive"
+            if positive
+            else "finite and nonnegative"
+            if nonnegative
+            else "finite"
+        )
         raise _radius_error(
             "INVALID_COMPATIBILITY_FIELD",
-            "stored compatibility radius must be finite",
+            f"stored compatibility radius must be {qualifier}",
             stage=stage,
             field=field,
             actual=result,
@@ -615,11 +630,13 @@ def validate_radius_artifact_compatibility(
         _target_value(artifact, "mp_cutoff", stage="artifact_compatibility"),
         field="mp_cutoff",
         stage="artifact_compatibility",
+        positive=True,
     )
     actual_skin = _compatibility_real(
         _target_value(artifact, "mp_skin", stage="artifact_compatibility"),
         field="mp_skin",
         stage="artifact_compatibility",
+        nonnegative=True,
     )
     mismatches = tuple(
         (field, expected, actual)
@@ -643,22 +660,18 @@ def validate_radius_artifact_compatibility(
     return derive_interaction_radii(config)
 
 
-def _model_support(model_or_config: Any) -> Any:
+def _model_configuration(model_or_config: Any) -> Any:
     target = model_or_config
     if not isinstance(target, Mapping) and not hasattr(target, "transport_support"):
         target = getattr(target, "config", target)
-    return _target_value(target, "transport_support", stage="model_compatibility")
+    return target
 
 
 def validate_radius_model_compatibility(
     config: InteractionRadiusConfig,
     model_or_config: Any,
 ) -> DerivedInteractionRadii:
-    """Require existing model OT support radii to equal the derived controls.
-
-    The support kind/backend are deliberately ignored: they are execution
-    policy, whereas the three compared values are the physical support radii.
-    """
+    """Require existing model OT and MP cutoffs to match the v1 two-radius contract."""
 
     if not isinstance(config, InteractionRadiusConfig):
         raise _radius_error(
@@ -667,21 +680,61 @@ def validate_radius_model_compatibility(
             stage="model_compatibility.input",
             actual=type(config).__name__,
         )
-    support = _model_support(model_or_config)
+    model_config = _model_configuration(model_or_config)
+    support = _target_value(
+        model_config, "transport_support", stage="model_compatibility"
+    )
+    support_kind = _target_value(
+        support, "kind", stage="model_compatibility"
+    )
+    if support_kind != "compact_c2":
+        raise _radius_error(
+            "RADIUS_MODEL_SUPPORT_KIND_MISMATCH",
+            "finite r_ot requires compact_c2 transport support",
+            stage="model_compatibility",
+            field="transport_support.kind",
+            expected="compact_c2",
+            actual=support_kind,
+            action=(
+                "Create a compact_c2 model run for a finite r_ot; a dense "
+                "support with coincidentally equal numeric cutoffs is not compatible."
+            ),
+        )
     cutoff = _compatibility_real(
         _target_value(support, "cutoff", stage="model_compatibility"),
         field="transport_support.cutoff",
         stage="model_compatibility",
+        positive=True,
     )
     switch_width = _compatibility_real(
         _target_value(support, "switch_width", stage="model_compatibility"),
         field="transport_support.switch_width",
         stage="model_compatibility",
+        positive=True,
     )
     candidate_skin = _compatibility_real(
         _target_value(support, "candidate_skin", stage="model_compatibility"),
         field="transport_support.candidate_skin",
         stage="model_compatibility",
+        nonnegative=True,
+    )
+    feature = _target_value(
+        model_config, "feature", stage="model_compatibility"
+    )
+    higher_body = _target_value(
+        model_config, "higher_body", stage="model_compatibility"
+    )
+    feature_cutoff = _compatibility_real(
+        _target_value(feature, "r_cut", stage="model_compatibility"),
+        field="feature.r_cut",
+        stage="model_compatibility",
+        positive=True,
+    )
+    higher_body_cutoff = _compatibility_real(
+        _target_value(higher_body, "cutoff", stage="model_compatibility"),
+        field="higher_body.cutoff",
+        stage="model_compatibility",
+        positive=True,
     )
     actual = {
         "r_on": cutoff - switch_width,
@@ -693,21 +746,36 @@ def validate_radius_model_compatibility(
         "r_on": expected_radii.r_on_ot,
         "r_off": expected_radii.r_off_ot,
         "r_candidate": expected_radii.r_candidate_ot,
+        "feature.r_cut": expected_radii.r_mp,
+        "higher_body.cutoff": expected_radii.r_mp,
     }
+    actual.update(
+        {
+            "feature.r_cut": feature_cutoff,
+            "higher_body.cutoff": higher_body_cutoff,
+        }
+    )
     mismatches = tuple(
         (field, expected[field], actual[field])
-        for field in ("r_on", "r_off", "r_candidate")
+        for field in (
+            "r_on",
+            "r_off",
+            "r_candidate",
+            "feature.r_cut",
+            "higher_body.cutoff",
+        )
         if expected[field] != actual[field]
     )
     if mismatches:
         raise _radius_error(
             "RADIUS_MODEL_MISMATCH",
-            "model transport support radii do not match the requested config",
+            "model OT/MP radii do not match the requested two-radius config",
             stage="model_compatibility",
             mismatches=mismatches,
             action=(
-                "Treat changes to r_ot, ot_switch_width, or ot_skin as a new "
-                "model run; the existing model/checkpoint was not modified."
+                "Treat changes to r_ot, r_mp, switch width, or skin as a new "
+                "model run and rebuild MP artifacts when r_mp changes; the "
+                "existing model/checkpoint was not modified."
             ),
         )
     return expected_radii

@@ -242,6 +242,54 @@ def test_resume_rejects_nonincrease_lock_and_data_change(
     assert (run_directory / "run_status.json").read_bytes() == status_before
 
 
+def test_resume_rejects_unowned_running_status(
+    training_bundle, tmp_path, capsys
+):
+    _, run_directory, _ = _fresh_one_epoch(tmp_path, training_bundle)
+    status_path = run_directory / "run_status.json"
+    status = json.loads(status_path.read_text(encoding="utf-8"))
+    status["status"] = "running"
+    status_path.write_text(json.dumps(status, sort_keys=True), encoding="utf-8")
+    before = _file_snapshot(run_directory)
+
+    assert main(
+        ["resume", str(run_directory), "--max-epochs", "3", "--dry-run"]
+    ) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "RUN_STATUS_ACTIVE_OR_UNCERTAIN" in captured.err
+    assert _file_snapshot(run_directory) == before
+    assert not (run_directory / ".resume.lock").exists()
+
+
+def test_resume_rechecks_status_after_lock_without_clobbering_foreign_change(
+    training_bundle, tmp_path, monkeypatch
+):
+    _, run_directory, _ = _fresh_one_epoch(tmp_path, training_bundle)
+    status_path = run_directory / "run_status.json"
+    original_acquire = TrainingRunDirectory.acquire_resume_lock
+    changed = {}
+
+    def acquire_then_change(directory):
+        lock = original_acquire(directory)
+        status = json.loads(status_path.read_text(encoding="utf-8"))
+        status["operation_phase"] = "foreign-change"
+        status_path.write_text(json.dumps(status, sort_keys=True), encoding="utf-8")
+        changed["bytes"] = status_path.read_bytes()
+        return lock
+
+    monkeypatch.setattr(
+        TrainingRunDirectory, "acquire_resume_lock", acquire_then_change
+    )
+    with pytest.raises(Exception) as caught:
+        resume_training(run_directory, max_epochs=3)
+    assert getattr(caught.value, "reason_code", None) == (
+        "RUN_STATUS_TOCTOU_MISMATCH"
+    )
+    assert status_path.read_bytes() == changed["bytes"]
+    assert not (run_directory / ".resume.lock").exists()
+
+
 def test_resume_rejects_epoch_gap_and_arbitrary_checkpoint_path(
     training_bundle, tmp_path, capsys
 ):

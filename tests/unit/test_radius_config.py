@@ -223,7 +223,11 @@ def test_structured_artifact_and_model_compatibility_mapping_contracts():
     assert validate_radius_artifact_compatibility(config, artifact) == config.derived
 
     support = config.to_transport_support_config(backend="edge-list")
-    model_config = SimpleNamespace(transport_support=support)
+    model_config = SimpleNamespace(
+        transport_support=support,
+        feature=SimpleNamespace(r_cut=3.0),
+        higher_body=SimpleNamespace(cutoff=3.0),
+    )
     assert validate_radius_model_compatibility(config, model_config) == config.derived
 
     with pytest.raises(RadiusConfigError) as caught:
@@ -242,10 +246,13 @@ def test_structured_artifact_and_model_compatibility_mapping_contracts():
             config,
             {
                 "transport_support": {
+                    "kind": "compact_c2",
                     "cutoff": 4.1,
                     "switch_width": 0.4,
                     "candidate_skin": 0.3,
-                }
+                },
+                "feature": {"r_cut": 3.0},
+                "higher_body": {"cutoff": 3.0},
             },
         )
     assert caught.value.reason_code == "RADIUS_MODEL_MISMATCH"
@@ -255,3 +262,39 @@ def test_structured_artifact_and_model_compatibility_mapping_contracts():
         "r_candidate",
     }
     assert "new model run" in str(caught.value)
+
+
+def test_dense_support_and_message_passing_cutoff_mismatches_are_rejected():
+    config = InteractionRadiusConfig()
+    dense = {
+        "transport_support": {
+            "kind": "dense",
+            "cutoff": 4.0,
+            "switch_width": 0.5,
+            "candidate_skin": 0.2,
+        },
+        "feature": {"r_cut": 3.0},
+        "higher_body": {"cutoff": 3.0},
+    }
+    with pytest.raises(RadiusConfigError) as caught:
+        validate_radius_model_compatibility(config, dense)
+    assert caught.value.reason_code == "RADIUS_MODEL_SUPPORT_KIND_MISMATCH"
+    assert caught.value.field == "transport_support.kind"
+    assert caught.value.expected == "compact_c2"
+    assert caught.value.actual == "dense"
+
+    compact = dict(dense)
+    compact["transport_support"] = {
+        **dense["transport_support"],
+        "kind": "compact_c2",
+    }
+    compact["feature"] = {"r_cut": 3.1}
+    compact["higher_body"] = {"cutoff": 2.9}
+    with pytest.raises(RadiusConfigError) as caught:
+        validate_radius_model_compatibility(config, compact)
+    assert caught.value.reason_code == "RADIUS_MODEL_MISMATCH"
+    assert caught.value.mismatches == (
+        ("feature.r_cut", 3.0, 3.1),
+        ("higher_body.cutoff", 3.0, 2.9),
+    )
+    assert "rebuild MP artifacts" in caught.value.action

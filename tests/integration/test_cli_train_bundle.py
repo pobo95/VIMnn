@@ -24,6 +24,7 @@ from refsite_mlip.training import (
     FitExecutionError,
     FitProgress,
     ModelSelectionState,
+    TrainingRunDirectory,
     build_optimizer,
     build_scheduler,
     capture_training_checkpoint,
@@ -143,6 +144,61 @@ def test_synthetic_cpu_float64_one_epoch_writes_recoverable_state(
     assert config_path.read_bytes() == config_before
     assert training_bundle["path"].read_bytes() == bundle_before
     assert (train_path.read_bytes(), validation_path.read_bytes()) == inputs_before
+
+
+def test_fresh_training_holds_common_run_lock_for_entire_fit(
+    training_bundle, tmp_path, monkeypatch
+):
+    config_path, _ = _simple_case(tmp_path, training_bundle)
+    _set_epochs(config_path, 1)
+    module = importlib.import_module("refsite_mlip.cli.train")
+    original = module.run_checkpointed_fit
+    observed = []
+
+    def inspect_lock(*args, **kwargs):
+        lock = tmp_path / "run-output" / ".resume.lock"
+        status = json.loads(
+            (tmp_path / "run-output" / "run_status.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        observed.append((lock.is_file(), status["status"]))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(module, "run_checkpointed_fit", inspect_lock)
+    result = run_training(config_path)
+    assert result["status"] == "completed"
+    assert observed == [(True, "running")]
+    assert not (tmp_path / "run-output" / ".resume.lock").exists()
+
+
+def test_fresh_training_rechecks_config_after_lock_acquisition(
+    training_bundle, tmp_path, monkeypatch
+):
+    config_path, _ = _simple_case(tmp_path, training_bundle)
+    _set_epochs(config_path, 1)
+    original = TrainingRunDirectory.acquire_resume_lock
+
+    def mutate_then_acquire(directory):
+        lock = original(directory)
+        payload = json.loads(config_path.read_text(encoding="utf-8"))
+        payload["runtime"]["seed"] += 1
+        config_path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+        return lock
+
+    monkeypatch.setattr(
+        TrainingRunDirectory, "acquire_resume_lock", mutate_then_acquire
+    )
+    with pytest.raises(Exception) as caught:
+        run_training(config_path)
+    assert getattr(caught.value, "reason_code", None) == (
+        "TRAIN_CONFIG_TOCTOU_MISMATCH"
+    )
+    output = tmp_path / "run-output"
+    assert not (output / ".resume.lock").exists()
+    status = json.loads((output / "run_status.json").read_text(encoding="utf-8"))
+    assert status["status"] == "failed"
+    assert status["training_executed"] is False
 
 
 def test_cli_path_matches_direct_checkpointed_fit_payload_and_result(

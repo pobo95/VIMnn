@@ -55,7 +55,12 @@ from .losses import (
     PotentialLossOutput,
     compute_potential_loss,
 )
-from .optimizer import OptimizerConfig, build_optimizer
+from .optimizer import (
+    OptimizerConfig,
+    build_optimizer,
+    optimizer_parameters,
+    validate_optimizer_binding,
+)
 from .resume import (
     CheckpointCompatibilityError,
     CheckpointRestoreError,
@@ -172,5 +177,7 @@ __all__ = [
     "validate_checkpoint_compatibility",
     "validate_checkpoint_history",
     "validate_managed_checkpoint_history",
+    "validate_optimizer_binding",
+    "optimizer_parameters",
     "compose_resumed_fit_result",
 ]

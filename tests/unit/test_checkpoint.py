@@ -260,6 +260,49 @@ def test_capture_save_and_load_do_not_change_global_rng(tmp_path):
     _assert_rng_equal(before, after_load)
 
 
+def test_checkpoint_capture_rejects_foreign_optimizer_before_rng_or_state_capture():
+    (
+        model,
+        _optimizer,
+        _scheduler,
+        scheduler_config,
+        optimizer_config,
+        selection,
+        progress,
+    ) = _live_state()
+    foreign_model = TinyModel()
+    foreign_optimizer = torch.optim.AdamW(
+        foreign_model.parameters(), lr=optimizer_config.learning_rate
+    )
+    foreign_scheduler = build_scheduler(foreign_optimizer, scheduler_config)
+    before = _rng_snapshot()
+    model_before = copy.deepcopy(model.state_dict())
+    gradient_before = model.weight.grad.clone()
+    with pytest.raises(ValueError, match="optimizer parameters"):
+        capture_training_checkpoint(
+            model,
+            foreign_optimizer,
+            foreign_scheduler,
+            selection,
+            progress,
+            (_batch(("train",)),),
+            (_batch(("validation",)),),
+            model_config={"kind": "tiny"},
+            loss_config=LossConfig(),
+            optimizer_config=optimizer_config,
+            train_step_config=TrainStepConfig(),
+            validation_step_config=ValidationStepConfig(),
+            scheduler_config=scheduler_config,
+            model_selection_config=ModelSelectionConfig(),
+            fit_config=FitConfig(3),
+            species_vocabulary=(6,),
+        )
+    _assert_rng_equal(before, _rng_snapshot())
+    _assert_tree_equal(model.state_dict(), model_before)
+    assert torch.equal(model.weight.grad, gradient_before)
+    assert foreign_optimizer.state == {}
+
+
 def test_python_numpy_torch_and_cuda_rng_payload_shape():
     _, _, _, checkpoint = _capture()
     assert isinstance(checkpoint.python_rng_state, list)
@@ -362,6 +405,25 @@ def test_replace_failure_preserves_target_and_cleans_temp(tmp_path, monkeypatch)
         save_training_checkpoint(checkpoint, path, overwrite=True)
     assert path.read_bytes() == b"original"
     assert not list(tmp_path.glob(".replace-failure.pt.*.tmp"))
+
+
+def test_no_overwrite_race_never_clobbers_competing_checkpoint(
+    tmp_path, monkeypatch
+):
+    _, _, _, checkpoint = _capture()
+    path = tmp_path / "raced.pt"
+
+    def competing_link(source, target, *args, **kwargs):
+        del source, args, kwargs
+        target_path = type(path)(target)
+        target_path.write_bytes(b"competitor")
+        raise FileExistsError(f"competing checkpoint won: {target_path}")
+
+    monkeypatch.setattr(checkpoint_module.os, "link", competing_link)
+    with pytest.raises(FileExistsError, match="competing checkpoint"):
+        save_training_checkpoint(checkpoint, path, overwrite=False)
+    assert path.read_bytes() == b"competitor"
+    assert not list(tmp_path.glob(".raced.pt.*.tmp"))
 
 
 def test_corrupt_wrong_schema_scope_and_missing_key_fail_fast(tmp_path):

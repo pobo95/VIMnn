@@ -21,6 +21,8 @@ from typing import Any, Mapping
 
 import torch
 
+from refsite_mlip._atomic import commit_temporary_file
+
 from refsite_mlip import __version__ as _PACKAGE_VERSION
 from refsite_mlip.compatibility import import_e3nn_0_4_4
 from refsite_mlip.data.reference_artifact import (
@@ -1539,9 +1541,7 @@ def save_reference_site_model_bundle(
                 bundle_path=str(target),
                 validation_stage="save.replace",
             )
-        if target.exists() and not overwrite:
-            raise FileExistsError(f"bundle already exists: {target}")
-        os.replace(temporary, target)
+        commit_temporary_file(temporary, target, overwrite=overwrite)
         try:
             directory_descriptor = os.open(parent, os.O_RDONLY)
             try:

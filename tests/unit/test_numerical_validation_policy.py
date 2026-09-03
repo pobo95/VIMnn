@@ -21,7 +21,7 @@ from refsite_mlip.transport.dual import transport_plan
 from refsite_mlip.transport.problem import build_ot_problem
 
 
-def _float32_transport():
+def _float32_transport(*, diagnostic_tolerance=None):
     distances = torch.tensor(
         [
             [0.20, 1.00, 1.60],
@@ -39,7 +39,10 @@ def _float32_transport():
         0.5,
         TRAIN_FIXED,
         "sinkhorn",
-        TrainSinkhornConfig(iterations=256),
+        TrainSinkhornConfig(
+            iterations=256,
+            diagnostic_tolerance=diagnostic_tolerance,
+        ),
         support_config=support,
         atom_distances=distances,
     )
@@ -52,17 +55,13 @@ def test_automatic_probability_tolerance_is_dtype_and_size_aware():
     automatic = effective_probability_validation_tolerances(
         result.P, None
     )
-    strict = effective_probability_validation_tolerances(
+    requested_strict = effective_probability_validation_tolerances(
         result.P, 1.0e-9
     )
 
     assert automatic["simplex"] > torch.finfo(torch.float32).eps
     assert automatic["species_count"] >= automatic["simplex"]
-    assert strict == {
-        "simplex": 1.0e-9,
-        "species_count": 1.0e-9,
-        "vacancy_mass": 1.0e-9,
-    }
+    assert requested_strict == automatic
     build_probability_multipoles(
         result.P,
         result.q,
@@ -70,10 +69,14 @@ def test_automatic_probability_tolerance_is_dtype_and_size_aware():
         torch.zeros((*distances.shape, 3), dtype=torch.float32),
         ProbabilityMultipoleConfig(species_vocabulary=(6, 41)),
     )
+    # A configured check cannot be stricter than representable float32
+    # reductions, but a genuinely unbalanced probability is still rejected.
+    invalid_q = result.q.clone()
+    invalid_q[0] += 20.0 * requested_strict["simplex"]
     with pytest.raises(ValueError, match="balanced probability-field"):
         build_probability_multipoles(
             result.P,
-            result.q,
+            invalid_q,
             numbers,
             torch.zeros((*distances.shape, 3), dtype=torch.float32),
             ProbabilityMultipoleConfig(
@@ -90,7 +93,7 @@ def test_float64_default_and_explicit_probability_contract_round_trip():
     assert ProbabilityMultipoleConfig.from_dict(explicit.to_dict()) == explicit
 
 
-def test_float32_result_stabilizes_only_converged_storage_roundoff():
+def test_train_fixed_result_is_exactly_reconstructible_from_returned_duals():
     seed = torch.tensor(
         [[0.4, 0.6], [0.6, 0.40000024]], dtype=torch.float32
     )
@@ -98,17 +101,82 @@ def test_float32_result_stabilizes_only_converged_storage_roundoff():
     problem = build_ot_problem(cost, 1.0)
     f = torch.zeros(2, dtype=torch.float32)
     g = torch.zeros(2, dtype=torch.float32)
-    raw = transport_plan(problem, f, g)
-    raw_error = torch.maximum(
-        (raw.to(torch.float64).sum(0) - 1.0).abs().max(),
-        (raw.to(torch.float64).sum(1) - 1.0).abs().max(),
-    )
-    assert raw_error > 1.0e-7
+    expected = transport_plan(problem, f, g)
+    for converged, tolerance in ((False, 1.0e-12), (True, 1.0)):
+        result = build_result(
+            problem,
+            f,
+            g,
+            converged=converged,
+            sinkhorn_iterations=1,
+            newton_iterations=0,
+            cg_iterations=0,
+            line_search_reductions=0,
+            fallback_used=False,
+            solver_name="fixture",
+            path_name=TRAIN_FIXED,
+            effective_diagnostic_tolerance=tolerance,
+        )
+        assert torch.equal(result.gamma, expected)
+        assert torch.equal(result.P, expected[:, : problem.num_atoms])
+        assert torch.equal(result.q, torch.zeros(2, dtype=torch.float32))
+        assert torch.equal(result.f, f)
+        assert torch.equal(result.g, g)
 
-    stabilized = build_result(
+
+def test_train_fixed_diagnostic_tolerance_cannot_change_plan_or_duals():
+    strict, _ = _float32_transport(diagnostic_tolerance=1.0e-12)
+    loose, _ = _float32_transport(diagnostic_tolerance=1.0)
+    assert not bool(strict.converged)
+    assert bool(loose.converged)
+    for name in ("gamma", "P", "q", "f", "g"):
+        assert torch.equal(getattr(strict, name), getattr(loose, name))
+    assert strict.effective_diagnostic_tolerance == 1.0e-12
+    assert loose.effective_diagnostic_tolerance == 1.0
+
+
+@pytest.mark.parametrize(
+    ("P", "q"),
+    (
+        (
+            torch.tensor([[1.0], [0.0]], dtype=torch.float64),
+            torch.tensor([-5.0e-8, 1.0], dtype=torch.float64),
+        ),
+        (
+            torch.tensor([[0.0], [1.0]], dtype=torch.float64),
+            torch.tensor([1.0 + 5.0e-8, 0.0], dtype=torch.float64),
+        ),
+    ),
+)
+def test_vacancy_probability_bounds_allow_only_numerical_roundoff(P, q):
+    result = build_probability_multipoles(
+        P,
+        q,
+        torch.tensor([6], dtype=torch.long),
+        torch.zeros((2, 1, 3), dtype=torch.float64),
+        ProbabilityMultipoleConfig((6,)),
+    )
+    assert torch.equal(result.vacancy_probabilities, q)
+
+    invalid = q.clone()
+    invalid[0] = -1.0e-3 if q[0] <= 0.0 else 1.001
+    with pytest.raises(ValueError, match="outside.*probability bounds"):
+        build_probability_multipoles(
+            P,
+            invalid,
+            torch.tensor([6], dtype=torch.long),
+            torch.zeros((2, 1, 3), dtype=torch.float64),
+            ProbabilityMultipoleConfig((6,)),
+        )
+
+
+def test_dense_aggregate_vacancy_supports_zero_atoms_without_empty_reduction():
+    problem = build_ot_problem(torch.empty((3, 0), dtype=torch.float64), 0.5)
+    zeros = torch.zeros(3, dtype=torch.float64)
+    result = build_result(
         problem,
-        f,
-        g,
+        zeros,
+        torch.zeros(1, dtype=torch.float64),
         converged=True,
         sinkhorn_iterations=1,
         newton_iterations=0,
@@ -118,29 +186,19 @@ def test_float32_result_stabilizes_only_converged_storage_roundoff():
         solver_name="fixture",
         path_name=TRAIN_FIXED,
     )
-    stored_error = torch.maximum(
-        (stabilized.gamma.to(torch.float64).sum(0) - 1.0).abs().max(),
-        (stabilized.gamma.to(torch.float64).sum(1) - 1.0).abs().max(),
+    assert result.P.shape == (3, 0)
+    assert torch.equal(result.q, torch.ones(3, dtype=torch.float64))
+    features = build_probability_multipoles(
+        result.P,
+        result.q,
+        torch.empty(0, dtype=torch.long),
+        torch.empty((3, 0, 3), dtype=torch.float64),
+        ProbabilityMultipoleConfig((6, 41)),
     )
-    assert stored_error < 1.0e-7
-    assert (stabilized.gamma - raw).abs().max() <= 2.0 * torch.finfo(
-        torch.float32
-    ).eps
-
-    nonconverged = build_result(
-        problem,
-        f,
-        g,
-        converged=False,
-        sinkhorn_iterations=1,
-        newton_iterations=0,
-        cg_iterations=0,
-        line_search_reductions=0,
-        fallback_used=False,
-        solver_name="fixture",
-        path_name=TRAIN_FIXED,
+    assert torch.equal(
+        features.species_probabilities,
+        torch.zeros((3, 2), dtype=torch.float64),
     )
-    assert torch.equal(nonconverged.gamma, raw)
 
 
 def test_support_diagnostics_separate_switch_boundaries():

@@ -478,6 +478,25 @@ def test_atomic_save_failure_overwrite_and_symlink_contract(typed_crystal, tmp_p
         save_reference_site_model_bundle(link, bundle, overwrite=True)
 
 
+def test_no_overwrite_race_never_clobbers_competing_bundle(
+    typed_crystal, tmp_path, monkeypatch
+):
+    _, _, _, _, bundle = _capture(typed_crystal)
+    target = tmp_path / "raced-bundle.pt"
+
+    def competing_link(source, destination, *args, **kwargs):
+        del source, args, kwargs
+        path = type(target)(destination)
+        path.write_bytes(b"competitor")
+        raise FileExistsError(f"competing bundle won: {path}")
+
+    monkeypatch.setattr(bundle_module.os, "link", competing_link)
+    with pytest.raises(FileExistsError, match="competing bundle"):
+        save_reference_site_model_bundle(target, bundle, overwrite=False)
+    assert target.read_bytes() == b"competitor"
+    assert not list(tmp_path.glob(".raced-bundle.pt.*.tmp"))
+
+
 def test_relocated_path_semantics_rng_and_no_builder_on_load(typed_crystal, tmp_path, monkeypatch):
     _, _, _, _, bundle = _capture(typed_crystal)
     first = tmp_path / "first.pt"

@@ -48,6 +48,37 @@ def _cpu_clone(tensor: torch.Tensor, *, dtype: torch.dtype | None = None) -> tor
     return tensor.detach().to(device="cpu", dtype=dtype).contiguous().clone()
 
 
+def _integer_modes(value: Any) -> torch.Tensor:
+    if not isinstance(value, torch.Tensor):
+        raise TypeError("phase modes must be supplied as a torch.Tensor")
+    if value.dtype == torch.bool:
+        raise TypeError("phase modes must be integers; bool is not accepted")
+    if value.is_complex():
+        raise TypeError("phase modes must be real integers")
+    if value.is_floating_point():
+        if not bool(torch.all(torch.isfinite(value))):
+            raise ValueError("phase modes contain NaN or Inf")
+        if not bool(torch.all(value == torch.round(value))):
+            raise ValueError("phase modes contain fractional reciprocal indices")
+    else:
+        try:
+            torch.iinfo(value.dtype)
+        except TypeError as error:
+            raise TypeError("phase modes must use an integer tensor dtype") from error
+    long_limits = torch.iinfo(torch.long)
+    if any(
+        item < long_limits.min or item > long_limits.max
+        for item in value.detach().cpu().reshape(-1).tolist()
+    ):
+        raise ValueError("phase modes cannot be represented exactly as torch.long")
+    converted = _cpu_clone(value, dtype=torch.long)
+    if value.is_floating_point() and not bool(
+        torch.all(converted.to(dtype=value.dtype) == value.detach().cpu())
+    ):
+        raise ValueError("phase modes cannot be represented exactly as torch.long")
+    return converted
+
+
 @dataclass(frozen=True)
 class PhaseSpecification:
     """Explicit reciprocal modes and every associated alignment weight."""
@@ -60,7 +91,7 @@ class PhaseSpecification:
     convention_version: str = "explicit_phase_specification_v1"
 
     def __post_init__(self) -> None:
-        modes = _cpu_clone(self.modes, dtype=torch.long)
+        modes = _integer_modes(self.modes)
         mode_weights = _cpu_clone(self.mode_weights, dtype=torch.float64)
         site_weights = _cpu_clone(
             self.site_type_alignment_weights, dtype=torch.float64
@@ -122,7 +153,7 @@ class PhaseSpecification:
         if payload.get("floating_dtype", "float64") != "float64":
             raise ValueError("canonical phase specification dtype must be float64")
         return cls(
-            modes=torch.tensor(payload["modes"], dtype=torch.long),
+            modes=torch.as_tensor(payload["modes"]),
             mode_weights=torch.tensor(
                 payload["mode_weights"], dtype=torch.float64
             ),

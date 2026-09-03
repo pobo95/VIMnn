@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "refsite-mlip"
 version = "0.1.0"
 requires-python = ">=3.10"
-dependencies = ["torch==2.6.0", "e3nn==0.4.4"]
+dependencies = ["torch==2.6.0", "e3nn==0.4.4", "numpy", "ase"]
 
 [project.scripts]
 refsite-mlip = "refsite_mlip.cli.main:main"

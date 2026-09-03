@@ -363,6 +363,7 @@ def _validate_checkpoint_preflight(
             "existing checkpoint directory is outside this milestone"
         )
     train_batches, validation_batches = _preflight(
+        model,
         optimizer,
         scheduler,
         train_batches,

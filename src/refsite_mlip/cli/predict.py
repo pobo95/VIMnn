@@ -288,6 +288,17 @@ def _resolve_input_path(config: Any) -> Path:
 
 def _preflight_paths(config: ExtXYZPredictionConfig) -> tuple[Path, Path]:
     resolved_source = _resolve_input_path(config)
+    bundle_source = Path(config.bundle_path).expanduser()
+    try:
+        resolved_bundle = bundle_source.resolve(strict=False)
+    except OSError as error:
+        raise _file_error(
+            "BUNDLE_PATH_ERROR",
+            "portable bundle path identity could not be resolved",
+            stage=_operation_stage(config, "output_path"),
+            path=bundle_source,
+            original_error=error,
+        ) from error
 
     target = Path(config.output_path).expanduser()
     parent = target.parent
@@ -301,6 +312,7 @@ def _preflight_paths(config: ExtXYZPredictionConfig) -> tuple[Path, Path]:
     _validate_output_target(
         target,
         resolved_source=resolved_source,
+        resolved_bundle=resolved_bundle,
         overwrite=config.overwrite,
     )
     return resolved_source, target
@@ -310,6 +322,7 @@ def _validate_output_target(
     target: Path,
     *,
     resolved_source: Path,
+    resolved_bundle: Path,
     overwrite: bool,
 ) -> None:
     if target.is_symlink():
@@ -335,6 +348,25 @@ def _validate_output_target(
         raise _file_error(
             "INPUT_OUTPUT_COLLISION",
             "output must not replace the input extxyz",
+            stage="prediction.output_path",
+            path=target,
+        )
+    try:
+        same_bundle = target.resolve(strict=False) == resolved_bundle
+        if target.exists() and resolved_bundle.exists():
+            same_bundle = same_bundle or os.path.samefile(target, resolved_bundle)
+    except OSError as error:
+        raise _file_error(
+            "OUTPUT_PATH_ERROR",
+            "output and portable bundle identity could not be checked",
+            stage="prediction.output_path",
+            path=target,
+            original_error=error,
+        ) from error
+    if same_bundle:
+        raise _file_error(
+            "BUNDLE_OUTPUT_COLLISION",
+            "prediction output must not replace the portable input bundle",
             stage="prediction.output_path",
             path=target,
         )
@@ -1057,6 +1089,9 @@ def _write_atomic_extxyz(
         _validate_output_target(
             target,
             resolved_source=source,
+            resolved_bundle=Path(config.bundle_path).expanduser().resolve(
+                strict=False
+            ),
             overwrite=config.overwrite,
         )
         try:

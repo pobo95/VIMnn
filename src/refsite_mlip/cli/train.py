@@ -604,38 +604,39 @@ def _write_failure_status(
     return original_error
 
 
-def run_training(
-    path: str | os.PathLike[str],
+def _execute_training(
+    config: TrainingRunConfig,
+    resolved: ResolvedTrainingRun,
+    directory: TrainingRunDirectory,
     *,
-    dry_run: bool = False,
-    progress: Callable[[str], None] | None = None,
-) -> ResolvedTrainingRun | dict[str, Any]:
-    """Preflight and optionally execute one fresh deterministic training run."""
+    progress: Callable[[str], None] | None,
+) -> dict[str, Any]:
+    """Execute a fresh run while the caller owns the run-directory lock."""
 
-    if type(dry_run) is not bool:
-        raise TypeError("dry_run must be a bool")
-    config, resolved = _load_preflight(path)
-    if dry_run:
-        return resolved
-
-    seed_training_runtime(config.runtime.seed)
-    output = Path(str(resolved.runtime_paths["output_directory"]))
-    try:
-        directory = TrainingRunDirectory.create(output)
-    except RunDirectoryError as error:
-        raise _execution_cli_error(
-            error,
-            config,
-            resolved,
-            {"failure_phase": "run_directory.create", "rollback_performed": False},
-        ) from error
-
-    phase = "metadata.resolved_config"
+    phase = "config.toctou"
     manager: CheckpointManager | None = None
     prepared: _PreparedTrainingRuntime | None = None
     baseline: dict[str, Any] | None = None
     training_executed = False
     try:
+        if config.source_path is None:
+            raise CLIError(
+                "CONFIG_SOURCE_MISSING",
+                "fresh training requires the original resolved config path",
+                stage="training.config.toctou",
+            )
+        try:
+            current_config = load_training_run_config(config.source_path)
+        except TrainingRunConfigError as error:
+            _raise_cli_preflight(error, config.source_path)
+        if current_config.config_fingerprint != config.config_fingerprint:
+            raise CLIError(
+                "TRAIN_CONFIG_TOCTOU_MISMATCH",
+                "training-run config changed between preflight and lock acquisition",
+                stage="training.config.toctou",
+                path=config.source_path,
+            )
+        phase = "metadata.resolved_config"
         directory.write_resolved_config(config.to_dict())
         phase = "metadata.preflight"
         directory.write_preflight(resolved.to_dict())
@@ -758,6 +759,59 @@ def run_training(
         stored_error = _write_failure_status(directory, status, error)
         raise _execution_cli_error(
             stored_error, config, resolved, status
+        ) from error
+
+
+def run_training(
+    path: str | os.PathLike[str],
+    *,
+    dry_run: bool = False,
+    progress: Callable[[str], None] | None = None,
+) -> ResolvedTrainingRun | dict[str, Any]:
+    """Preflight and optionally execute one fresh deterministic training run."""
+
+    if type(dry_run) is not bool:
+        raise TypeError("dry_run must be a bool")
+    config, resolved = _load_preflight(path)
+    if dry_run:
+        return resolved
+
+    seed_training_runtime(config.runtime.seed)
+    output = Path(str(resolved.runtime_paths["output_directory"]))
+    try:
+        directory = TrainingRunDirectory.create(output)
+    except RunDirectoryError as error:
+        raise _execution_cli_error(
+            error,
+            config,
+            resolved,
+            {"failure_phase": "run_directory.create", "rollback_performed": False},
+        ) from error
+    try:
+        lock = directory.acquire_resume_lock()
+    except RunDirectoryError as error:
+        raise _execution_cli_error(
+            error,
+            config,
+            resolved,
+            {"failure_phase": "run_directory.lock", "rollback_performed": False},
+        ) from error
+    try:
+        with lock:
+            return _execute_training(
+                config,
+                resolved,
+                directory,
+                progress=progress,
+            )
+    except (CLIError, CLIInterruptedError):
+        raise
+    except RunDirectoryError as error:
+        raise _execution_cli_error(
+            error,
+            config,
+            resolved,
+            {"failure_phase": "run_directory.lock", "rollback_performed": False},
         ) from error
 
 
