@@ -42,7 +42,7 @@ def _payload() -> dict:
             "batch_size": 4,
             "shuffle": False,
         },
-        "runtime": {"device": "cpu", "dtype": "float64"},
+        "runtime": {"device": "cpu", "dtype": "float64", "seed": 17},
         "loss": LossConfig().to_dict(),
         "baseline": AtomicBaselineConfig().to_dict(),
         "optimizer": OptimizerConfig().to_dict(),
@@ -146,6 +146,11 @@ def test_full_config_reuses_every_existing_config_serialization():
         assert type(config).from_dict(parsed.to_dict()[name]) == config
     assert TrainingRunConfig.from_dict(parsed.to_dict()) == parsed
 
+    payload["baseline"] = None
+    disabled = TrainingRunConfig.from_dict(payload)
+    assert disabled.baseline is None
+    assert disabled.to_dict()["baseline"] is None
+
 
 def test_public_data_and_runtime_configs_are_frozen_and_strict():
     data = TrainingDataConfig(
@@ -155,8 +160,12 @@ def test_public_data_and_runtime_configs_are_frozen_and_strict():
         shuffle=False,
     )
     assert data.to_dict()["train"] == [{"path": "a.xyz", "template_id": "a"}]
-    runtime = TrainingRuntimeConfig(device="cuda:2", dtype="float32")
-    assert runtime.to_dict() == {"device": "cuda:2", "dtype": "float32"}
+    runtime = TrainingRuntimeConfig(seed=23, device="cuda:2", dtype="float32")
+    assert runtime.to_dict() == {
+        "device": "cuda:2",
+        "dtype": "float32",
+        "seed": 23,
+    }
     with pytest.raises(FrozenInstanceError):
         runtime.device = "cpu"
     with pytest.raises(TrainingRunConfigError, match="shuffle=false"):
@@ -194,6 +203,10 @@ def test_public_data_and_runtime_configs_are_frozen_and_strict():
             "INVALID_RUNTIME_DTYPE",
         ),
         (
+            lambda value: value["runtime"].update({"seed": False}),
+            "INVALID_RUNTIME_SEED",
+        ),
+        (
             lambda value: value["data"].update({"shuffle": True}),
             "UNSUPPORTED_SHUFFLE",
         ),
@@ -227,6 +240,13 @@ def test_duplicate_nonfinite_and_invalid_json_are_rejected():
     with pytest.raises(TrainingRunConfigError) as caught:
         TrainingRunConfig.from_json("[]")
     assert caught.value.reason_code == "INVALID_CONFIG_SECTION"
+
+    missing_seed = _payload()
+    missing_seed["runtime"].pop("seed")
+    with pytest.raises(TrainingRunConfigError) as caught:
+        TrainingRunConfig.from_dict(missing_seed)
+    assert caught.value.reason_code == "MISSING_CONFIG_KEY"
+    assert "seed" in (caught.value.field or "")
 
 
 def test_solver_monitor_mode_and_fresh_fit_cross_validation():

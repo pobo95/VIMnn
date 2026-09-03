@@ -413,10 +413,23 @@ class TrainingDataConfig:
 
 @dataclass(frozen=True)
 class TrainingRuntimeConfig:
+    seed: int
     device: str = "cpu"
     dtype: str = "float64"
 
     def __post_init__(self) -> None:
+        if (
+            isinstance(self.seed, bool)
+            or not isinstance(self.seed, Integral)
+        ):
+            raise _error(
+                "INVALID_RUNTIME_SEED",
+                "seed must be an integer and bool is not accepted",
+                stage="config.validation",
+                field="runtime.seed",
+                actual=self.seed,
+            )
+        object.__setattr__(self, "seed", int(self.seed))
         if type(self.device) is not str or _DEVICE.fullmatch(self.device) is None:
             raise _error(
                 "INVALID_RUNTIME_DEVICE",
@@ -438,15 +451,19 @@ class TrainingRuntimeConfig:
     def torch_dtype(self) -> torch.dtype:
         return torch.float32 if self.dtype == "float32" else torch.float64
 
-    def to_dict(self) -> dict[str, str]:
-        return {"device": self.device, "dtype": self.dtype}
+    def to_dict(self) -> dict[str, Any]:
+        return {"device": self.device, "dtype": self.dtype, "seed": self.seed}
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "TrainingRuntimeConfig":
         payload = _strict_keys(
-            value, frozenset({"device", "dtype"}), name="runtime"
+            value, frozenset({"device", "dtype", "seed"}), name="runtime"
         )
-        return cls(device=payload["device"], dtype=payload["dtype"])
+        return cls(
+            seed=payload["seed"],
+            device=payload["device"],
+            dtype=payload["dtype"],
+        )
 
 
 def _parse_existing_config(name: str, cls, value: Any):
@@ -549,7 +566,7 @@ class TrainingRunConfig:
     data: TrainingDataConfig
     runtime: TrainingRuntimeConfig
     loss: LossConfig
-    baseline: AtomicBaselineConfig
+    baseline: AtomicBaselineConfig | None
     optimizer: OptimizerConfig
     train_step: TrainStepConfig
     validation_step: ValidationStepConfig
@@ -585,7 +602,6 @@ class TrainingRunConfig:
             ("data", TrainingDataConfig),
             ("runtime", TrainingRuntimeConfig),
             ("loss", LossConfig),
-            ("baseline", AtomicBaselineConfig),
             ("optimizer", OptimizerConfig),
             ("train_step", TrainStepConfig),
             ("validation_step", ValidationStepConfig),
@@ -596,6 +612,10 @@ class TrainingRunConfig:
         ):
             if not isinstance(getattr(self, name), cls):
                 raise TypeError(f"{name} must be a {cls.__name__}")
+        if self.baseline is not None and not isinstance(
+            self.baseline, AtomicBaselineConfig
+        ):
+            raise TypeError("baseline must be an AtomicBaselineConfig or None")
         if self.source_path is not None:
             object.__setattr__(self, "source_path", str(self.source_path))
         validate_training_run_config(self)
@@ -608,7 +628,9 @@ class TrainingRunConfig:
             "data": self.data.to_dict(),
             "runtime": self.runtime.to_dict(),
             "loss": self.loss.to_dict(),
-            "baseline": self.baseline.to_dict(),
+            "baseline": (
+                None if self.baseline is None else self.baseline.to_dict()
+            ),
             "optimizer": self.optimizer.to_dict(),
             "train_step": self.train_step.to_dict(),
             "validation_step": self.validation_step.to_dict(),
@@ -629,8 +651,12 @@ class TrainingRunConfig:
             data=TrainingDataConfig.from_dict(payload["data"]),
             runtime=TrainingRuntimeConfig.from_dict(payload["runtime"]),
             loss=_parse_existing_config("loss", LossConfig, payload["loss"]),
-            baseline=_parse_existing_config(
-                "baseline", AtomicBaselineConfig, payload["baseline"]
+            baseline=(
+                None
+                if payload["baseline"] is None
+                else _parse_existing_config(
+                    "baseline", AtomicBaselineConfig, payload["baseline"]
+                )
             ),
             optimizer=_parse_existing_config(
                 "optimizer", OptimizerConfig, payload["optimizer"]
@@ -894,6 +920,7 @@ class ResolvedTrainingRun:
     validation_batch_count: int
     resolved_device: str
     resolved_dtype: str
+    seed: int
     radius_config: InteractionRadiusConfig
     radii: DerivedInteractionRadii
     species_vocabulary: tuple[int, ...]
@@ -934,6 +961,12 @@ class ResolvedTrainingRun:
             object.__setattr__(self, name, int(value))
         if self.resolved_dtype not in ("float32", "float64"):
             raise ValueError("resolved_dtype must be float32 or float64")
+        if (
+            isinstance(self.seed, bool)
+            or not isinstance(self.seed, Integral)
+        ):
+            raise ValueError("seed must be an integer and bool is not accepted")
+        object.__setattr__(self, "seed", int(self.seed))
         if type(self.resolved_device) is not str or _DEVICE.fullmatch(
             self.resolved_device
         ) is None:
@@ -1012,6 +1045,7 @@ class ResolvedTrainingRun:
             "runtime": {
                 "device": self.resolved_device,
                 "dtype": self.resolved_dtype,
+                "seed": self.seed,
                 "configured_paths": _plain(self.configured_paths),
                 "paths": _plain(self.runtime_paths),
             },
@@ -1722,8 +1756,14 @@ def _validate_supervision(
 def _baseline_preflight(
     samples: tuple[StructureSample, ...],
     species_vocabulary: tuple[int, ...],
-    config: AtomicBaselineConfig,
+    config: AtomicBaselineConfig | None,
 ) -> dict[str, Any]:
+    if config is None:
+        return {
+            "enabled": False,
+            "reason": "baseline config is null",
+            "parameter_update_applied": False,
+        }
     try:
         fitted = fit_atomic_baseline(
             samples,
@@ -1743,6 +1783,7 @@ def _baseline_preflight(
             original_error=error,
         ) from error
     return {
+        "enabled": True,
         "num_valid_energy_structures": fitted.num_valid_energy_structures,
         "rank": fitted.rank,
         "required_rank": len(species_vocabulary),
@@ -1901,7 +1942,9 @@ def resolve_training_run(
         )
     _validate_supervision(train_samples, validation_samples, config)
     baseline = _baseline_preflight(
-        train_samples, tuple(bundle.species_vocabulary), config.baseline
+        train_samples,
+        tuple(bundle.species_vocabulary),
+        config.baseline,
     )
 
     batch_size = config.data.batch_size
@@ -1957,13 +2000,20 @@ def resolve_training_run(
     }
     expected_paths = {
         "output_directory": str(output_path),
-        "latest_checkpoint": str(output_path / "latest.pt"),
-        "best_checkpoint": str(output_path / "best.pt"),
-        "epoch_checkpoint_pattern": str(output_path / "epoch-XXXXXX.pt"),
+        "resolved_config": str(output_path / "resolved_config.json"),
+        "preflight": str(output_path / "preflight.json"),
+        "run_status": str(output_path / "run_status.json"),
+        "latest_checkpoint": str(output_path / "checkpoints" / "latest.pt"),
+        "best_checkpoint": str(output_path / "checkpoints" / "best.pt"),
+        "epoch_checkpoint_pattern": str(
+            output_path / "checkpoints" / "epoch_XXXXXX.pt"
+        ),
     }
     training_configuration = {
         "loss": config.loss.to_dict(),
-        "baseline": config.baseline.to_dict(),
+        "baseline": (
+            None if config.baseline is None else config.baseline.to_dict()
+        ),
         "optimizer": config.optimizer.to_dict(),
         "train_step": config.train_step.to_dict(),
         "validation_step": config.validation_step.to_dict(),
@@ -1989,6 +2039,7 @@ def resolve_training_run(
         validation_batch_count=math.ceil(len(validation_samples) / batch_size),
         resolved_device=resolved_device,
         resolved_dtype=config.runtime.dtype,
+        seed=config.runtime.seed,
         radius_config=config.radii,
         radii=config.radii.derived,
         species_vocabulary=tuple(bundle.species_vocabulary),

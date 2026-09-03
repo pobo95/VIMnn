@@ -6,10 +6,11 @@ import argparse
 from collections.abc import Sequence
 import math
 import sys
+import traceback
 
 from refsite_mlip import __version__
 
-from .errors import CLIError, format_cli_error
+from .errors import CLIError, CLIInterruptedError, format_cli_error
 
 
 def _add_debug_argument(parser: argparse.ArgumentParser, *, hidden: bool = False) -> None:
@@ -274,6 +275,31 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_debug_argument(validate_train, hidden=True)
     validate_train.set_defaults(command_handler=_run_validate_train_config)
+
+    train = commands.add_parser(
+        "train",
+        help="execute a validated fresh training run",
+        description=(
+            "Preflight a canonical training-run config and compose the existing "
+            "baseline, optimizer, scheduler, and checkpointed-fit engine."
+        ),
+    )
+    train.add_argument(
+        "config_path", help="canonical training-run JSON configuration path"
+    )
+    train.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="stop after the same read-only preflight as validate-train-config",
+    )
+    train.add_argument(
+        "--json",
+        action="store_true",
+        dest="json_output",
+        help="emit only deterministic final JSON on stdout",
+    )
+    _add_debug_argument(train, hidden=True)
+    train.set_defaults(command_handler=_run_train)
     return parser
 
 
@@ -383,6 +409,32 @@ def _run_validate_train_config(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_train(args: argparse.Namespace) -> int:
+    from .train import (
+        render_train_result_human,
+        render_train_result_json,
+        run_training,
+    )
+
+    progress = None
+    if not args.dry_run:
+        progress = lambda message: print(
+            f"refsite-mlip: {message}", file=sys.stderr
+        )
+    result = run_training(
+        args.config_path,
+        dry_run=args.dry_run,
+        progress=progress,
+    )
+    output = (
+        render_train_result_json(result)
+        if args.json_output
+        else render_train_result_human(result)
+    )
+    print(output)
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the CLI and return its process exit code."""
 
@@ -390,6 +442,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(None if argv is None else list(argv))
     try:
         return int(args.command_handler(args))
+    except CLIInterruptedError as error:
+        if args.debug:
+            traceback.print_exception(error, file=sys.stderr)
+        else:
+            print(format_cli_error(error), file=sys.stderr)
+        return 130
     except CLIError as error:
         if args.debug:
             raise
@@ -408,6 +466,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         print(format_cli_error(wrapped), file=sys.stderr)
         return 1
+    except KeyboardInterrupt as error:
+        if args.debug:
+            traceback.print_exception(error, file=sys.stderr)
+        else:
+            wrapped = CLIInterruptedError(
+                "COMMAND_INTERRUPTED",
+                "command was interrupted",
+                stage=f"command.{args.command}",
+                path=getattr(args, "config_path", None),
+                original_error=error,
+            )
+            print(format_cli_error(wrapped), file=sys.stderr)
+        return 130
 
 
 __all__ = ["build_parser", "main"]

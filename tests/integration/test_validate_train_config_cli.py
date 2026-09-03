@@ -176,7 +176,7 @@ def _base_payload(
             "batch_size": 2,
             "shuffle": False,
         },
-        "runtime": {"device": "cpu", "dtype": "float64"},
+        "runtime": {"device": "cpu", "dtype": "float64", "seed": 17},
         "loss": LossConfig().to_dict(),
         "baseline": AtomicBaselineConfig().to_dict(),
         "optimizer": OptimizerConfig().to_dict(),

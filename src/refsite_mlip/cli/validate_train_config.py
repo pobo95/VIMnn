@@ -172,6 +172,7 @@ def render_train_config_human(resolved: ResolvedTrainingRun) -> str:
             "Runtime",
             f"  Device: {report['runtime']['device']}",
             f"  Dtype: {report['runtime']['dtype']}",
+            f"  Seed: {report['runtime']['seed']}",
             "  Configured path expressions: "
             f"{_display(configured_paths)}",
             f"  Config path: {_display(paths['config'])}",

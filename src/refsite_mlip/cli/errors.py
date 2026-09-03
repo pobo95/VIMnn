@@ -23,6 +23,11 @@ class CLIError(RuntimeError):
         term: str | None = None,
         config_field: str | None = None,
         split: str | None = None,
+        epoch_index: int | None = None,
+        batch_index: int | None = None,
+        global_step: int | None = None,
+        failure_phase: str | None = None,
+        rollback_performed: bool | None = None,
         solver_path: str | None = None,
         prediction_stage: str | None = None,
         predictor_reason_code: str | None = None,
@@ -49,6 +54,11 @@ class CLIError(RuntimeError):
         self.term = term
         self.config_field = config_field
         self.split = split
+        self.epoch_index = epoch_index
+        self.batch_index = batch_index
+        self.global_step = global_step
+        self.failure_phase = failure_phase
+        self.rollback_performed = rollback_performed
         self.solver_path = solver_path
         self.prediction_stage = prediction_stage
         self.predictor_reason_code = predictor_reason_code
@@ -70,6 +80,11 @@ class CLIError(RuntimeError):
             "term",
             "config_field",
             "split",
+            "epoch_index",
+            "batch_index",
+            "global_step",
+            "failure_phase",
+            "rollback_performed",
             "solver_path",
             "prediction_stage",
             "predictor_reason_code",
@@ -90,12 +105,17 @@ class CLIError(RuntimeError):
             "bundle_path": self.bundle_path,
             "config_field": self.config_field,
             "frame_index": self.frame_index,
+            "epoch_index": self.epoch_index,
+            "batch_index": self.batch_index,
+            "global_step": self.global_step,
+            "failure_phase": self.failure_phase,
             "message": self.message,
             "original_exception_type": self.original_exception_type,
             "path": self.path,
             "prediction_stage": self.prediction_stage,
             "predictor_reason_code": self.predictor_reason_code,
             "reason_code": self.reason_code,
+            "rollback_performed": self.rollback_performed,
             "sample_id": self.sample_id,
             "solver_path": self.solver_path,
             "split": self.split,
@@ -104,6 +124,10 @@ class CLIError(RuntimeError):
             "term": self.term,
             "underlying_reason_code": self.underlying_reason_code,
         }
+
+
+class CLIInterruptedError(CLIError):
+    """A handled KeyboardInterrupt whose process contract is exit status 130."""
 
 
 def format_cli_error(error: CLIError) -> str:
@@ -118,6 +142,11 @@ def format_cli_error(error: CLIError) -> str:
         "term",
         "config_field",
         "split",
+        "epoch_index",
+        "batch_index",
+        "global_step",
+        "failure_phase",
+        "rollback_performed",
         "solver_path",
         "prediction_stage",
         "predictor_reason_code",
@@ -134,4 +163,4 @@ def format_cli_error(error: CLIError) -> str:
     )
 
 
-__all__ = ["CLIError", "format_cli_error"]
+__all__ = ["CLIError", "CLIInterruptedError", "format_cli_error"]
