@@ -28,6 +28,12 @@ class CLIError(RuntimeError):
         global_step: int | None = None,
         failure_phase: str | None = None,
         rollback_performed: bool | None = None,
+        source_kind: str | None = None,
+        run_directory: str | PathLike[str] | None = None,
+        checkpoint_stage: str | None = None,
+        bundle_fingerprint: str | None = None,
+        config_fingerprint: str | None = None,
+        template_fingerprint: str | None = None,
         solver_path: str | None = None,
         prediction_stage: str | None = None,
         predictor_reason_code: str | None = None,
@@ -59,6 +65,14 @@ class CLIError(RuntimeError):
         self.global_step = global_step
         self.failure_phase = failure_phase
         self.rollback_performed = rollback_performed
+        self.source_kind = source_kind
+        self.run_directory = (
+            None if run_directory is None else str(run_directory)
+        )
+        self.checkpoint_stage = checkpoint_stage
+        self.bundle_fingerprint = bundle_fingerprint
+        self.config_fingerprint = config_fingerprint
+        self.template_fingerprint = template_fingerprint
         self.solver_path = solver_path
         self.prediction_stage = prediction_stage
         self.predictor_reason_code = predictor_reason_code
@@ -85,6 +99,12 @@ class CLIError(RuntimeError):
             "global_step",
             "failure_phase",
             "rollback_performed",
+            "source_kind",
+            "run_directory",
+            "checkpoint_stage",
+            "bundle_fingerprint",
+            "config_fingerprint",
+            "template_fingerprint",
             "solver_path",
             "prediction_stage",
             "predictor_reason_code",
@@ -116,6 +136,12 @@ class CLIError(RuntimeError):
             "predictor_reason_code": self.predictor_reason_code,
             "reason_code": self.reason_code,
             "rollback_performed": self.rollback_performed,
+            "source_kind": self.source_kind,
+            "run_directory": self.run_directory,
+            "checkpoint_stage": self.checkpoint_stage,
+            "bundle_fingerprint": self.bundle_fingerprint,
+            "config_fingerprint": self.config_fingerprint,
+            "template_fingerprint": self.template_fingerprint,
             "sample_id": self.sample_id,
             "solver_path": self.solver_path,
             "split": self.split,
@@ -147,6 +173,12 @@ def format_cli_error(error: CLIError) -> str:
         "global_step",
         "failure_phase",
         "rollback_performed",
+        "source_kind",
+        "run_directory",
+        "checkpoint_stage",
+        "bundle_fingerprint",
+        "config_fingerprint",
+        "template_fingerprint",
         "solver_path",
         "prediction_stage",
         "predictor_reason_code",

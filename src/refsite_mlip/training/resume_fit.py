@@ -96,18 +96,27 @@ def _history_records(checkpoint: TrainingCheckpoint) -> tuple[FitEpochRecord, ..
 
 def validate_checkpoint_history(
     checkpoint: TrainingCheckpoint,
+    *,
+    allow_stopped_early: bool = False,
 ) -> tuple[FitEpochRecord, ...]:
     """Return owned records after strict history/progress/LR continuity checks.
 
     This function is read-only.  It never mutates the checkpoint or any live
-    model, optimizer, scheduler, or RNG state.
+    model, optimizer, scheduler, or RNG state.  Resume callers retain the
+    default early-stop rejection; read-only terminal consumers may opt in to
+    validating an otherwise complete early-stopped history.
     """
 
     if not isinstance(checkpoint, TrainingCheckpoint):
         raise TypeError("checkpoint must be a TrainingCheckpoint")
+    if not isinstance(allow_stopped_early, bool):
+        raise TypeError("allow_stopped_early must be a bool")
     progress = checkpoint.progress
     selection = checkpoint.selection_state
-    if progress.stopped_early or selection.stopped_early:
+    if (
+        not allow_stopped_early
+        and (progress.stopped_early or selection.stopped_early)
+    ):
         raise ValueError("an already early-stopped checkpoint cannot be resumed")
     if progress.next_batch_index != 0:
         raise ValueError("exact resumed fitting only supports epoch boundaries")

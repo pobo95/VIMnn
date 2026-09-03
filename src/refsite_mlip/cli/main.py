@@ -333,6 +333,57 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_debug_argument(resume, hidden=True)
     resume.set_defaults(command_handler=_run_resume)
+
+    export = commands.add_parser(
+        "export-bundle",
+        help="export a portable model bundle from a managed training checkpoint",
+        description=(
+            "Safely validate a train/resume run and strip optimizer, scheduler, "
+            "history, data, and RNG state from its managed best or latest "
+            "checkpoint without model execution."
+        ),
+    )
+    export.add_argument(
+        "run_directory", help="run directory created by refsite-mlip train"
+    )
+    export.add_argument(
+        "--source",
+        required=True,
+        choices=("best", "latest"),
+        help="managed checkpoint alias to export",
+    )
+    export.add_argument(
+        "--output",
+        required=True,
+        dest="output_path",
+        help="portable model bundle output path",
+    )
+    export.add_argument(
+        "--initial-bundle",
+        dest="initial_bundle_path",
+        help=(
+            "replacement initial bundle path; its semantic SHA-256 must exactly "
+            "match the stored run metadata"
+        ),
+    )
+    export.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="validate through strict model-state load and capture without saving",
+    )
+    export.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="atomically replace an existing regular output bundle",
+    )
+    export.add_argument(
+        "--json",
+        action="store_true",
+        dest="json_output",
+        help="emit deterministic compact JSON",
+    )
+    _add_debug_argument(export, hidden=True)
+    export.set_defaults(command_handler=_run_export_bundle)
     return parser
 
 
@@ -490,6 +541,33 @@ def _run_resume(args: argparse.Namespace) -> int:
         render_resume_json(result)
         if args.json_output
         else render_resume_human(result)
+    )
+    print(output)
+    return 0
+
+
+def _run_export_bundle(args: argparse.Namespace) -> int:
+    from .export_bundle import (
+        ExportBundleConfig,
+        export_bundle,
+        render_export_bundle_human,
+        render_export_bundle_json,
+    )
+
+    result = export_bundle(
+        ExportBundleConfig(
+            run_directory=args.run_directory,
+            source=args.source,
+            output_path=args.output_path,
+            initial_bundle_path=args.initial_bundle_path,
+            dry_run=args.dry_run,
+            overwrite=args.overwrite,
+        )
+    )
+    output = (
+        render_export_bundle_json(result)
+        if args.json_output
+        else render_export_bundle_human(result)
     )
     print(output)
     return 0
