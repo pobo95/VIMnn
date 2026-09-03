@@ -16,7 +16,10 @@ import torch
 
 from .edge_list import CompactTransportEdges
 from .gauge import project_duals, project_gauge
-from .newton_krylov import validate_eval_config
+from .newton_krylov import (
+    _converged_candidate_within_objective_roundoff,
+    validate_eval_config,
+)
 from .result import (
     DualVariables,
     EvalOTConfig,
@@ -588,12 +591,30 @@ def solve_sparse_newton_krylov(
             candidate_objective = sparse_dual_objective(
                 edges, candidate_f, candidate_g
             )
-            bound = objective + objective.new_tensor(
+            armijo_decrease = objective.new_tensor(
                 config.armijo_coefficient * step
             ) * directional_derivative
-            if bool(torch.isfinite(candidate_objective).detach()) and float(
-                (candidate_objective - bound).detach().cpu()
-            ) <= 0.0:
+            bound = objective + armijo_decrease
+            armijo_satisfied = bool(
+                torch.isfinite(candidate_objective).detach()
+            ) and float((candidate_objective - bound).detach().cpu()) <= 0.0
+            converged_at_objective_resolution = False
+            if bool(torch.isfinite(candidate_objective).detach()) and not (
+                armijo_satisfied
+            ):
+                _, _, candidate_projected_residual = _projected_residual(
+                    edges, candidate_f, candidate_g
+                )
+                converged_at_objective_resolution = (
+                    _converged_candidate_within_objective_roundoff(
+                        objective,
+                        candidate_objective,
+                        candidate_projected_residual.abs().max(),
+                        armijo_decrease,
+                        config.convergence_tolerance,
+                    )
+                )
+            if armijo_satisfied or converged_at_objective_resolution:
                 accepted = True
                 accepted_f, accepted_g = candidate_f, candidate_g
                 accepted_objective = candidate_objective

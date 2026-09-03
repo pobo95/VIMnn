@@ -444,6 +444,7 @@ def test_compact_adaptive_force_and_six_stress_directions_finite_difference(
         template_context=context,
         evaluation_policy=policy,
         compute_forces=True,
+        return_aux=True,
     )
     stress_only = model(
         positions,
@@ -454,9 +455,33 @@ def test_compact_adaptive_force_and_six_stress_directions_finite_difference(
         template_context=context,
         evaluation_policy=policy,
         compute_stress=True,
+        return_aux=True,
     )
-    torch.testing.assert_close(force_only.forces, baseline.forces, atol=0.0, rtol=0.0)
-    torch.testing.assert_close(stress_only.stress, baseline.stress, atol=0.0, rtol=0.0)
+    for derivative_only in (force_only, stress_only):
+        diagnostics = derivative_only.auxiliary["evaluation_diagnostics"]
+        assert diagnostics.selected_grouped_index == signature[0]
+        assert torch.equal(derivative_only.auxiliary["ot"].P == 0.0, signature[1])
+        assert not diagnostics.transport_fallback_used
+        torch.testing.assert_close(
+            derivative_only.energy, baseline.energy, atol=0.0, rtol=0.0
+        )
+    # Asking autograd for one input or both inputs can alter the threaded CPU
+    # accumulation order by a few floating-point roundoff units.  This is not
+    # a solver-branch or FD tolerance: both calls use the same energy and the
+    # checks above certify the same selected support/non-fallback branch.
+    derivative_roundoff = 64.0 * torch.finfo(positions.dtype).eps
+    torch.testing.assert_close(
+        force_only.forces,
+        baseline.forces,
+        atol=derivative_roundoff,
+        rtol=derivative_roundoff,
+    )
+    torch.testing.assert_close(
+        stress_only.stress,
+        baseline.stress,
+        atol=derivative_roundoff,
+        rtol=derivative_roundoff,
+    )
 
 
 def test_grouped_mixed_template_compact_adaptive_matches_individual(typed_crystal):

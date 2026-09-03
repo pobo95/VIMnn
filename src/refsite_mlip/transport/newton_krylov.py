@@ -69,6 +69,40 @@ def validate_eval_config(config: EvalOTConfig) -> None:
         raise ValueError("line_search_reduction must be less than one")
 
 
+def _converged_candidate_within_objective_roundoff(
+    objective: torch.Tensor,
+    candidate_objective: torch.Tensor,
+    candidate_residual: torch.Tensor,
+    armijo_decrease: torch.Tensor,
+    convergence_tolerance: float,
+) -> bool:
+    """Certify a converged step when Armijo decrease is below resolution.
+
+    Near a stationary point the requested Armijo decrease can be many orders
+    of magnitude smaller than one objective ULP.  Independent reductions of
+    the current and candidate objectives can then differ by a few roundoff
+    units even though the candidate already satisfies the solver residual.
+    The residual remains the primary certificate; this guard only treats the
+    objective comparison as unresolved within the roundoff of the two finite
+    objective evaluations.
+    """
+
+    if not bool(torch.isfinite(candidate_objective).detach()) or not bool(
+        torch.isfinite(candidate_residual).detach()
+    ):
+        return False
+    if float(candidate_residual.detach().cpu()) > convergence_tolerance:
+        return False
+    epsilon = torch.finfo(objective.dtype).eps
+    roundoff = objective.new_tensor(epsilon) * (
+        objective.abs() + candidate_objective.abs() + objective.new_tensor(1.0)
+    )
+    objective_difference = (candidate_objective - objective).abs()
+    return bool((objective_difference <= roundoff).detach()) and bool(
+        (armijo_decrease.abs() <= roundoff).detach()
+    )
+
+
 def solve_newton_krylov(
     problem: OTProblem,
     config: EvalOTConfig,
@@ -184,12 +218,34 @@ def solve_newton_krylov(
             candidate_objective = dual_objective(
                 problem, candidate_f, candidate_g
             )
-            bound = objective + objective.new_tensor(
+            armijo_decrease = objective.new_tensor(
                 config.armijo_coefficient * step
             ) * directional_derivative
-            if bool(torch.isfinite(candidate_objective)) and float(
+            bound = objective + armijo_decrease
+            armijo_satisfied = bool(torch.isfinite(candidate_objective)) and float(
                 (candidate_objective - bound).detach().cpu()
-            ) <= 0.0:
+            ) <= 0.0
+            converged_at_objective_resolution = False
+            if bool(torch.isfinite(candidate_objective)) and not armijo_satisfied:
+                candidate_gamma = transport_plan(
+                    problem, candidate_f, candidate_g
+                )
+                if bool(torch.all(torch.isfinite(candidate_gamma))):
+                    candidate_residual = project_gauge(
+                        residual_vector(problem, candidate_gamma),
+                        problem.num_sites,
+                        problem.num_columns,
+                    ).abs().max()
+                    converged_at_objective_resolution = (
+                        _converged_candidate_within_objective_roundoff(
+                            objective,
+                            candidate_objective,
+                            candidate_residual,
+                            armijo_decrease,
+                            config.convergence_tolerance,
+                        )
+                    )
+            if armijo_satisfied or converged_at_objective_resolution:
                 accepted = True
                 accepted_f, accepted_g = candidate_f, candidate_g
                 reductions_this_step = reduction

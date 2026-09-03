@@ -108,6 +108,30 @@ def _dense_hybrid(distances: torch.Tensor, config: EvalOTConfig):
     )
 
 
+def _objective_roundoff_fixture():
+    # The two final entries differ from the integration geometry by only a
+    # handful of binary64 ULPs.  The full Newton step is converged, while its
+    # independently reduced objective rounds one ULP above the current value.
+    cost = torch.tensor(
+        [
+            [0.012091520574566365, 0.7848798290018676, 1.214882844255246,
+             1.3106785466903754, 0.4691935469130355],
+            [0.5688401746050944, 0.014368208552289072, 0.49366771412150584,
+             1.1557863959948065, 0.43457966357254146],
+            [0.8999197912427667, 0.5349493270400782, 0.01328062291002436,
+             1.3342427470886042, 1.6522795897557845],
+            [1.1960797643540755, 1.4388525269574766, 0.9561440724622954,
+             0.013565543941512536, 0.6822482212144998],
+            [0.43502876229173043, 0.6208988299628464, 1.1771523918796816,
+             0.7450037551396463, 0.012328841244243528],
+            [0.583267730836448, 0.8861251606879396, 0.8774240763459057,
+             0.6736118787571361, 1.5076794123617066],
+        ],
+        dtype=torch.float64,
+    )
+    return torch.sqrt(cost * (2.0 * 1.5**2)), cost
+
+
 def test_sparse_hybrid_one_vacancy_matches_dense_and_fixed_oracles():
     distances = _one_vacancy_distances()
     edges = _edges(distances)
@@ -145,6 +169,74 @@ def test_sparse_hybrid_one_vacancy_matches_dense_and_fixed_oracles():
     repeated = solve_sparse_hybrid_eval(_edges(distances), config)
     for name in ("edge_plan", "q", "f", "g", "row_residual", "column_residual"):
         assert torch.equal(getattr(sparse, name), getattr(repeated, name))
+
+
+def test_converged_newton_step_below_objective_resolution_avoids_fallback():
+    distances, cost = _objective_roundoff_fixture()
+    config = _config(sinkhorn_iterations=16)
+    dense_support = TransportSupportConfig("compact_c2", 2.6, 0.5, 0.2)
+    edge_support = TransportSupportConfig(
+        "compact_c2", 2.6, 0.5, 0.2, backend="edge_list"
+    )
+    dense = solve_atom_vacancy_ot(
+        cost,
+        0.5,
+        EVAL_ADAPTIVE,
+        "hybrid",
+        config,
+        support_config=dense_support,
+        atom_distances=distances,
+    )
+    displacements = torch.stack(
+        (distances, torch.zeros_like(distances), torch.zeros_like(distances)),
+        dim=-1,
+    )
+    edges = build_compact_transport_edges(
+        displacements,
+        epsilon_ot=0.5,
+        ell_ot=1.5,
+        config=edge_support,
+    )
+    sparse = solve_sparse_hybrid_eval(edges, config)
+
+    for result in (dense, sparse):
+        assert result.converged and not result.fallback_used
+        assert result.newton_iterations == 1
+        assert result.line_search_reductions == 0
+        residual = max(float(result.row_residual), float(result.column_residual))
+        assert residual <= 1e-12
+    step = sparse.adaptive_diagnostics.line_search_steps[0]
+    assert step.accepted_damping == 1.0 and step.failure_reason is None
+    assert step.objective_after > step.objective_before
+    roundoff = torch.finfo(torch.float64).eps * (
+        step.objective_before.abs() + step.objective_after.abs() + 1.0
+    )
+    assert step.objective_after - step.objective_before <= roundoff
+
+    sparse_plan = materialize_dense_plan(sparse).plan
+    torch.testing.assert_close(sparse_plan, dense.P, atol=2e-14, rtol=2e-14)
+    torch.testing.assert_close(sparse.q, dense.q, atol=2e-14, rtol=2e-14)
+    dense_fixed = solve_atom_vacancy_ot(
+        cost,
+        0.5,
+        TRAIN_FIXED,
+        "sinkhorn",
+        TrainSinkhornConfig(512),
+        support_config=dense_support,
+        atom_distances=distances,
+    )
+    sparse_fixed = solve_sparse_sinkhorn_train_fixed(
+        edges, TrainSinkhornConfig(512)
+    )
+    torch.testing.assert_close(dense.P, dense_fixed.P, atol=2e-12, rtol=2e-12)
+    torch.testing.assert_close(dense.q, dense_fixed.q, atol=2e-12, rtol=2e-12)
+    torch.testing.assert_close(
+        sparse_plan,
+        materialize_dense_plan(sparse_fixed).plan,
+        atol=2e-12,
+        rtol=2e-12,
+    )
+    torch.testing.assert_close(sparse.q, sparse_fixed.q, atol=2e-12, rtol=2e-12)
 
 
 def test_sparse_objective_gradient_hvp_gauge_psd_and_newton_direction_oracle():
@@ -342,7 +434,11 @@ def test_sparse_newton_armijo_fallback_and_structured_fallback_failure():
 
     reduced = solve_sparse_hybrid_eval(
         edges,
-        _config(sinkhorn_iterations=0, armijo_coefficient=0.1),
+        _config(
+            sinkhorn_iterations=0,
+            max_newton_iterations=80,
+            armijo_coefficient=0.51,
+        ),
     )
     assert not reduced.fallback_used and reduced.line_search_reductions > 0
     reduced_steps = reduced.adaptive_diagnostics.line_search_steps
