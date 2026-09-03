@@ -427,7 +427,7 @@ def _fit_result(
     )
 
 
-def run_checkpointed_fit(
+def _run_checkpointed_epochs(
     model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
     scheduler,
@@ -443,33 +443,23 @@ def run_checkpointed_fit(
     fit_config: FitConfig,
     checkpoint_manager: CheckpointManager,
     checkpoint_metadata: CheckpointMetadata,
-    checkpoint_config: CheckpointedFitConfig = CheckpointedFitConfig(),
+    optimizer_config: OptimizerConfig,
+    *,
+    history_prefix: Sequence[FitEpochRecord] = (),
+    checkpoint_fit_config: FitConfig | None = None,
+    existing_best_path: str | None = None,
 ) -> CheckpointedFitResult:
-    """Run a fresh deterministic fit and atomically checkpoint every epoch.
+    """Execute the shared epoch/checkpoint loop for fresh and resumed fits."""
 
-    The checkpoint is captured only after validation, scheduler/model selection,
-    and the immutable epoch record are complete. A successful checkpoint write
-    precedes both early-stop termination and the next training epoch.
-    """
-
-    train_batches, validation_batches, optimizer_config = _validate_checkpoint_preflight(
-        model,
-        optimizer,
-        scheduler,
-        train_batches,
-        validation_batches,
-        template_contexts,
-        loss_config,
-        train_step_config,
-        validation_step_config,
-        scheduler_config,
-        selection_config,
-        selection_state,
-        fit_config,
-        checkpoint_manager,
-        checkpoint_metadata,
-        checkpoint_config,
+    prefix = tuple(history_prefix)
+    if any(not isinstance(record, FitEpochRecord) for record in prefix):
+        raise TypeError("history_prefix entries must be FitEpochRecord objects")
+    persisted_fit_config = (
+        fit_config if checkpoint_fit_config is None else checkpoint_fit_config
     )
+    if not isinstance(persisted_fit_config, FitConfig):
+        raise TypeError("checkpoint_fit_config must be a FitConfig")
+
     records: list[FitEpochRecord] = []
     managed_results: list[ManagedCheckpointResult] = []
     state = selection_state
@@ -552,10 +542,11 @@ def run_checkpointed_fit(
             learning_rates_after_validation=decision.learning_rates_after,
         )
         records.append(record)
+        full_history = prefix + tuple(records)
         progress = FitProgress(
             next_epoch=epoch_index + 1,
             global_step=current_global_step,
-            completed_epochs=len(records),
+            completed_epochs=len(full_history),
             next_batch_index=0,
             last_completed_epoch=epoch_index,
             stopped_early=decision.should_stop,
@@ -578,9 +569,9 @@ def run_checkpointed_fit(
                 validation_step_config=validation_step_config,
                 scheduler_config=scheduler_config,
                 model_selection_config=selection_config,
-                fit_config=fit_config,
+                fit_config=persisted_fit_config,
                 species_vocabulary=checkpoint_metadata.species_vocabulary,
-                fit_history=records,
+                fit_history=full_history,
                 baseline_fit_metadata=checkpoint_metadata.baseline_fit_metadata,
                 source_git_commit=checkpoint_metadata.source_git_commit,
             )
@@ -619,15 +610,84 @@ def run_checkpointed_fit(
     best_paths = tuple(
         result.best_path for result in managed_results if result.best_path is not None
     )
+    best_path = best_paths[-1] if best_paths else existing_best_path
+    if best_path is None:
+        raise ValueError("checkpointed fit did not establish a best checkpoint")
+    resolved_best = Path(best_path)
+    if resolved_best.is_symlink() or not resolved_best.is_file():
+        raise ValueError("checkpointed fit best checkpoint is not a regular file")
     return CheckpointedFitResult(
         fit_result=fit_result,
         managed_checkpoint_results=tuple(managed_results),
         epoch_paths=epoch_paths,
         latest_path=managed_results[-1].latest_path,
-        best_path=best_paths[-1],
+        best_path=best_path,
         epochs_checkpointed=len(managed_results),
         terminal_checkpoint_epoch=managed_results[-1].epoch_index,
         terminal_checkpoint_global_step=managed_results[-1].global_step,
+    )
+
+
+def run_checkpointed_fit(
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler,
+    train_batches: Sequence[StructureBatch],
+    validation_batches: Sequence[StructureBatch],
+    template_contexts,
+    loss_config: LossConfig,
+    train_step_config: TrainStepConfig,
+    validation_step_config: ValidationStepConfig,
+    scheduler_config: SchedulerConfig,
+    selection_config: ModelSelectionConfig,
+    selection_state: ModelSelectionState,
+    fit_config: FitConfig,
+    checkpoint_manager: CheckpointManager,
+    checkpoint_metadata: CheckpointMetadata,
+    checkpoint_config: CheckpointedFitConfig = CheckpointedFitConfig(),
+) -> CheckpointedFitResult:
+    """Run a fresh deterministic fit and atomically checkpoint every epoch.
+
+    The checkpoint is captured only after validation, scheduler/model selection,
+    and the immutable epoch record are complete. A successful checkpoint write
+    precedes both early-stop termination and the next training epoch.
+    """
+
+    train_batches, validation_batches, optimizer_config = _validate_checkpoint_preflight(
+        model,
+        optimizer,
+        scheduler,
+        train_batches,
+        validation_batches,
+        template_contexts,
+        loss_config,
+        train_step_config,
+        validation_step_config,
+        scheduler_config,
+        selection_config,
+        selection_state,
+        fit_config,
+        checkpoint_manager,
+        checkpoint_metadata,
+        checkpoint_config,
+    )
+    return _run_checkpointed_epochs(
+        model,
+        optimizer,
+        scheduler,
+        train_batches,
+        validation_batches,
+        template_contexts,
+        loss_config,
+        train_step_config,
+        validation_step_config,
+        scheduler_config,
+        selection_config,
+        selection_state,
+        fit_config,
+        checkpoint_manager,
+        checkpoint_metadata,
+        optimizer_config,
     )
 
 

@@ -1,0 +1,155 @@
+from __future__ import annotations
+
+import importlib
+import json
+
+import pytest
+
+from refsite_mlip.cli.errors import CLIInterruptedError
+from refsite_mlip.cli.main import build_parser, main
+from refsite_mlip.cli.resume import render_resume_human, render_resume_json
+from refsite_mlip.training import RunDirectoryError, TrainingRunDirectory
+
+
+def _ready_report():
+    return {
+        "schema_version": "refsite_training_resume_preflight_v1",
+        "status": "resume_preflight_ready",
+        "training_executed": False,
+        "mutation_performed": False,
+        "run_directory": "/runtime/run",
+        "path_kind": "runtime_location_not_semantic_fingerprint",
+        "config_fingerprint": "1" * 64,
+        "bundle_fingerprint": "2" * 64,
+        "train_semantic_digest": "3" * 64,
+        "validation_semantic_digest": "4" * 64,
+        "seed": 17,
+        "runtime": {
+            "device": "cpu",
+            "dtype": "float64",
+            "solver_path": "train_fixed",
+        },
+        "checkpoint": {
+            "source": "/runtime/run/checkpoints/latest.pt",
+            "scope": "epoch_boundary",
+            "completed_epochs": 1,
+            "next_epoch": 1,
+            "global_step": 2,
+            "max_epochs": 1,
+            "best_epoch": 0,
+            "best_global_step": 2,
+            "managed_epochs": [0],
+        },
+        "requested_max_epochs": 3,
+        "continuation_epoch_count": 2,
+        "train_batch_count": 2,
+        "validation_batch_count": 1,
+        "template_ids": ["template"],
+        "resume_policy": {},
+        "exact_rng_restore_required": True,
+        "lock_state": "available_not_acquired",
+        "message": "no training was executed",
+    }
+
+
+def test_resume_parser_requires_positive_max_epochs():
+    parser = build_parser()
+    args = parser.parse_args(
+        ["resume", "run", "--max-epochs", "20", "--dry-run", "--json"]
+    )
+    assert args.command == "resume"
+    assert args.run_directory == "run"
+    assert args.max_epochs == 20
+    assert args.dry_run and args.json_output
+    with pytest.raises(SystemExit) as caught:
+        parser.parse_args(["resume", "run", "--max-epochs", "0"])
+    assert caught.value.code == 2
+
+
+def test_resume_lock_is_exclusive_owned_and_cleaned(tmp_path):
+    root = tmp_path / "run"
+    root.mkdir()
+    directory = TrainingRunDirectory.open_existing(root)
+    lock = directory.acquire_resume_lock()
+    assert lock.owned and directory.resume_lock_path.is_file()
+    with pytest.raises(RunDirectoryError, match="RESUME_LOCK_EXISTS"):
+        directory.acquire_resume_lock()
+    lock.release()
+    assert not lock.owned and not directory.resume_lock_path.exists()
+    lock.release()
+
+
+def test_resume_lock_never_removes_a_replacement(tmp_path):
+    root = tmp_path / "run"
+    root.mkdir()
+    directory = TrainingRunDirectory.open_existing(root)
+    lock = directory.acquire_resume_lock()
+    owned = root / ".owned-lock"
+    directory.resume_lock_path.rename(owned)
+    directory.resume_lock_path.write_text("foreign", encoding="utf-8")
+    with pytest.raises(RunDirectoryError, match="RESUME_LOCK_OWNERSHIP_LOST"):
+        lock.release()
+    assert directory.resume_lock_path.read_text(encoding="utf-8") == "foreign"
+    assert owned.is_file()
+
+
+def test_resume_lock_symlink_is_rejected_without_removing_target(tmp_path):
+    root = tmp_path / "run"
+    root.mkdir()
+    target = tmp_path / "foreign-lock"
+    target.write_text("foreign", encoding="utf-8")
+    (root / ".resume.lock").symlink_to(target)
+    directory = TrainingRunDirectory.open_existing(root)
+    with pytest.raises(RunDirectoryError, match="RESUME_LOCK_SYMLINK_REJECTED"):
+        directory.validate_resume_lock_available()
+    assert target.read_text(encoding="utf-8") == "foreign"
+
+    real_run = tmp_path / "real-run"
+    real_run.mkdir()
+    linked_run = tmp_path / "linked-run"
+    linked_run.symlink_to(real_run, target_is_directory=True)
+    with pytest.raises(RunDirectoryError, match="RUN_DIRECTORY_SYMLINK_REJECTED"):
+        TrainingRunDirectory.open_existing(linked_run)
+
+
+def test_resume_rendering_is_deterministic_plain_json():
+    report = _ready_report()
+    reversed_report = dict(reversed(tuple(report.items())))
+    assert render_resume_json(report) == render_resume_json(reversed_report)
+    assert json.loads(render_resume_json(report)) == report
+    human = render_resume_human(report)
+    assert "Status: ready" in human
+    assert "No training was executed" in human
+
+
+def test_resume_cli_routes_json_and_interrupt(monkeypatch, capsys):
+    module = importlib.import_module("refsite_mlip.cli.resume")
+    report = _ready_report()
+    calls = []
+
+    def fake(path, *, max_epochs, dry_run, progress):
+        calls.append((path, max_epochs, dry_run, progress))
+        return report
+
+    monkeypatch.setattr(module, "resume_training", fake)
+    assert main(
+        ["resume", "run", "--max-epochs", "3", "--dry-run", "--json"]
+    ) == 0
+    captured = capsys.readouterr()
+    assert json.loads(captured.out) == report and captured.err == ""
+    assert calls[0][:3] == ("run", 3, True)
+
+    def interrupted(*args, **kwargs):
+        del args, kwargs
+        raise CLIInterruptedError(
+            "RESUME_INTERRUPTED",
+            "interrupted",
+            stage="resume.fit",
+            path="run",
+        )
+
+    monkeypatch.setattr(module, "resume_training", interrupted)
+    assert main(["resume", "run", "--max-epochs", "3"]) == 130
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "RESUME_INTERRUPTED" in captured.err

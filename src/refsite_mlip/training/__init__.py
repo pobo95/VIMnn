@@ -23,6 +23,11 @@ from .checkpointed_fit import (
     CheckpointedFitResult,
     run_checkpointed_fit,
 )
+from .checkpointed_resume import (
+    CheckpointedResumeResult,
+    run_checkpointed_resumed_fit,
+    validate_managed_checkpoint_history,
+)
 
 from .checkpoint_manager import (
     CheckpointManager,
@@ -74,10 +79,13 @@ from .selection import (
     process_primary_validation,
 )
 from .run_directory import (
+    RESUME_LOCK_FILENAME,
     RUN_STATUS_SCHEMA_VERSION,
+    ResumeRunLock,
     RunDirectoryError,
     TrainingRunDirectory,
     canonical_runtime_json,
+    load_runtime_json,
 )
 from .step import (
     TrainStepConfig,
@@ -103,6 +111,7 @@ __all__ = [
     "CheckpointedFitConfig",
     "CheckpointedFitExecutionError",
     "CheckpointedFitResult",
+    "CheckpointedResumeResult",
     "CheckpointCompatibilityError",
     "CheckpointRestoreError",
     "EpochMetrics",
@@ -121,6 +130,8 @@ __all__ = [
     "OptimizerConfig",
     "PotentialLossOutput",
     "RUN_STATUS_SCHEMA_VERSION",
+    "RESUME_LOCK_FILENAME",
+    "ResumeRunLock",
     "ResumePolicy",
     "ResumeState",
     "ResumedFitExecutionError",
@@ -146,9 +157,11 @@ __all__ = [
     "fingerprint_batch_sequence",
     "fit_atomic_baseline",
     "load_training_checkpoint",
+    "load_runtime_json",
     "process_primary_validation",
     "run_fit",
     "run_checkpointed_fit",
+    "run_checkpointed_resumed_fit",
     "run_training_epoch",
     "run_validation_epoch",
     "save_training_checkpoint",
@@ -158,5 +171,6 @@ __all__ = [
     "validation_step",
     "validate_checkpoint_compatibility",
     "validate_checkpoint_history",
+    "validate_managed_checkpoint_history",
     "compose_resumed_fit_result",
 ]

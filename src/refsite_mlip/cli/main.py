@@ -300,6 +300,39 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_debug_argument(train, hidden=True)
     train.set_defaults(command_handler=_run_train)
+
+    resume = commands.add_parser(
+        "resume",
+        help="continue an existing run from its managed latest checkpoint",
+        description=(
+            "Validate an existing training run directory, restore only its "
+            "weights-only-safe checkpoints/latest.pt, and continue the shared "
+            "checkpointed-fit engine with a strictly increased max epoch."
+        ),
+    )
+    resume.add_argument(
+        "run_directory", help="run directory created by refsite-mlip train"
+    )
+    resume.add_argument(
+        "--max-epochs",
+        required=True,
+        type=_positive_integer,
+        metavar="INTEGER",
+        help="strictly increased terminal epoch count",
+    )
+    resume.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="perform complete read-only resume preflight without acquiring a lock",
+    )
+    resume.add_argument(
+        "--json",
+        action="store_true",
+        dest="json_output",
+        help="emit only deterministic final JSON on stdout",
+    )
+    _add_debug_argument(resume, hidden=True)
+    resume.set_defaults(command_handler=_run_resume)
     return parser
 
 
@@ -435,6 +468,33 @@ def _run_train(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_resume(args: argparse.Namespace) -> int:
+    from .resume import (
+        render_resume_human,
+        render_resume_json,
+        resume_training,
+    )
+
+    progress = None
+    if not args.dry_run:
+        progress = lambda message: print(
+            f"refsite-mlip: {message}", file=sys.stderr
+        )
+    result = resume_training(
+        args.run_directory,
+        max_epochs=args.max_epochs,
+        dry_run=args.dry_run,
+        progress=progress,
+    )
+    output = (
+        render_resume_json(result)
+        if args.json_output
+        else render_resume_human(result)
+    )
+    print(output)
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the CLI and return its process exit code."""
 
@@ -461,7 +521,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             "command failed unexpectedly",
             stage=f"command.{args.command}",
             bundle_path=getattr(args, "bundle_path", None),
-            path=getattr(args, "config_path", None),
+            path=(
+                getattr(args, "config_path", None)
+                or getattr(args, "run_directory", None)
+            ),
             original_error=error,
         )
         print(format_cli_error(wrapped), file=sys.stderr)
@@ -474,7 +537,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "COMMAND_INTERRUPTED",
                 "command was interrupted",
                 stage=f"command.{args.command}",
-                path=getattr(args, "config_path", None),
+                path=(
+                    getattr(args, "config_path", None)
+                    or getattr(args, "run_directory", None)
+                ),
                 original_error=error,
             )
             print(format_cli_error(wrapped), file=sys.stderr)
