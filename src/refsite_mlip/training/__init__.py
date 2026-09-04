@@ -98,6 +98,12 @@ from .scratch_startup import (
     ScratchTrainingStartupError,
     initialize_scratch_training_startup,
 )
+from .scratch_checkpointed_training import (
+    SCRATCH_CHECKPOINTED_TRAINING_RESULT_SCHEMA_VERSION,
+    ScratchCheckpointedTrainingError,
+    ScratchCheckpointedTrainingResult,
+    run_scratch_checkpointed_training,
+)
 from .selection import (
     ModelSelectionConfig,
     ModelSelectionState,
@@ -169,6 +175,9 @@ __all__ = [
     "SCRATCH_PREPARATION_CONVENTION_VERSION",
     "SCRATCH_TRAINING_STARTUP_CONVENTION_VERSION",
     "SCRATCH_TRAINING_STARTUP_STATUS_SCHEMA_VERSION",
+    "SCRATCH_CHECKPOINTED_TRAINING_RESULT_SCHEMA_VERSION",
+    "ScratchCheckpointedTrainingError",
+    "ScratchCheckpointedTrainingResult",
     "ScratchModelInitialization",
     "ScratchModelInitializationError",
     "ScratchTrainingStartup",
@@ -202,6 +211,7 @@ __all__ = [
     "initialize_scratch_training_startup",
     "run_fit",
     "run_checkpointed_fit",
+    "run_scratch_checkpointed_training",
     "run_checkpointed_resumed_fit",
     "run_training_epoch",
     "run_validation_epoch",

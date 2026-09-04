@@ -510,16 +510,16 @@ class ScratchTrainingPreparation:
     input_file_digests: Mapping[str, Any]
     training_configuration: Mapping[str, Any]
     training_executed: bool = False
-    scratch_execution_implemented: bool = False
+    scratch_execution_implemented: bool = True
 
     def __post_init__(self) -> None:
         if type(self.training_executed) is not bool or self.training_executed:
             raise ValueError("scratch preparation cannot execute training")
         if (
             type(self.scratch_execution_implemented) is not bool
-            or self.scratch_execution_implemented
+            or not self.scratch_execution_implemented
         ):
-            raise ValueError("scratch model execution is not implemented")
+            raise ValueError("prepared scratch execution must be enabled")
         for name in ("config_fingerprint", "preparation_fingerprint"):
             value = getattr(self, name)
             if type(value) is not str or len(value) != 64 or any(
@@ -590,8 +590,8 @@ class ScratchTrainingPreparation:
             "config_fingerprint": self.config_fingerprint,
             "preparation_fingerprint": self.preparation_fingerprint,
             "execution": {
-                "implemented": False,
-                "reason_code": "SCRATCH_EXECUTION_NOT_IMPLEMENTED",
+                "implemented": True,
+                "reason_code": None,
             },
             "model_source": self.model_source.to_dict(),
             "registry_fingerprint": self.registry.fingerprint,
@@ -1321,7 +1321,7 @@ def prepare_scratch_training_run(
         input_file_digests=input_file_digests,
         training_configuration=run_config._training_configuration_metadata(config),
         training_executed=False,
-        scratch_execution_implemented=False,
+        scratch_execution_implemented=True,
     )
     # Detect files changed while the relatively expensive builder/data
     # preflight was running, not only changes observed later by training.

@@ -10,7 +10,12 @@ import traceback
 
 from refsite_mlip import __version__
 
-from .errors import CLIError, CLIInterruptedError, format_cli_error
+from .errors import (
+    CLIConfigPreflightError,
+    CLIError,
+    CLIInterruptedError,
+    format_cli_error,
+)
 
 
 def _add_debug_argument(parser: argparse.ArgumentParser, *, hidden: bool = False) -> None:
@@ -140,7 +145,7 @@ def _training_config_overrides(args: argparse.Namespace):
             output_directory=args.output_directory,
         )
     except TrainingRunConfigError as error:
-        raise CLIError(
+        raise CLIConfigPreflightError(
             error.reason_code,
             error.message,
             stage=error.stage,
@@ -659,6 +664,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         else:
             print(format_cli_error(error), file=sys.stderr)
         return 130
+    except CLIConfigPreflightError as error:
+        if args.debug:
+            traceback.print_exception(error, file=sys.stderr)
+        else:
+            print(format_cli_error(error), file=sys.stderr)
+        return 2
     except CLIError as error:
         if args.debug:
             raise

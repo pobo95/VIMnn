@@ -16,6 +16,7 @@ from typing import Any
 import torch
 
 from refsite_mlip.config import (
+    ScratchModelSourceConfig,
     TrainingRunConfig,
     TrainingRunConfigError,
 )
@@ -66,6 +67,10 @@ from refsite_mlip.training.checkpoint import (
     _template_fingerprint_mapping,
     _unit_conventions,
 )
+from refsite_mlip.training.scratch_preparation import (
+    SCRATCH_DATA_MANIFEST_CONVENTION_VERSION,
+    _fingerprint as _scratch_metadata_fingerprint,
+)
 from refsite_mlip.transport import TRAIN_FIXED
 
 from .errors import CLIError, CLIInterruptedError
@@ -111,6 +116,7 @@ class _ResumePreflight:
     report: Mapping[str, Any]
     stored_preflight: Mapping[str, Any]
     stored_status: Mapping[str, Any]
+    stored_data_manifest: Mapping[str, Any] | None
 
 
 def _canonical_equal(first: Any, second: Any) -> bool:
@@ -701,6 +707,11 @@ def _validate_data(
     train_paths: tuple[Path, ...],
     validation_paths: tuple[Path, ...],
 ) -> None:
+    # Scratch schema-v2 sources may deliberately omit an exact template and
+    # request the full-preflight unique-domain assignment rule.  Resume must
+    # replay that same deterministic candidate set from the persisted bundle;
+    # it must not rebuild POSCAR artifacts or infer a template from atom count.
+    automatic_template_ids = tuple(sorted(templates))
     try:
         train_samples = _load_split(
             config.data.train,
@@ -709,6 +720,7 @@ def _validate_data(
             registry=registry,
             dtype=torch.float64,
             config_path=None,
+            automatic_template_ids=automatic_template_ids,
         )
         validation_samples = _load_split(
             config.data.validation,
@@ -717,6 +729,7 @@ def _validate_data(
             registry=registry,
             dtype=torch.float64,
             config_path=None,
+            automatic_template_ids=automatic_template_ids,
         )
     except TrainingRunConfigError as error:
         raise _training_config_cli_error(
@@ -874,6 +887,8 @@ def _validate_status(
     status: Mapping[str, Any],
     stored: _StoredResolvedRun,
     config: TrainingRunConfig,
+    preflight: Mapping[str, Any],
+    data_manifest: Mapping[str, Any] | None,
 ) -> None:
     if status.get("schema_version") != "refsite_training_run_status_v1":
         raise CLIError(
@@ -912,6 +927,208 @@ def _validate_status(
             status.get(field),
             expected,
             reason="RUN_STATUS_IDENTITY_MISMATCH",
+        )
+    scratch_config = isinstance(config.model_source, ScratchModelSourceConfig)
+    if scratch_config:
+        if data_manifest is None:
+            raise CLIError(
+                "SCRATCH_DATA_MANIFEST_MISSING",
+                "scratch resume requires the immutable data_manifest.json",
+                stage="resume.metadata.data_manifest",
+                path=directory.data_manifest_path,
+            )
+        manifest_fields = {
+            "convention_version",
+            "fingerprint",
+            "observed_species",
+            "train",
+            "train_semantic_digest",
+            "validation",
+            "validation_semantic_digest",
+        }
+        if set(data_manifest) != manifest_fields:
+            raise CLIError(
+                "INVALID_DATA_MANIFEST",
+                "data_manifest.json has missing or unknown top-level fields",
+                stage="resume.metadata.data_manifest",
+                path=directory.data_manifest_path,
+            )
+        _require_equal(
+            "run_status.source_kind",
+            status.get("source_kind"),
+            "scratch",
+            reason="RUN_STATUS_IDENTITY_MISMATCH",
+        )
+        _require_equal(
+            "run_status.initial_bundle_fingerprint",
+            status.get("initial_bundle_fingerprint"),
+            stored.bundle_fingerprint,
+            reason="RUN_STATUS_IDENTITY_MISMATCH",
+        )
+        _require_equal(
+            "run_status.initialization_seed",
+            status.get("initialization_seed"),
+            config.model_source.initialization_seed,
+            reason="RUN_STATUS_IDENTITY_MISMATCH",
+        )
+        for field in ("preparation_fingerprint", "data_manifest_fingerprint"):
+            value = status.get(field)
+            if type(value) is not str or _SHA256.fullmatch(value) is None:
+                raise CLIError(
+                    "INVALID_RUN_STATUS",
+                    f"run_status.{field} must be a lowercase SHA-256",
+                    stage="resume.metadata.status",
+                    path=directory.status_path,
+                    config_field=field,
+                )
+        manifest = dict(data_manifest)
+        manifest_fingerprint = manifest.pop("fingerprint", None)
+        if (
+            type(manifest_fingerprint) is not str
+            or _SHA256.fullmatch(manifest_fingerprint) is None
+        ):
+            raise CLIError(
+                "INVALID_DATA_MANIFEST",
+                "data_manifest.json fingerprint must be a lowercase SHA-256",
+                stage="resume.metadata.data_manifest",
+                path=directory.data_manifest_path,
+                config_field="fingerprint",
+            )
+        expected_manifest_fingerprint = _scratch_metadata_fingerprint(
+            SCRATCH_DATA_MANIFEST_CONVENTION_VERSION,
+            manifest,
+        )
+        _require_equal(
+            "data_manifest.fingerprint",
+            manifest_fingerprint,
+            expected_manifest_fingerprint,
+            reason="DATA_MANIFEST_FINGERPRINT_MISMATCH",
+        )
+        _require_equal(
+            "run_status.data_manifest_fingerprint",
+            status["data_manifest_fingerprint"],
+            manifest_fingerprint,
+            reason="RUN_STATUS_IDENTITY_MISMATCH",
+        )
+        _require_equal(
+            "data_manifest.convention_version",
+            data_manifest.get("convention_version"),
+            SCRATCH_DATA_MANIFEST_CONVENTION_VERSION,
+            reason="DATA_MANIFEST_CONVENTION_MISMATCH",
+        )
+        _require_equal(
+            "data_manifest.train_semantic_digest",
+            data_manifest.get("train_semantic_digest"),
+            stored.train_semantic_digest,
+            reason="DATA_MANIFEST_IDENTITY_MISMATCH",
+        )
+        _require_equal(
+            "data_manifest.validation_semantic_digest",
+            data_manifest.get("validation_semantic_digest"),
+            stored.validation_semantic_digest,
+            reason="DATA_MANIFEST_IDENTITY_MISMATCH",
+        )
+        _require_equal(
+            "run_status.template_fingerprints",
+            status.get("template_fingerprints"),
+            preflight.get("template_fingerprints"),
+            reason="RUN_STATUS_IDENTITY_MISMATCH",
+        )
+        manifest_species = _require_mapping(
+            data_manifest.get("observed_species"),
+            field="data_manifest.observed_species",
+        )
+        _require_equal(
+            "data_manifest.observed_species.configured",
+            manifest_species.get("configured"),
+            list(stored.species_vocabulary),
+            reason="DATA_MANIFEST_IDENTITY_MISMATCH",
+        )
+        preflight_data = _require_mapping(
+            preflight.get("data"), field="preflight.data"
+        )
+        for split, expected_batches in (
+            ("train", stored.train_batch_count),
+            ("validation", stored.validation_batch_count),
+        ):
+            manifest_split = _require_mapping(
+                data_manifest.get(split),
+                field=f"data_manifest.{split}",
+            )
+            preflight_split = _require_mapping(
+                preflight_data.get(split), field=f"preflight.data.{split}"
+            )
+            _require_equal(
+                f"data_manifest.{split}.split",
+                manifest_split.get("split"),
+                split,
+                reason="DATA_MANIFEST_IDENTITY_MISMATCH",
+            )
+            _require_equal(
+                f"data_manifest.{split}.batch_count",
+                manifest_split.get("batch_count"),
+                expected_batches,
+                reason="DATA_MANIFEST_IDENTITY_MISMATCH",
+            )
+            _require_equal(
+                f"data_manifest.{split}.frame_count",
+                manifest_split.get("frame_count"),
+                preflight_split.get("frame_count"),
+                reason="DATA_MANIFEST_IDENTITY_MISMATCH",
+            )
+        first_update = status.get("first_optimizer_update_executed")
+        if type(first_update) is not bool:
+            raise CLIError(
+                "INVALID_RUN_STATUS",
+                "run_status.first_optimizer_update_executed must be a bool",
+                stage="resume.metadata.status",
+                path=directory.status_path,
+                config_field="first_optimizer_update_executed",
+            )
+        global_step = status.get("global_step")
+        if type(global_step) is not int or global_step < 0:
+            raise CLIError(
+                "INVALID_RUN_STATUS",
+                "run_status.global_step must be a nonnegative integer",
+                stage="resume.metadata.status",
+                path=directory.status_path,
+                config_field="global_step",
+            )
+        _require_equal(
+            "run_status.first_optimizer_update_executed",
+            first_update,
+            global_step > 0,
+            reason="RUN_STATUS_IDENTITY_MISMATCH",
+        )
+        initial_bundle_path = str(
+            Path(str(stored.runtime_paths["initial_bundle"]))
+        )
+        _require_equal(
+            "run_status.recoverable_initial_bundle",
+            status.get("recoverable_initial_bundle"),
+            initial_bundle_path,
+            reason="RUN_STATUS_CHECKPOINT_PATH_MISMATCH",
+        )
+        latest_path = str(directory.checkpoints / "latest.pt")
+        _require_equal(
+            "run_status.recoverable_checkpoint",
+            status.get("recoverable_checkpoint"),
+            latest_path,
+            reason="RUN_STATUS_CHECKPOINT_PATH_MISMATCH",
+        )
+        _require_equal(
+            "run_status.recovery",
+            status.get("recovery"),
+            {"kind": "latest_checkpoint", "path": latest_path},
+            reason="RUN_STATUS_CHECKPOINT_PATH_MISMATCH",
+        )
+    elif status.get("source_kind") is not None:
+        raise CLIError(
+            "RUN_STATUS_IDENTITY_MISMATCH",
+            "bundle-source run_status must not claim scratch provenance",
+            stage="resume.metadata.status",
+            path=directory.status_path,
+            config_field="source_kind",
         )
 
 
@@ -1004,6 +1221,12 @@ def _prepare_resume(
         status = load_runtime_json(
             directory.status_path, stage="resume.metadata.status"
         )
+        data_manifest = None
+        if isinstance(config.model_source, ScratchModelSourceConfig):
+            data_manifest = load_runtime_json(
+                directory.data_manifest_path,
+                stage="resume.metadata.data_manifest",
+            )
         stored, train_paths, validation_paths, bundle_path = (
             _validate_preflight_metadata(directory, config, preflight)
         )
@@ -1078,7 +1301,14 @@ def _prepare_resume(
                 epoch_index=checkpoint.progress.last_completed_epoch,
                 global_step=checkpoint.progress.global_step,
             )
-        _validate_status(directory, status, stored, config)
+        _validate_status(
+            directory,
+            status,
+            stored,
+            config,
+            preflight,
+            data_manifest,
+        )
         _, registry, templates = _validate_bundle_and_checkpoint(
             config, stored, preflight, checkpoint, bundle_path
         )
@@ -1110,6 +1340,7 @@ def _prepare_resume(
             report=report,
             stored_preflight=preflight,
             stored_status=status,
+            stored_data_manifest=data_manifest,
         )
     except CLIError:
         raise
@@ -1140,7 +1371,7 @@ def _resume_status_base(
     training_executed: bool,
 ) -> dict[str, Any]:
     checkpoint = preflight.checkpoint
-    return {
+    result = {
         "schema_version": "refsite_training_run_status_v1",
         "result_schema_version": RESUME_RESULT_SCHEMA_VERSION,
         "status": status,
@@ -1182,6 +1413,41 @@ def _resume_status_base(
         "rollback_succeeded": None,
         "partial_update_retained": False,
     }
+    if isinstance(preflight.config.model_source, ScratchModelSourceConfig):
+        previous = preflight.stored_status
+        initial_bundle_path = str(
+            preflight.resolved.runtime_paths["initial_bundle"]
+        )
+        latest_path = str(preflight.directory.checkpoints / "latest.pt")
+        result.update(
+            {
+                "data_manifest_fingerprint": previous[
+                    "data_manifest_fingerprint"
+                ],
+                "first_optimizer_update_executed": (
+                    checkpoint.progress.global_step > 0
+                ),
+                "initial_bundle_fingerprint": (
+                    preflight.resolved.bundle_fingerprint
+                ),
+                "initialization_seed": (
+                    preflight.config.model_source.initialization_seed
+                ),
+                "preparation_fingerprint": previous[
+                    "preparation_fingerprint"
+                ],
+                "recoverable_initial_bundle": initial_bundle_path,
+                "recovery": {
+                    "kind": "latest_checkpoint",
+                    "path": latest_path,
+                },
+                "source_kind": "scratch",
+                "template_fingerprints": preflight.stored_preflight[
+                    "template_fingerprints"
+                ],
+            }
+        )
+    return result
 
 
 def _completed_status(preflight: _ResumePreflight, result: Any) -> dict[str, Any]:
@@ -1206,6 +1472,12 @@ def _completed_status(preflight: _ResumePreflight, result: Any) -> dict[str, Any
             "exact_resume": result.resume_state.exact_resume_ready,
         }
     )
+    if status.get("source_kind") == "scratch":
+        status["first_optimizer_update_executed"] = fit.global_step_end > 0
+        status["recovery"] = {
+            "kind": "latest_checkpoint",
+            "path": checkpointed.latest_path,
+        }
     return json.loads(canonical_runtime_json(status))
 
 
@@ -1311,6 +1583,12 @@ def _failure_status(
             },
         }
     )
+    if status.get("source_kind") == "scratch":
+        status["first_optimizer_update_executed"] = int(current_step) > 0
+        status["recovery"] = {
+            "kind": "latest_checkpoint",
+            "path": str(preflight.directory.checkpoints / "latest.pt"),
+        }
     return json.loads(canonical_runtime_json(status))
 
 
@@ -1456,6 +1734,20 @@ def _recheck_resume_sources(preflight: _ResumePreflight) -> None:
             stage="resume.status.toctou",
             path=preflight.directory.status_path,
         )
+    if preflight.stored_data_manifest is not None:
+        current_manifest = load_runtime_json(
+            preflight.directory.data_manifest_path,
+            stage="resume.metadata.data_manifest_toctou",
+        )
+        if not _canonical_equal(
+            current_manifest, preflight.stored_data_manifest
+        ):
+            raise CLIError(
+                "DATA_MANIFEST_TOCTOU_MISMATCH",
+                "data_manifest.json changed between preflight and lock acquisition",
+                stage="resume.data_manifest.toctou",
+                path=preflight.directory.data_manifest_path,
+            )
     try:
         current = preflight.manager.load_latest()
     except Exception as error:

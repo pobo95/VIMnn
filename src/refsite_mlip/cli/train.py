@@ -57,7 +57,7 @@ from refsite_mlip.training.run_directory import (
 )
 from refsite_mlip.transport import TRAIN_FIXED
 
-from .errors import CLIError, CLIInterruptedError
+from .errors import CLIConfigPreflightError, CLIError, CLIInterruptedError
 from .validate_train_config import (
     _cli_error as _preflight_cli_error,
     render_train_config_human,
@@ -95,8 +95,17 @@ def seed_training_runtime(seed: int) -> None:
         torch.cuda.manual_seed_all(torch_seed)
 
 
-def _raise_cli_preflight(error: TrainingRunConfigError, path: Any) -> None:
-    raise _preflight_cli_error(error, requested_path=path) from error
+def _raise_cli_preflight(
+    error: TrainingRunConfigError,
+    path: Any,
+    *,
+    error_type: type[CLIError] = CLIError,
+) -> None:
+    raise _preflight_cli_error(
+        error,
+        requested_path=path,
+        error_type=error_type,
+    ) from error
 
 
 def _load_preflight(
@@ -112,12 +121,23 @@ def _load_preflight(
         config = load_effective_training_run_config(
             path, overrides, cli_cwd=cli_cwd
         )
-        if isinstance(config.model_source, ScratchModelSourceConfig):
-            resolved = prepare_scratch_training_run(config)
-        else:
-            resolved = resolve_training_run(config)
     except TrainingRunConfigError as error:
-        _raise_cli_preflight(error, path)
+        _raise_cli_preflight(error, path, error_type=CLIConfigPreflightError)
+    if isinstance(config.model_source, ScratchModelSourceConfig):
+        try:
+            resolved = prepare_scratch_training_run(config)
+        except TrainingRunConfigError as error:
+            converted = _preflight_cli_error(
+                error,
+                requested_path=path,
+                error_type=CLIConfigPreflightError,
+            )
+            raise converted from error
+    else:
+        try:
+            resolved = resolve_training_run(config)
+        except TrainingRunConfigError as error:
+            _raise_cli_preflight(error, path)
     return config, resolved
 
 
@@ -607,6 +627,123 @@ def _execution_cli_error(
     )
 
 
+def _nested_exception_is_interrupt(error: BaseException) -> bool:
+    """Recognize an interrupt retained behind a structured training error."""
+
+    pending: list[BaseException] = [error]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, KeyboardInterrupt):
+            return True
+        if getattr(current, "interrupted", False) is True or getattr(
+            current, "status", None
+        ) == "interrupted":
+            return True
+        for nested in (
+            getattr(current, "original_error", None),
+            current.__cause__,
+            current.__context__,
+        ):
+            if isinstance(nested, BaseException):
+                pending.append(nested)
+    return False
+
+
+def _scratch_error_attribute(
+    error: BaseException,
+    *names: str,
+) -> Any:
+    """Return the first retained scratch-error attribute with a value."""
+
+    pending: list[BaseException] = [error]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        for name in names:
+            value = getattr(current, name, None)
+            if value is not None:
+                return value
+        for nested in (
+            getattr(current, "original_error", None),
+            current.__cause__,
+            current.__context__,
+        ):
+            if isinstance(nested, BaseException):
+                pending.append(nested)
+    return None
+
+
+def _scratch_execution_cli_error(
+    error: BaseException,
+    config: TrainingRunConfig,
+) -> CLIError:
+    """Preserve scratch orchestration context at the public CLI boundary."""
+
+    interrupted = _nested_exception_is_interrupt(error)
+    error_type = CLIInterruptedError if interrupted else CLIError
+    reason = _scratch_error_attribute(error, "reason_code")
+    if not isinstance(reason, str) or not reason:
+        reason = (
+            "SCRATCH_TRAINING_INTERRUPTED"
+            if interrupted
+            else "SCRATCH_TRAINING_FAILED"
+        )
+    stage = _scratch_error_attribute(error, "stage")
+    if not isinstance(stage, str) or not stage:
+        stage = "scratch_training"
+    failure_phase = _scratch_error_attribute(error, "failure_phase")
+    if not isinstance(failure_phase, str) or not failure_phase:
+        failure_phase = stage
+    message = _scratch_error_attribute(error, "message")
+    if not isinstance(message, str) or not message:
+        message = (
+            "scratch training was interrupted; durable completed state was retained"
+            if interrupted
+            else "scratch checkpointed training failed; durable state was retained"
+        )
+    underlying = _scratch_error_attribute(error, "original_reason_code")
+    if not isinstance(underlying, str) or not underlying:
+        underlying = _nested_reason(error) or reason
+    path = _scratch_error_attribute(error, "output_path", "path")
+    if path is None:
+        path = config.source_path
+    epoch_index = _scratch_error_attribute(
+        error, "epoch_index", "completed_epochs"
+    )
+    return error_type(
+        reason,
+        message,
+        stage=stage,
+        path=path,
+        source_path=config.source_path,
+        sample_id=_scratch_error_attribute(error, "sample_id"),
+        template_id=_scratch_error_attribute(error, "template_id"),
+        epoch_index=epoch_index,
+        batch_index=_scratch_error_attribute(error, "batch_index"),
+        global_step=_scratch_error_attribute(error, "global_step"),
+        failure_phase=failure_phase,
+        rollback_performed=getattr(error, "rollback_performed", False),
+        source_kind="scratch",
+        run_directory=_scratch_error_attribute(error, "output_path"),
+        bundle_fingerprint=_scratch_error_attribute(
+            error, "bundle_fingerprint", "initial_bundle_fingerprint"
+        ),
+        config_fingerprint=_scratch_error_attribute(
+            error, "config_fingerprint"
+        ),
+        solver_path=TRAIN_FIXED,
+        underlying_reason_code=underlying,
+        original_error=error,
+    )
+
+
 def _write_failure_status(
     directory: TrainingRunDirectory,
     status: Mapping[str, Any],
@@ -825,17 +962,48 @@ def run_training(
     )
     if dry_run:
         return resolved
-    if isinstance(
-        resolved, (ResolvedScratchTrainingRun, ScratchTrainingPreparation)
-    ):
+    if isinstance(resolved, ScratchTrainingPreparation):
+        # Imported only on the execution branch so validate/dry-run retain their
+        # strictly read-only dependency boundary.
+        from refsite_mlip.training import (
+            ScratchCheckpointedTrainingError,
+            run_scratch_checkpointed_training,
+        )
+
+        try:
+            result = run_scratch_checkpointed_training(
+                config,
+                resolved,
+                progress=progress,
+            )
+        except KeyboardInterrupt as error:
+            retained = getattr(error, "scratch_training_error", error)
+            raise _scratch_execution_cli_error(retained, config) from error
+        except ScratchCheckpointedTrainingError as error:
+            raise _scratch_execution_cli_error(error, config) from error
+        # Keep the command-level JSON contract source-independent: both
+        # bundle and scratch fresh runs return the flat terminal status.  The
+        # richer composed result remains available from the public training
+        # orchestration API.
+        payload = result.to_dict()["terminal_status"]
+        if not isinstance(payload, Mapping):
+            raise CLIError(
+                "INVALID_SCRATCH_TRAINING_RESULT",
+                "scratch training result did not provide a mapping payload",
+                stage="scratch_training.result",
+                path=config.source_path,
+                source_kind="scratch",
+            )
+        return json.loads(canonical_runtime_json(payload))
+    if isinstance(resolved, ResolvedScratchTrainingRun):
         raise CLIError(
-            "SCRATCH_EXECUTION_NOT_IMPLEMENTED",
-            "scratch model construction is deferred to Milestone 10A-2B",
-            stage="model_source.execution",
+            "SCRATCH_FULL_PREFLIGHT_REQUIRED",
+            "scratch execution requires full POSCAR/data preparation",
+            stage="model_source.preflight",
             path=config.source_path,
             config_field="model_source.kind",
             source_kind="scratch",
-            underlying_reason_code="SCRATCH_EXECUTION_NOT_IMPLEMENTED",
+            underlying_reason_code="SCRATCH_FULL_PREFLIGHT_REQUIRED",
         )
 
     seed_training_runtime(config.runtime.seed)
@@ -892,14 +1060,20 @@ def render_training_human(report: Mapping[str, Any]) -> str:
 
     if not isinstance(report, Mapping):
         raise TypeError("training report must be a mapping")
-    if report.get("status") != "completed":
+    terminal_status = report.get("terminal_status")
+    if terminal_status is not None:
+        if not isinstance(terminal_status, Mapping):
+            raise TypeError("terminal_status must be a mapping")
+        report = terminal_status
+    if report.get("status") not in ("completed", "early_stopped"):
         raise ValueError("human terminal summary requires a completed report")
+    status = str(report["status"])
     fit = report["fit_result"]
     baseline = report["baseline"]
     return "\n".join(
         (
             "Reference-site MLIP training run",
-            "Status: completed",
+            f"Status: {status}",
             f"Config SHA-256: {report['config_fingerprint']}",
             f"Bundle SHA-256: {report['bundle_fingerprint']}",
             f"Train semantic SHA-256: {report['train_semantic_digest']}",

@@ -20,7 +20,7 @@ from refsite_mlip.training import (
     prepare_scratch_training_run,
 )
 
-from .errors import CLIError
+from .errors import CLIConfigPreflightError, CLIError
 from .inspect_bundle import render_json as _render_json
 
 
@@ -28,8 +28,9 @@ def _cli_error(
     error: TrainingRunConfigError,
     *,
     requested_path: str | PathLike[str],
+    error_type: type[CLIError] = CLIError,
 ) -> CLIError:
-    return CLIError(
+    return error_type(
         error.reason_code,
         error.message,
         stage=error.stage,
@@ -59,8 +60,22 @@ def validate_train_config(
         config = load_effective_training_run_config(
             path, overrides, cli_cwd=cli_cwd
         )
-        if isinstance(config.model_source, ScratchModelSourceConfig):
+    except TrainingRunConfigError as error:
+        raise _cli_error(
+            error,
+            requested_path=path,
+            error_type=CLIConfigPreflightError,
+        ) from error
+    if isinstance(config.model_source, ScratchModelSourceConfig):
+        try:
             return prepare_scratch_training_run(config)
+        except TrainingRunConfigError as error:
+            raise _cli_error(
+                error,
+                requested_path=path,
+                error_type=CLIConfigPreflightError,
+            ) from error
+    try:
         return resolve_training_run(config)
     except TrainingRunConfigError as error:
         raise _cli_error(error, requested_path=path) from error
@@ -172,7 +187,7 @@ def render_train_config_human(
                 "Full POSCAR/data/domain preflight completed.",
                 "No model parameters, optimizer, initial bundle, output directory, "
                 "or training run were created.",
-                "Scratch execution remains deferred to Milestone 10A-2B.",
+                "Scratch training is available through refsite-mlip train.",
             ]
         )
         return "\n".join(lines)
@@ -196,7 +211,7 @@ def render_train_config_human(
                 f"Device: {report['runtime']['device']}",
                 f"Dtype: {report['runtime']['dtype']}",
                 f"Output directory: {paths['output_directory']}",
-                "Scratch execution: not implemented (Milestone 10A-2)",
+                "Scratch execution requires full POSCAR/data preflight.",
                 "No POSCAR/artifact/model construction or training was executed.",
             )
         )

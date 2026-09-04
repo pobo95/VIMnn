@@ -80,6 +80,71 @@ def test_resume_lock_is_exclusive_owned_and_cleaned(tmp_path):
     lock.release()
 
 
+def test_resume_lock_validate_owned_is_read_only_and_enter_rejects_release(
+    tmp_path,
+):
+    root = tmp_path / "run"
+    root.mkdir()
+    directory = TrainingRunDirectory.open_existing(root)
+    lock = directory.acquire_resume_lock()
+    before = directory.resume_lock_path.read_bytes()
+    identity = directory.resume_lock_path.lstat()
+
+    assert lock.validate_owned(directory.resume_lock_path) is None
+    assert lock.owned
+    assert directory.resume_lock_path.read_bytes() == before
+    after = directory.resume_lock_path.lstat()
+    assert (after.st_dev, after.st_ino) == (identity.st_dev, identity.st_ino)
+
+    with pytest.raises(RunDirectoryError) as mismatch:
+        lock.validate_owned(root / ".different.lock")
+    assert mismatch.value.reason_code == "RESUME_LOCK_PATH_MISMATCH"
+    assert lock.owned and directory.resume_lock_path.read_bytes() == before
+
+    lock.release()
+    with pytest.raises(RunDirectoryError) as released:
+        lock.validate_owned(directory.resume_lock_path)
+    assert released.value.reason_code == "RESUME_LOCK_NOT_OWNED"
+    with pytest.raises(RunDirectoryError, match="RESUME_LOCK_NOT_OWNED"):
+        with lock:
+            raise AssertionError("released lock body must not execute")
+
+
+@pytest.mark.parametrize("replacement_kind", ["file", "symlink"])
+def test_resume_lock_validate_owned_preserves_replacement(
+    tmp_path, replacement_kind
+):
+    root = tmp_path / "run"
+    root.mkdir()
+    directory = TrainingRunDirectory.open_existing(root)
+    lock = directory.acquire_resume_lock()
+    owned = root / ".owned-lock"
+    directory.resume_lock_path.rename(owned)
+    if replacement_kind == "file":
+        directory.resume_lock_path.write_bytes(b"foreign")
+    else:
+        foreign = tmp_path / "foreign"
+        foreign.write_bytes(b"foreign")
+        directory.resume_lock_path.symlink_to(foreign)
+
+    with pytest.raises(RunDirectoryError) as caught:
+        lock.validate_owned(directory.resume_lock_path)
+    assert caught.value.reason_code == "RESUME_LOCK_OWNERSHIP_LOST"
+    assert lock.owned
+    assert owned.is_file()
+    if replacement_kind == "file":
+        assert directory.resume_lock_path.read_bytes() == b"foreign"
+    else:
+        assert directory.resume_lock_path.is_symlink()
+        assert directory.resume_lock_path.read_bytes() == b"foreign"
+
+    # Explicit test teardown restores the inode owned by this lock; production
+    # validation never removes a replacement on the caller's behalf.
+    directory.resume_lock_path.unlink()
+    owned.rename(directory.resume_lock_path)
+    lock.release()
+
+
 def test_resume_lock_never_removes_a_replacement(tmp_path):
     root = tmp_path / "run"
     root.mkdir()

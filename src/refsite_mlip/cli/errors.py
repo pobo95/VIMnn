@@ -160,6 +160,14 @@ class CLIInterruptedError(CLIError):
     """A handled KeyboardInterrupt whose process contract is exit status 130."""
 
 
+class CLIConfigPreflightError(CLIError):
+    """A parsed scratch config whose read-only full preflight failed.
+
+    The process entry point maps this class to exit status 2 without changing
+    the established exit-status contract for bundle runtime validation.
+    """
+
+
 def format_cli_error(error: CLIError) -> str:
     """Format one escaped, single-line diagnostic for stderr."""
 
@@ -200,4 +208,9 @@ def format_cli_error(error: CLIError) -> str:
     )
 
 
-__all__ = ["CLIError", "CLIInterruptedError", "format_cli_error"]
+__all__ = [
+    "CLIConfigPreflightError",
+    "CLIError",
+    "CLIInterruptedError",
+    "format_cli_error",
+]

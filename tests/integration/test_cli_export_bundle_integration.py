@@ -651,6 +651,28 @@ def test_running_status_and_checkpoint_symlink_are_rejected(
         backup.rename(checkpoint)
 
 
+def test_bundle_run_rejects_scratch_only_status_extensions(
+    synthetic_run, tmp_path
+):
+    status_path = synthetic_run["run"] / "run_status.json"
+    status_before = status_path.read_bytes()
+    try:
+        status = json.loads(status_before)
+        status["initialization_seed"] = 17
+        status_path.write_text(json.dumps(status, sort_keys=True), encoding="utf-8")
+        with pytest.raises(CLIError) as caught:
+            export_bundle(
+                synthetic_run["run"],
+                source="latest",
+                output_path=tmp_path / "invalid-extension.pt",
+                dry_run=True,
+            )
+        assert caught.value.reason_code == "INVALID_RUN_STATUS"
+        assert "scratch-only" in caught.value.message
+    finally:
+        status_path.write_bytes(status_before)
+
+
 def test_resumed_run_latest_and_preserved_best_are_exportable(
     training_bundle, tmp_path
 ):

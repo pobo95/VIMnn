@@ -8,10 +8,12 @@ import pytest
 from refsite_mlip.cli.errors import CLIError, format_cli_error
 from refsite_mlip.cli.export_bundle import (
     ExportBundleConfig,
+    export_bundle,
     render_export_bundle_human,
     render_export_bundle_json,
 )
 from refsite_mlip.cli.main import build_parser, main
+from refsite_mlip.training import TrainingRunDirectory
 
 
 def _report(*, dry_run: bool = False) -> dict:
@@ -219,3 +221,26 @@ def test_runtime_failure_writes_only_stderr(capsys):
     assert "source_kind='latest'" in captured.err
     assert "Traceback" not in captured.err
 
+
+def test_export_checks_active_common_run_lock_before_startup_metadata(tmp_path):
+    root = tmp_path / "scratch-run"
+    directory = TrainingRunDirectory.create(root)
+    lock = directory.acquire_resume_lock()
+    try:
+        # Fresh scratch training acquires the common lock immediately after
+        # creating the directory, before resolved_config/preflight/status are
+        # guaranteed to exist.  Export must still report active ownership,
+        # rather than a misleading missing-metadata failure.
+        with pytest.raises(CLIError) as caught:
+            export_bundle(
+                root,
+                source="latest",
+                output_path=tmp_path / "model.pt",
+                dry_run=True,
+            )
+        assert caught.value.reason_code == "RESUME_LOCK_EXISTS"
+        assert caught.value.stage == "export.active_run"
+        assert lock.owned
+        assert directory.resume_lock_path.is_file()
+    finally:
+        lock.release()

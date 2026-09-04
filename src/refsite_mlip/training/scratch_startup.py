@@ -39,9 +39,11 @@ from refsite_mlip.models import (
 )
 
 from .baseline import AtomicBaselineFit, apply_atomic_baseline_, fit_atomic_baseline
+from ._scratch_run_metadata import scratch_runtime_preflight_metadata
 from .checkpoint import FitProgress
 from .optimizer import build_optimizer, optimizer_parameters, validate_optimizer_binding
 from .run_directory import (
+    ResumeRunLock,
     TrainingRunDirectory,
 )
 from .scheduler import build_scheduler
@@ -329,6 +331,8 @@ def _live_split_digest(
 
 def _revalidate_preparation(
     preparation: ScratchTrainingPreparation,
+    *,
+    refresh_from_files: bool = True,
 ) -> ScratchTrainingPreparation:
     from refsite_mlip.config import (
         ScratchModelSourceConfig,
@@ -359,6 +363,14 @@ def _revalidate_preparation(
     ) != preparation.validation_semantic_digest:
         raise ValueError("prepared validation sample content changed after preflight")
     verify_scratch_preparation_input_digests(preparation)
+
+    # An outer fresh-run orchestration may already own the configured output
+    # directory and its lock.  Re-running the full preparation in that case
+    # would reject the owned directory as an output collision.  The checks
+    # above still validate the complete caller-owned preparation, semantic
+    # sample digests, and every raw config/POSCAR/extxyz byte digest.
+    if not refresh_from_files:
+        return preparation
 
     base_directory = preparation.runtime_paths.get("base_directory")
     if type(base_directory) is not str or not base_directory:
@@ -407,6 +419,34 @@ def _revalidate_preparation(
         if actual != expected:
             raise ValueError(f"scratch {name} changed after preflight")
     return refreshed
+
+
+def _validate_supplied_run_ownership(
+    preparation: ScratchTrainingPreparation,
+    directory: TrainingRunDirectory,
+    run_lock: ResumeRunLock,
+) -> None:
+    if not isinstance(directory, TrainingRunDirectory):
+        raise TypeError("run_directory must be a TrainingRunDirectory")
+    if not isinstance(run_lock, ResumeRunLock):
+        raise TypeError("run_lock must be a ResumeRunLock")
+    output_value = preparation.runtime_paths.get("output_directory")
+    if type(output_value) is not str or not output_value:
+        raise ValueError("prepared output_directory runtime path is invalid")
+    configured_output = Path(output_value)
+    if not configured_output.is_absolute():
+        raise ValueError("prepared output_directory runtime path must be absolute")
+    try:
+        resolved_output = configured_output.resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise ValueError(
+            "configured scratch output directory is unavailable"
+        ) from error
+    if resolved_output != directory.root:
+        raise ValueError(
+            "supplied run directory differs from the configured output directory"
+        )
+    run_lock.validate_owned(directory.resume_lock_path)
 
 
 def _validate_runtime_bundle(
@@ -888,6 +928,9 @@ def _startup_error(
 
 def _initialize_scratch_training_startup(
     preparation: ScratchTrainingPreparation,
+    *,
+    run_directory: TrainingRunDirectory | None = None,
+    run_lock: ResumeRunLock | None = None,
 ) -> ScratchTrainingStartup:
     """Create durable scratch startup state without evaluating or updating it."""
 
@@ -900,7 +943,28 @@ def _initialize_scratch_training_startup(
     baseline_metadata: Mapping[str, Any] | None = None
     phase = "preflight"
     try:
-        verified = _revalidate_preparation(preparation)
+        supplied_run = run_directory is not None or run_lock is not None
+        if (run_directory is None) != (run_lock is None):
+            raise ValueError(
+                "run_directory and run_lock must be supplied together"
+            )
+        if supplied_run:
+            if not isinstance(preparation, ScratchTrainingPreparation):
+                raise TypeError(
+                    "preparation must be a ScratchTrainingPreparation"
+                )
+            assert run_directory is not None and run_lock is not None
+            _validate_supplied_run_ownership(
+                preparation, run_directory, run_lock
+            )
+            # Only after exact path and active-inode ownership have been
+            # established may failure reporting write into the supplied root.
+            directory = run_directory
+            verified = _revalidate_preparation(
+                preparation, refresh_from_files=False
+            )
+        else:
+            verified = _revalidate_preparation(preparation)
         if not _process_state_equal(entry_state, _capture_process_state()):
             raise RuntimeError("scratch preflight changed process RNG or execution state")
 
@@ -909,14 +973,31 @@ def _initialize_scratch_training_startup(
         if not _process_state_equal(entry_state, _capture_process_state()):
             raise RuntimeError("scratch model initialization leaked process state")
 
-        phase = "run_directory_create"
-        output = Path(str(verified.runtime_paths["output_directory"]))
-        directory = TrainingRunDirectory.create(output)
+        if supplied_run:
+            phase = "run_directory_validate"
+            assert run_directory is not None and run_lock is not None
+            _validate_supplied_run_ownership(
+                verified, run_directory, run_lock
+            )
+            # Close the initialization-time TOCTOU window without invoking
+            # the output-collision gate against our already-owned root.
+            verify_scratch_preparation_input_digests(verified)
+        else:
+            phase = "run_directory_create"
+            output = Path(str(verified.runtime_paths["output_directory"]))
+            directory = TrainingRunDirectory.create(output)
+        assert directory is not None
         directory.create_checkpoints_directory()
 
         phase = "metadata_save"
         directory.write_resolved_config(verified.config.to_dict())
-        directory.write_preflight(verified.to_dict())
+        directory.write_preflight(
+            scratch_runtime_preflight_metadata(
+                verified,
+                initialization,
+                directory,
+            )
+        )
         directory.write_data_manifest(_plain(verified.data_manifest))
 
         phase = "initial_bundle_save"
@@ -1024,6 +1105,9 @@ def _initialize_scratch_training_startup(
         )
 
         phase = "status_save"
+        if supplied_run:
+            assert run_lock is not None
+            run_lock.validate_owned(directory.resume_lock_path)
         directory.write_status(
             _status(
                 "startup_ready",
@@ -1033,6 +1117,8 @@ def _initialize_scratch_training_startup(
                 directory=directory,
             )
         )
+        if supplied_run:
+            run_lock.validate_owned(directory.resume_lock_path)
         if not _process_state_equal(entry_state, _capture_process_state()):
             raise RuntimeError("startup changed process state before training seeding")
         _seed_training_runtime(verified.runtime.seed)
@@ -1058,6 +1144,9 @@ def _initialize_scratch_training_startup(
         )
         if directory is not None:
             try:
+                if supplied_run:
+                    assert run_lock is not None
+                    run_lock.validate_owned(directory.resume_lock_path)
                 status_preparation = verified or preparation
                 directory.write_status(
                     _status(
@@ -1098,14 +1187,26 @@ def _initialize_scratch_training_startup(
 
 def initialize_scratch_training_startup(
     preparation: ScratchTrainingPreparation,
+    *,
+    run_directory: TrainingRunDirectory | None = None,
+    run_lock: ResumeRunLock | None = None,
 ) -> ScratchTrainingStartup:
-    """Create a normal trainable runtime even under a caller no-grad context."""
+    """Create a normal trainable runtime even under caller no-grad state.
+
+    ``run_directory`` and ``run_lock`` are an all-or-nothing injection point
+    for a surrounding fresh-run transaction.  The caller retains ownership of
+    a supplied lock on both success and failure; startup never releases it.
+    """
 
     # Construction inside inference mode would permanently mark Parameters and
     # buffers as inference tensors.  A nested disabled context creates ordinary
     # tensors while restoring the caller's grad/inference state on exit.
     with torch.inference_mode(False), torch.enable_grad():
-        return _initialize_scratch_training_startup(preparation)
+        return _initialize_scratch_training_startup(
+            preparation,
+            run_directory=run_directory,
+            run_lock=run_lock,
+        )
 
 
 __all__ = [

@@ -541,6 +541,60 @@ class ResumeRunLock:
     def owned(self) -> bool:
         return self._owned
 
+    def validate_owned(
+        self,
+        expected_path: str | os.PathLike[str] | None = None,
+    ) -> None:
+        """Validate this lock's live inode without changing ownership state."""
+
+        expected = self.path if expected_path is None else Path(expected_path)
+        if not self._owned:
+            raise RunDirectoryError(
+                "RESUME_LOCK_NOT_OWNED",
+                "resume lock ownership was already released or lost",
+                stage="run_directory.resume_lock.validate_owned",
+                path=self.path,
+            )
+        if self.path != expected:
+            raise RunDirectoryError(
+                "RESUME_LOCK_PATH_MISMATCH",
+                "resume lock does not belong to the expected run directory",
+                stage="run_directory.resume_lock.validate_owned",
+                path=self.path,
+            )
+        if self.path.is_symlink():
+            raise RunDirectoryError(
+                "RESUME_LOCK_OWNERSHIP_LOST",
+                "owned resume lock path became a symbolic link; it was not removed",
+                stage="run_directory.resume_lock.validate_owned",
+                path=self.path,
+            )
+        try:
+            stat = self.path.lstat()
+        except FileNotFoundError as error:
+            raise RunDirectoryError(
+                "RESUME_LOCK_OWNERSHIP_LOST",
+                "owned resume lock disappeared",
+                stage="run_directory.resume_lock.validate_owned",
+                path=self.path,
+                original_error=error,
+            ) from error
+        except OSError as error:
+            raise RunDirectoryError(
+                "RESUME_LOCK_VALIDATE_FAILED",
+                "owned resume lock could not be inspected",
+                stage="run_directory.resume_lock.validate_owned",
+                path=self.path,
+                original_error=error,
+            ) from error
+        if (stat.st_dev, stat.st_ino) != (self._device, self._inode):
+            raise RunDirectoryError(
+                "RESUME_LOCK_OWNERSHIP_LOST",
+                "resume lock was replaced; the foreign lock was not removed",
+                stage="run_directory.resume_lock.validate_owned",
+                path=self.path,
+            )
+
     def release(self) -> None:
         if not self._owned:
             return
@@ -579,6 +633,7 @@ class ResumeRunLock:
         self._owned = False
 
     def __enter__(self) -> "ResumeRunLock":
+        self.validate_owned()
         return self
 
     def __exit__(self, exception_type, exception, traceback) -> bool:

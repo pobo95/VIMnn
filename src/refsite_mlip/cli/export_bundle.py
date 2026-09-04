@@ -17,7 +17,11 @@ from typing import Any, Iterator
 import numpy as np
 import torch
 
-from refsite_mlip.config import TrainingRunConfig, TrainingRunConfigError
+from refsite_mlip.config import (
+    ScratchModelSourceConfig,
+    TrainingRunConfig,
+    TrainingRunConfigError,
+)
 from refsite_mlip.config.radii import (
     RadiusConfigError,
     validate_radius_artifact_compatibility,
@@ -50,6 +54,10 @@ from refsite_mlip.training import (
 from refsite_mlip.training.checkpoint import (
     _plain as _checkpoint_plain,
     _unit_conventions,
+)
+from refsite_mlip.training.scratch_preparation import (
+    SCRATCH_DATA_MANIFEST_CONVENTION_VERSION,
+    _fingerprint as _scratch_metadata_fingerprint,
 )
 from refsite_mlip.transport import TRAIN_FIXED
 
@@ -550,6 +558,17 @@ def _validate_stored_run(directory: TrainingRunDirectory) -> _StoredRun:
         "error",
         "rollback_performed",
     }
+    scratch_status_fields = {
+        "data_manifest_fingerprint",
+        "first_optimizer_update_executed",
+        "initial_bundle_fingerprint",
+        "initialization_seed",
+        "preparation_fingerprint",
+        "recoverable_initial_bundle",
+        "recovery",
+        "source_kind",
+        "template_fingerprints",
+    }
     allowed_status = required_status | {
         "result_schema_version",
         "epoch_index",
@@ -569,7 +588,7 @@ def _validate_stored_run(directory: TrainingRunDirectory) -> _StoredRun:
         "exact_resume",
         "rollback_succeeded",
         "partial_update_retained",
-    }
+    } | scratch_status_fields
     if not required_status.issubset(status) or not set(status).issubset(allowed_status):
         raise CLIError(
             "INVALID_RUN_STATUS",
@@ -592,10 +611,16 @@ def _validate_stored_run(directory: TrainingRunDirectory) -> _StoredRun:
             stage="export.active_run",
             path=directory.status_path,
         )
-    if status_name not in {"completed", "failed", "interrupted"}:
+    if status_name not in {
+        "completed",
+        "early_stopped",
+        "failed",
+        "interrupted",
+    }:
         raise CLIError(
             "INVALID_RUN_STATUS",
-            "run status must be completed, failed, or interrupted for export",
+            "run status must be completed, early_stopped, failed, or "
+            "interrupted for export",
             stage="export.metadata.status",
             path=directory.status_path,
         )
@@ -628,6 +653,200 @@ def _validate_stored_run(directory: TrainingRunDirectory) -> _StoredRun:
             f"run_status.{field}",
             status.get(field),
             expected,
+            path=directory.status_path,
+            reason="RUN_STATUS_IDENTITY_MISMATCH",
+        )
+    scratch_config = isinstance(config.model_source, ScratchModelSourceConfig)
+    if scratch_config and status.get("source_kind") is None:
+        raise CLIError(
+            "INVALID_RUN_STATUS",
+            "scratch run_status.json is missing source_kind provenance",
+            stage="export.metadata.status",
+            path=directory.status_path,
+            config_field="source_kind",
+        )
+    if not scratch_config and scratch_status_fields.intersection(status):
+        raise CLIError(
+            "INVALID_RUN_STATUS",
+            "bundle-source run_status.json contains scratch-only provenance fields",
+            stage="export.metadata.status",
+            path=directory.status_path,
+        )
+    if status.get("source_kind") is not None:
+        if status.get("source_kind") != "scratch" or not scratch_config:
+            raise CLIError(
+                "INVALID_RUN_STATUS",
+                "run_status source_kind is inconsistent with the training config",
+                stage="export.metadata.status",
+                path=directory.status_path,
+                config_field="source_kind",
+            )
+        if not scratch_status_fields.issubset(status):
+            raise CLIError(
+                "INVALID_RUN_STATUS",
+                "scratch run_status.json is missing provenance fields",
+                stage="export.metadata.status",
+                path=directory.status_path,
+            )
+        for field in ("data_manifest_fingerprint", "preparation_fingerprint"):
+            _sha256(
+                status[field],
+                field=f"run_status.{field}",
+                path=directory.status_path,
+            )
+        data_manifest = load_runtime_json(
+            directory.data_manifest_path,
+            stage="export.metadata.data_manifest",
+        )
+        manifest_fields = {
+            "convention_version",
+            "fingerprint",
+            "observed_species",
+            "train",
+            "train_semantic_digest",
+            "validation",
+            "validation_semantic_digest",
+        }
+        if set(data_manifest) != manifest_fields:
+            raise CLIError(
+                "INVALID_DATA_MANIFEST",
+                "data_manifest.json has missing or unknown top-level fields",
+                stage="export.metadata.data_manifest",
+                path=directory.data_manifest_path,
+            )
+        manifest_payload = dict(data_manifest)
+        manifest_fingerprint = _sha256(
+            manifest_payload.pop("fingerprint", None),
+            field="data_manifest.fingerprint",
+            path=directory.data_manifest_path,
+        )
+        _require_equal(
+            "data_manifest.fingerprint",
+            manifest_fingerprint,
+            _scratch_metadata_fingerprint(
+                SCRATCH_DATA_MANIFEST_CONVENTION_VERSION,
+                manifest_payload,
+            ),
+            path=directory.data_manifest_path,
+            reason="DATA_MANIFEST_FINGERPRINT_MISMATCH",
+        )
+        for field, expected in (
+            (
+                "convention_version",
+                SCRATCH_DATA_MANIFEST_CONVENTION_VERSION,
+            ),
+            ("train_semantic_digest", train_digest),
+            ("validation_semantic_digest", validation_digest),
+        ):
+            _require_equal(
+                f"data_manifest.{field}",
+                data_manifest[field],
+                expected,
+                path=directory.data_manifest_path,
+                reason="DATA_MANIFEST_IDENTITY_MISMATCH",
+            )
+        _require_equal(
+            "run_status.data_manifest_fingerprint",
+            status["data_manifest_fingerprint"],
+            manifest_fingerprint,
+            path=directory.status_path,
+            reason="RUN_STATUS_IDENTITY_MISMATCH",
+        )
+        for split, expected_frames, expected_batches in (
+            ("train", train_frames, train_batches),
+            (
+                "validation",
+                validation_frames,
+                validation_batches,
+            ),
+        ):
+            manifest_split = _require_mapping(
+                data_manifest[split],
+                field=f"data_manifest.{split}",
+                path=directory.data_manifest_path,
+            )
+            _require_equal(
+                f"data_manifest.{split}.frame_count",
+                manifest_split.get("frame_count"),
+                expected_frames,
+                path=directory.data_manifest_path,
+                reason="DATA_MANIFEST_IDENTITY_MISMATCH",
+            )
+            _require_equal(
+                f"data_manifest.{split}.batch_count",
+                manifest_split.get("batch_count"),
+                expected_batches,
+                path=directory.data_manifest_path,
+                reason="DATA_MANIFEST_IDENTITY_MISMATCH",
+            )
+        _require_equal(
+            "run_status.initial_bundle_fingerprint",
+            status["initial_bundle_fingerprint"],
+            bundle_fingerprint,
+            path=directory.status_path,
+            reason="RUN_STATUS_IDENTITY_MISMATCH",
+        )
+        _require_equal(
+            "run_status.initialization_seed",
+            status["initialization_seed"],
+            config.model_source.initialization_seed,
+            path=directory.status_path,
+            reason="RUN_STATUS_IDENTITY_MISMATCH",
+        )
+        _require_equal(
+            "run_status.template_fingerprints",
+            status["template_fingerprints"],
+            preflight["template_fingerprints"],
+            path=directory.status_path,
+            reason="RUN_STATUS_IDENTITY_MISMATCH",
+        )
+        if type(status["first_optimizer_update_executed"]) is not bool:
+            raise CLIError(
+                "INVALID_RUN_STATUS",
+                "run_status.first_optimizer_update_executed must be a bool",
+                stage="export.metadata.status",
+                path=directory.status_path,
+                config_field="first_optimizer_update_executed",
+            )
+        _require_equal(
+            "run_status.first_optimizer_update_executed",
+            status["first_optimizer_update_executed"],
+            status["global_step"] > 0,
+            path=directory.status_path,
+            reason="RUN_STATUS_IDENTITY_MISMATCH",
+        )
+        expected_initial = str(stored_initial)
+        initial_recovery = status["recoverable_initial_bundle"]
+        if initial_recovery != expected_initial:
+            raise CLIError(
+                "RUN_STATUS_CHECKPOINT_PATH_MISMATCH",
+                "run_status.recoverable_initial_bundle is not the managed initial bundle",
+                stage="export.metadata.status",
+                path=directory.status_path,
+                config_field="recoverable_initial_bundle",
+            )
+        recovery = _require_mapping(
+            status["recovery"],
+            field="run_status.recovery",
+            path=directory.status_path,
+        )
+        if set(recovery) != {"kind", "path"}:
+            raise CLIError(
+                "INVALID_RUN_STATUS",
+                "run_status.recovery must contain exactly kind and path",
+                stage="export.metadata.status",
+                path=directory.status_path,
+                config_field="recovery",
+            )
+        recovery_path = status.get("recoverable_checkpoint")
+        recovery_kind = "latest_checkpoint"
+        if recovery_path is None:
+            recovery_path = initial_recovery
+            recovery_kind = "initial_bundle" if recovery_path is not None else None
+        _require_equal(
+            "run_status.recovery",
+            recovery,
+            {"kind": recovery_kind, "path": recovery_path},
             path=directory.status_path,
             reason="RUN_STATUS_IDENTITY_MISMATCH",
         )
@@ -1846,6 +2065,22 @@ def _prepare_export(request: ExportBundleConfig) -> _PreparedExport:
             error.reason_code,
             "training run directory or active lock validation failed",
             stage=error.stage,
+            path=error.path,
+            source_kind=request.source,
+            underlying_reason_code=error.reason_code,
+            original_error=error,
+        ) from error
+    # Check the common run lock before reading metadata.  A fresh scratch run
+    # acquires it immediately after creating the directory, so export reports
+    # active ownership even while the first metadata files are still being
+    # committed.
+    try:
+        directory.validate_resume_lock_available()
+    except RunDirectoryError as error:
+        raise CLIError(
+            error.reason_code,
+            "an active or foreign run lock prevents bundle export",
+            stage="export.active_run",
             path=error.path,
             source_kind=request.source,
             underlying_reason_code=error.reason_code,

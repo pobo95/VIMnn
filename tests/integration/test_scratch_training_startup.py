@@ -19,6 +19,7 @@ from refsite_mlip.models import load_reference_site_model_bundle
 from refsite_mlip.training import (
     FitProgress,
     ModelSelectionState,
+    TrainingRunDirectory,
     ScratchTrainingStartup,
     ScratchTrainingStartupError,
     SCRATCH_TRAINING_STARTUP_STATUS_SCHEMA_VERSION,
@@ -181,6 +182,124 @@ def test_startup_uses_saved_bundle_and_stops_before_first_update(
     assert preparation.to_dict() == preparation_before
     assert all(path.read_bytes() == value for path, value in input_before.items())
     assert all(not value.is_inference() for value in result.model.state_dict().values())
+
+
+def test_startup_reuses_supplied_owned_directory_and_leaves_lock_owned(tmp_path):
+    preparation, _ = _preparation(tmp_path)
+    output = Path(preparation.runtime_paths["output_directory"])
+    directory = TrainingRunDirectory.create(output)
+    lock = directory.acquire_resume_lock()
+    identity = directory.resume_lock_path.lstat()
+    try:
+        result = initialize_scratch_training_startup(
+            preparation,
+            run_directory=directory,
+            run_lock=lock,
+        )
+        assert result.run_directory is directory
+        lock.validate_owned(directory.resume_lock_path)
+        current = directory.resume_lock_path.lstat()
+        assert (current.st_dev, current.st_ino) == (
+            identity.st_dev,
+            identity.st_ino,
+        )
+        assert directory.initial_bundle_path.is_file()
+        assert directory.status_path.is_file()
+        assert not list(directory.checkpoints.iterdir())
+    finally:
+        if lock.owned:
+            lock.release()
+
+
+def test_startup_supplied_directory_and_lock_are_all_or_nothing(tmp_path):
+    preparation, _ = _preparation(tmp_path)
+    output = Path(preparation.runtime_paths["output_directory"])
+    directory = TrainingRunDirectory.create(output)
+
+    with pytest.raises(ScratchTrainingStartupError) as missing_lock:
+        initialize_scratch_training_startup(
+            preparation, run_directory=directory
+        )
+    assert missing_lock.value.stage == "preflight"
+    assert list(directory.root.iterdir()) == []
+
+    lock = directory.acquire_resume_lock()
+    try:
+        with pytest.raises(ScratchTrainingStartupError) as missing_directory:
+            initialize_scratch_training_startup(preparation, run_lock=lock)
+        assert missing_directory.value.stage == "preflight"
+        lock.validate_owned(directory.resume_lock_path)
+        assert set(path.name for path in directory.root.iterdir()) == {
+            ".resume.lock"
+        }
+    finally:
+        lock.release()
+
+
+def test_startup_rejects_wrong_or_released_caller_lock_without_mutation(tmp_path):
+    preparation, _ = _preparation(tmp_path / "inputs")
+    configured = Path(preparation.runtime_paths["output_directory"])
+    configured.mkdir()
+    other = TrainingRunDirectory.create(tmp_path / "other-run")
+    other_lock = other.acquire_resume_lock()
+    try:
+        with pytest.raises(ScratchTrainingStartupError) as mismatch:
+            initialize_scratch_training_startup(
+                preparation,
+                run_directory=other,
+                run_lock=other_lock,
+            )
+        assert mismatch.value.stage == "preflight"
+        other_lock.validate_owned(other.resume_lock_path)
+        assert set(path.name for path in other.root.iterdir()) == {".resume.lock"}
+    finally:
+        other_lock.release()
+
+    configured_directory = TrainingRunDirectory.open_existing(configured)
+    released = configured_directory.acquire_resume_lock()
+    released.release()
+    with pytest.raises(ScratchTrainingStartupError) as not_owned:
+        initialize_scratch_training_startup(
+            preparation,
+            run_directory=configured_directory,
+            run_lock=released,
+        )
+    assert not_owned.value.reason_code == "RESUME_LOCK_NOT_OWNED"
+    assert list(configured.iterdir()) == []
+
+
+def test_supplied_lock_survives_startup_failure_and_post_init_input_toctou(
+    tmp_path, monkeypatch
+):
+    preparation, inputs = _preparation(tmp_path)
+    output = Path(preparation.runtime_paths["output_directory"])
+    directory = TrainingRunDirectory.create(output)
+    lock = directory.acquire_resume_lock()
+    original = startup_module.initialize_scratch_model
+
+    def initialize_then_mutate(value):
+        initialized = original(value)
+        with inputs[2].open("ab") as stream:
+            stream.write(b"\n")
+        return initialized
+
+    monkeypatch.setattr(
+        startup_module, "initialize_scratch_model", initialize_then_mutate
+    )
+    try:
+        with pytest.raises(ScratchTrainingStartupError) as caught:
+            initialize_scratch_training_startup(
+                preparation,
+                run_directory=directory,
+                run_lock=lock,
+            )
+        assert caught.value.stage == "run_directory_validate"
+        assert "INPUT_DIGEST" in caught.value.reason_code
+        lock.validate_owned(directory.resume_lock_path)
+        assert json.loads(directory.status_path.read_text())["status"] == "failed"
+        assert not directory.checkpoints.exists()
+    finally:
+        lock.release()
 
 
 def test_baseline_is_train_only_and_not_persisted_in_initial_bundle(tmp_path):

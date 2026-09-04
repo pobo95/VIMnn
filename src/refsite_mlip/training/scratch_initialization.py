@@ -340,7 +340,7 @@ def _validate_preparation(
             stage="initialization.preparation",
             preparation=preparation,
         )
-    if preparation.training_executed or preparation.scratch_execution_implemented:
+    if preparation.training_executed or not preparation.scratch_execution_implemented:
         raise _error(
             "INVALID_PREPARATION",
             "scratch preparation execution flags are invalid",

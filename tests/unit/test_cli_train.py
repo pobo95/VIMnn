@@ -192,21 +192,29 @@ def test_scratch_cli_requires_full_inputs_before_seed_model_optimizer_or_output(
     monkeypatch.setattr(module, "_prepare_training_runtime", forbidden)
     rng = torch.get_rng_state().clone()
 
-    assert main(["validate-train-config", str(path), "--json"]) == 1
+    assert main(["validate-train-config", str(path), "--json"]) == 2
     captured = capsys.readouterr()
     assert captured.out == ""
     assert "INPUT_NOT_FOUND" in captured.err
 
-    assert main(["train", str(path), "--dry-run"]) == 1
+    assert main(["train", str(path), "--dry-run"]) == 2
     captured = capsys.readouterr()
     assert captured.out == ""
     assert "INPUT_NOT_FOUND" in captured.err
     assert not output.exists()
     assert torch.equal(torch.get_rng_state(), rng)
 
-    assert main(["train", str(path)]) == 1
+    assert main(["train", str(path)]) == 2
     captured = capsys.readouterr()
     assert captured.out == ""
+    assert "INPUT_NOT_FOUND" in captured.err
+    assert not output.exists()
+    assert torch.equal(torch.get_rng_state(), rng)
+
+    assert main(["train", str(path), "--debug"]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "Traceback" in captured.err
     assert "INPUT_NOT_FOUND" in captured.err
     assert not output.exists()
     assert torch.equal(torch.get_rng_state(), rng)
@@ -272,3 +280,165 @@ def test_train_cli_interrupt_exit_code_and_debug_traceback(monkeypatch, capsys):
     assert main(["train", "run.json", "--debug"]) == 130
     captured = capsys.readouterr()
     assert "Traceback" in captured.err
+
+
+def test_scratch_training_branch_uses_checkpointed_orchestrator_without_reseeding(
+    monkeypatch,
+):
+    module = importlib.import_module("refsite_mlip.cli.train")
+    training = importlib.import_module("refsite_mlip.training")
+
+    class FakePreparation:
+        pass
+
+    class FakeConfig:
+        source_path = "/synthetic/run.yaml"
+
+    class FakeResult:
+        def to_dict(self):
+            return {
+                "checkpointed_fit_result": {},
+                "startup": {},
+                "terminal_status": {"z": 2, "status": "completed", "a": 1},
+            }
+
+    preparation = FakePreparation()
+    config = FakeConfig()
+    calls = []
+
+    class FakeScratchError(RuntimeError):
+        pass
+
+    def execute(observed_config, observed_preparation, *, progress):
+        calls.append((observed_config, observed_preparation, progress))
+        return FakeResult()
+
+    monkeypatch.setattr(module, "ScratchTrainingPreparation", FakePreparation)
+    monkeypatch.setattr(
+        module, "_load_preflight", lambda *args, **kwargs: (config, preparation)
+    )
+    monkeypatch.setattr(
+        module,
+        "seed_training_runtime",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("scratch startup owns training seeding")
+        ),
+    )
+    monkeypatch.setattr(
+        training, "ScratchCheckpointedTrainingError", FakeScratchError, raising=False
+    )
+    monkeypatch.setattr(
+        training, "run_scratch_checkpointed_training", execute, raising=False
+    )
+    progress = lambda message: None
+
+    report = module.run_training("run.yaml", progress=progress)
+    assert calls == [(config, preparation, progress)]
+    assert tuple(report) == ("a", "status", "z")
+    assert report["status"] == "completed"
+
+
+def test_scratch_structured_interrupt_maps_to_cli_interrupt_context(monkeypatch):
+    module = importlib.import_module("refsite_mlip.cli.train")
+    training = importlib.import_module("refsite_mlip.training")
+
+    class FakePreparation:
+        pass
+
+    class FakeConfig:
+        source_path = "/synthetic/run.json"
+
+    class FakeScratchError(RuntimeError):
+        def __init__(self):
+            self.reason_code = "SCRATCH_CHECKPOINTED_TRAINING_INTERRUPTED"
+            self.message = "synthetic interruption"
+            self.stage = "fit"
+            self.failure_phase = "fit"
+            self.output_path = "/synthetic/output"
+            self.template_id = "alpha"
+            self.sample_id = "train:000001"
+            self.completed_epochs = 1
+            self.batch_index = 2
+            self.global_step = 3
+            self.rollback_performed = False
+            self.bundle_fingerprint = "a" * 64
+            self.config_fingerprint = "b" * 64
+            self.original_reason_code = "KEYBOARD_INTERRUPT"
+            self.original_error = KeyboardInterrupt()
+            super().__init__(self.message)
+
+    preparation = FakePreparation()
+    config = FakeConfig()
+    monkeypatch.setattr(module, "ScratchTrainingPreparation", FakePreparation)
+    monkeypatch.setattr(
+        module, "_load_preflight", lambda *args, **kwargs: (config, preparation)
+    )
+    monkeypatch.setattr(
+        training, "ScratchCheckpointedTrainingError", FakeScratchError, raising=False
+    )
+    def interrupt_with_retained_context(*args, **kwargs):
+        del args, kwargs
+        interrupted = KeyboardInterrupt()
+        interrupted.scratch_training_error = FakeScratchError()
+        raise interrupted
+
+    monkeypatch.setattr(
+        training,
+        "run_scratch_checkpointed_training",
+        interrupt_with_retained_context,
+        raising=False,
+    )
+
+    with pytest.raises(CLIInterruptedError) as caught:
+        module.run_training("run.json")
+    error = caught.value
+    assert error.reason_code == "SCRATCH_CHECKPOINTED_TRAINING_INTERRUPTED"
+    assert error.path == "/synthetic/output"
+    assert error.source_path == "/synthetic/run.json"
+    assert error.run_directory == "/synthetic/output"
+    assert error.failure_phase == "fit"
+    assert error.template_id == "alpha"
+    assert error.sample_id == "train:000001"
+    assert error.epoch_index == 1
+    assert error.batch_index == 2
+    assert error.global_step == 3
+    assert error.source_kind == "scratch"
+    assert error.underlying_reason_code == "KEYBOARD_INTERRUPT"
+
+
+def test_scratch_nested_result_has_human_terminal_summary():
+    module = importlib.import_module("refsite_mlip.cli.train")
+    terminal = {
+        "status": "completed",
+        "source_kind": "scratch",
+        "config_fingerprint": "a" * 64,
+        "bundle_fingerprint": "b" * 64,
+        "train_semantic_digest": "c" * 64,
+        "validation_semantic_digest": "d" * 64,
+        "seed": 17,
+        "runtime": {
+            "device": "cpu",
+            "dtype": "float64",
+            "solver_path": "train-fixed",
+        },
+        "completed_epochs": 2,
+        "global_step": 4,
+        "fit_result": {
+            "stopped_early": False,
+            "best_epoch": 1,
+            "best_metric": 0.25,
+        },
+        "baseline": {"parameter_update_applied": True},
+        "latest_checkpoint": "/run/checkpoints/latest.pt",
+        "best_checkpoint": "/run/checkpoints/best.pt",
+    }
+    report = {
+        "checkpointed_fit_result": {},
+        "startup": {},
+        "terminal_status": terminal,
+    }
+
+    rendered = module.render_train_result_human(report)
+    assert "Status: completed" in rendered
+    assert "Epochs completed: 2" in rendered
+    assert "Global step: 4" in rendered

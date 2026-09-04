@@ -1090,10 +1090,5 @@ def test_cli_validate_and_train_dry_run_share_preparation_and_never_execute(
     assert dry_run.err == ""
     assert json.loads(dry_run.out) == validated_report
 
-    assert main(["train", str(config_path)]) == 1
-    failed = capsys.readouterr()
-    assert failed.out == ""
-    assert "SCRATCH_EXECUTION_NOT_IMPLEMENTED" in failed.err
-    assert "Traceback" not in failed.err
     assert not (tmp_path / "scratch-output").exists()
     assert torch.equal(torch.random.get_rng_state(), rng)
