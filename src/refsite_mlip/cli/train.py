@@ -118,6 +118,7 @@ def _load_preflight(
     *,
     overrides: TrainingRunConfigOverrides | None = None,
     cli_cwd: str | os.PathLike[str] | None = None,
+    stage: Callable[[str], None] | None = None,
 ) -> tuple[
     TrainingRunConfig,
     ResolvedTrainingRun | ResolvedScratchTrainingRun | ScratchTrainingPreparation,
@@ -129,6 +130,8 @@ def _load_preflight(
     except TrainingRunConfigError as error:
         _raise_cli_preflight(error, path, error_type=CLIConfigPreflightError)
     if isinstance(config.model_source, ScratchModelSourceConfig):
+        if stage is not None:
+            stage("preparing data and reference templates")
         try:
             resolved = prepare_scratch_training_run(config)
         except TrainingRunConfigError as error:
@@ -139,6 +142,8 @@ def _load_preflight(
             )
             raise converted from error
     else:
+        if stage is not None:
+            stage("preparing data and model bundle")
         try:
             resolved = resolve_training_run(config)
         except TrainingRunConfigError as error:
@@ -647,6 +652,24 @@ def _failed_status(
     return json.loads(canonical_runtime_json(status))
 
 
+def _attach_progress_context(
+    error: CLIError,
+    details: Mapping[str, Any],
+) -> CLIError:
+    """Retain non-semantic recovery facts for terminal presentation only."""
+
+    for name in (
+        "completed_epochs",
+        "global_step",
+        "recoverable_checkpoint",
+        "recoverable_initial_bundle",
+    ):
+        value = details.get(name)
+        if value is not None and getattr(error, name, None) is None:
+            setattr(error, name, value)
+    return error
+
+
 def _execution_cli_error(
     error: BaseException,
     config: TrainingRunConfig,
@@ -654,9 +677,9 @@ def _execution_cli_error(
     details: Mapping[str, Any],
 ) -> CLIError:
     if isinstance(error, CLIError):
-        return error
+        return _attach_progress_context(error, details)
     if isinstance(error, RunDirectoryError):
-        return CLIError(
+        return _attach_progress_context(CLIError(
             error.reason_code,
             "training runtime metadata operation failed",
             stage=error.stage,
@@ -665,10 +688,10 @@ def _execution_cli_error(
             rollback_performed=details.get("rollback_performed"),
             underlying_reason_code=error.reason_code,
             original_error=error,
-        )
+        ), details)
     reason = _nested_reason(error) or "TRAINING_EXECUTION_FAILED"
     prediction_stage = _nested_text_attribute(error, "stage")
-    return CLIError(
+    return _attach_progress_context(CLIError(
         reason,
         "training run failed; completed checkpoints and updates were retained",
         stage=f"training.{details.get('failure_phase') or 'runtime'}",
@@ -685,7 +708,7 @@ def _execution_cli_error(
         predictor_reason_code=(reason if prediction_stage is not None else None),
         underlying_reason_code=reason,
         original_error=error,
-    )
+    ), details)
 
 
 def _nested_exception_is_interrupt(error: BaseException) -> bool:
@@ -778,7 +801,7 @@ def _scratch_execution_cli_error(
     epoch_index = _scratch_error_attribute(
         error, "epoch_index", "completed_epochs"
     )
-    return error_type(
+    converted = error_type(
         reason,
         message,
         stage=stage,
@@ -802,6 +825,21 @@ def _scratch_execution_cli_error(
         solver_path=TRAIN_FIXED,
         underlying_reason_code=underlying,
         original_error=error,
+    )
+    return _attach_progress_context(
+        converted,
+        {
+            "completed_epochs": _scratch_error_attribute(
+                error, "completed_epochs"
+            ),
+            "global_step": _scratch_error_attribute(error, "global_step"),
+            "recoverable_checkpoint": _scratch_error_attribute(
+                error, "recoverable_checkpoint"
+            ),
+            "recoverable_initial_bundle": _scratch_error_attribute(
+                error, "recoverable_initial_bundle"
+            ),
+        },
     )
 
 
@@ -850,6 +888,305 @@ def _reload_effective_config_for_toctou(
     return current
 
 
+def _parameter_summary(model: torch.nn.Module) -> tuple[int, int]:
+    """Snapshot parameter cardinality without retaining any live tensor."""
+
+    parameters = tuple(model.parameters())
+    return len(parameters), sum(int(parameter.numel()) for parameter in parameters)
+
+
+def _composition_key(entry: Mapping[str, Any]) -> tuple[tuple[int, int], ...]:
+    species = entry.get("species")
+    if not isinstance(species, (tuple, list)):
+        raise TypeError("composition species must be a sequence")
+    return tuple(
+        sorted(
+            (
+                int(item["atomic_number"]),
+                int(item["count"]),
+            )
+            for item in species
+        )
+    )
+
+
+def _composition_name(composition: tuple[tuple[int, int], ...]) -> str:
+    # ASE is already a direct runtime dependency.  Use its canonical element
+    # symbols only for presentation; no chemistry or training state is derived
+    # here.
+    from ase.data import chemical_symbols
+
+    def symbol(atomic_number: int) -> str:
+        if (
+            0 < atomic_number < len(chemical_symbols)
+            and chemical_symbols[atomic_number]
+        ):
+            return chemical_symbols[atomic_number]
+        return f"Z{atomic_number}"
+
+    return " ".join(
+        f"{symbol(atomic_number)}{count}"
+        for atomic_number, count in composition
+    )
+
+
+def _composition_summary(
+    train: Any,
+    validation: Any,
+) -> tuple[tuple[str, int, int], ...]:
+    def counts(values: Any) -> dict[tuple[tuple[int, int], ...], int]:
+        result: dict[tuple[tuple[int, int], ...], int] = {}
+        for item in values:
+            if not isinstance(item, Mapping):
+                raise TypeError("composition statistics entries must be mappings")
+            key = _composition_key(item)
+            result[key] = result.get(key, 0) + int(item["frame_count"])
+        return result
+
+    train_counts = counts(train)
+    validation_counts = counts(validation)
+    return tuple(
+        (
+            _composition_name(key),
+            train_counts.get(key, 0),
+            validation_counts.get(key, 0),
+        )
+        for key in sorted(set(train_counts) | set(validation_counts))
+    )
+
+
+def _label_presence(
+    train: Mapping[str, Any],
+    validation: Mapping[str, Any],
+) -> tuple[tuple[str, int, int, int, int], ...]:
+    return tuple(
+        (
+            display_term,
+            int(train[source_term]["present_frames"]),
+            int(train[source_term]["missing_frames"]),
+            int(validation[source_term]["present_frames"]),
+            int(validation[source_term]["missing_frames"]),
+        )
+        for display_term, source_term in (
+            ("energy", "energy"),
+            ("force", "forces"),
+            ("stress", "stress"),
+        )
+    )
+
+
+def _baseline_presentation(
+    config: TrainingRunConfig,
+    metadata: Mapping[str, Any],
+) -> tuple[bool, tuple[float, ...], str, str]:
+    enabled = bool(metadata.get("enabled", config.baseline is not None))
+    if not enabled:
+        return False, (), "n/a", "disabled"
+    if config.baseline is None:
+        raise ValueError("enabled baseline metadata requires baseline config")
+    values = tuple(float(value) for value in metadata.get("baseline_energies", ()))
+    rank_deficient = bool(metadata.get("rank_deficient", False))
+    status = "rank_deficient" if rank_deficient else "full_rank"
+    return True, values, config.baseline.rank_policy, status
+
+
+def _start_summary(
+    *,
+    config: TrainingRunConfig,
+    source_kind: str,
+    model: torch.nn.Module,
+    device: str,
+    dtype: str,
+    initialization_seed: int | None,
+    species_vocabulary: tuple[int, ...],
+    templates: tuple[tuple[str, int], ...],
+    default_template_id: str,
+    train_frame_count: int,
+    validation_frame_count: int,
+    train_batch_count: int,
+    validation_batch_count: int,
+    template_frame_counts: tuple[tuple[str, int, int], ...],
+    composition_summary: tuple[tuple[str, int, int], ...],
+    label_presence: tuple[tuple[str, int, int, int, int], ...],
+    baseline_metadata: Mapping[str, Any],
+    initial_bundle_fingerprint: str,
+    train_semantic_digest: str,
+    validation_semantic_digest: str,
+    output_directory: str,
+) -> Any:
+    from .training_progress import TrainingStartSummary
+
+    parameter_tensors, parameter_elements = _parameter_summary(model)
+    baseline_enabled, baseline_values, rank_policy, baseline_status = (
+        _baseline_presentation(config, baseline_metadata)
+    )
+    radii = config.radii.derived
+    return TrainingStartSummary(
+        run_name=Path(output_directory).name,
+        source_kind=source_kind,
+        device=device,
+        dtype=dtype,
+        training_seed=config.runtime.seed,
+        initialization_seed=initialization_seed,
+        parameter_tensor_count=parameter_tensors,
+        parameter_element_count=parameter_elements,
+        species_vocabulary=tuple(species_vocabulary),
+        templates=tuple(sorted(templates)),
+        default_template_id=default_template_id,
+        train_frame_count=train_frame_count,
+        validation_frame_count=validation_frame_count,
+        train_batch_count=train_batch_count,
+        validation_batch_count=validation_batch_count,
+        train_batch_size=config.data.batch_size,
+        validation_batch_size=config.data.effective_validation_batch_size,
+        template_frame_counts=tuple(sorted(template_frame_counts)),
+        composition_summary=composition_summary,
+        label_presence=label_presence,
+        r_ot=config.radii.r_ot,
+        r_mp=config.radii.r_mp,
+        r_candidate_ot=radii.r_candidate_ot,
+        r_candidate_mp=radii.r_candidate_mp,
+        ot_backend=model.config.transport_support.backend,
+        solver_path="TRAIN_FIXED",
+        baseline_enabled=baseline_enabled,
+        baseline_values=baseline_values,
+        baseline_rank_policy=rank_policy,
+        baseline_status=baseline_status,
+        loss_terms=(
+            ("energy", config.loss.energy_weight, config.loss.energy_scale),
+            ("force", config.loss.force_weight, config.loss.force_scale),
+            ("stress", config.loss.stress_weight, config.loss.stress_scale),
+        ),
+        optimizer_kind=config.optimizer.optimizer,
+        initial_learning_rate=config.optimizer.learning_rate,
+        weight_decay=config.optimizer.weight_decay,
+        scheduler_kind=config.scheduler.kind,
+        scheduler_monitor=config.scheduler.monitor,
+        scheduler_mode=config.scheduler.mode,
+        max_epochs=config.fit.max_epochs,
+        early_stop_patience=config.selection.early_stopping_patience,
+        output_directory=output_directory,
+        initial_bundle_fingerprint=initial_bundle_fingerprint,
+        train_semantic_digest=train_semantic_digest,
+        validation_semantic_digest=validation_semantic_digest,
+    )
+
+
+def _bundle_training_start_summary(
+    config: TrainingRunConfig,
+    resolved: ResolvedTrainingRun,
+    prepared: _PreparedTrainingRuntime,
+    baseline: Mapping[str, Any],
+) -> Any:
+    templates = tuple(
+        (
+            binding.template_id,
+            int(binding.structural_artifact.diagnostics.num_sites),
+        )
+        for binding in prepared.bundle.template_bindings
+    )
+    template_ids = tuple(template_id for template_id, _ in templates)
+    return _start_summary(
+        config=config,
+        source_kind="bundle",
+        model=prepared.loaded.model,
+        device=resolved.resolved_device,
+        dtype=resolved.resolved_dtype,
+        initialization_seed=None,
+        species_vocabulary=resolved.species_vocabulary,
+        templates=templates,
+        default_template_id=prepared.bundle.default_template_id,
+        train_frame_count=resolved.train_frame_count,
+        validation_frame_count=resolved.validation_frame_count,
+        train_batch_count=resolved.train_batch_count,
+        validation_batch_count=resolved.validation_batch_count,
+        template_frame_counts=tuple(
+            (
+                template_id,
+                int(resolved.train_template_frame_counts.get(template_id, 0)),
+                int(resolved.validation_template_frame_counts.get(template_id, 0)),
+            )
+            for template_id in sorted(template_ids)
+        ),
+        composition_summary=_composition_summary(
+            resolved.train_composition_statistics,
+            resolved.validation_composition_statistics,
+        ),
+        label_presence=_label_presence(
+            resolved.train_label_statistics,
+            resolved.validation_label_statistics,
+        ),
+        baseline_metadata=baseline,
+        initial_bundle_fingerprint=resolved.bundle_fingerprint,
+        train_semantic_digest=resolved.train_semantic_digest,
+        validation_semantic_digest=resolved.validation_semantic_digest,
+        output_directory=str(resolved.runtime_paths["output_directory"]),
+    )
+
+
+def _scratch_manifest_template_counts(
+    preparation: ScratchTrainingPreparation,
+) -> tuple[tuple[str, int, int], ...]:
+    def split_counts(name: str) -> dict[str, int]:
+        result: dict[str, int] = {}
+        for item in preparation.data_manifest[name]["samples"]:
+            template_id = str(item["template_id"])
+            result[template_id] = result.get(template_id, 0) + 1
+        return result
+
+    train = split_counts("train")
+    validation = split_counts("validation")
+    return tuple(
+        (template_id, train.get(template_id, 0), validation.get(template_id, 0))
+        for template_id in sorted(set(train) | set(validation))
+    )
+
+
+def _scratch_training_start_summary(
+    config: TrainingRunConfig,
+    preparation: ScratchTrainingPreparation,
+    startup: Any,
+) -> Any:
+    templates = tuple(
+        (
+            template_id,
+            int(preparation.template_fingerprints[template_id]["num_sites"]),
+        )
+        for template_id in sorted(preparation.template_fingerprints)
+    )
+    return _start_summary(
+        config=config,
+        source_kind="scratch",
+        model=startup.model,
+        device=preparation.resolved_device,
+        dtype=preparation.resolved_dtype,
+        initialization_seed=startup.initialization_seed,
+        species_vocabulary=preparation.species_vocabulary,
+        templates=templates,
+        default_template_id=startup.initial_bundle.default_template_id,
+        train_frame_count=int(preparation.data_manifest["train"]["frame_count"]),
+        validation_frame_count=int(
+            preparation.data_manifest["validation"]["frame_count"]
+        ),
+        train_batch_count=len(startup.train_batches),
+        validation_batch_count=len(startup.validation_batches),
+        template_frame_counts=_scratch_manifest_template_counts(preparation),
+        composition_summary=_composition_summary(
+            preparation.train_composition_statistics,
+            preparation.validation_composition_statistics,
+        ),
+        label_presence=_label_presence(
+            preparation.train_label_statistics,
+            preparation.validation_label_statistics,
+        ),
+        baseline_metadata=startup.baseline_metadata,
+        initial_bundle_fingerprint=startup.initial_bundle_fingerprint,
+        train_semantic_digest=preparation.train_semantic_digest,
+        validation_semantic_digest=preparation.validation_semantic_digest,
+        output_directory=str(startup.run_directory.root),
+    )
+
+
 def _execute_training(
     config: TrainingRunConfig,
     resolved: ResolvedTrainingRun,
@@ -857,6 +1194,7 @@ def _execute_training(
     lock: ResumeRunLock,
     *,
     progress: Callable[[str], None] | None,
+    progress_renderer: Any | None,
     overrides: TrainingRunConfigOverrides | None,
     cli_cwd: str | os.PathLike[str],
 ) -> dict[str, Any]:
@@ -921,6 +1259,13 @@ def _execute_training(
             initial_bundle_fingerprint=resolved.bundle_fingerprint,
         )
         journal = MetricsJournal(directory, lock, provenance)
+        if progress_renderer is not None:
+            progress_renderer.render_start_from(
+                lambda: _bundle_training_start_summary(
+                    config, resolved, prepared, baseline
+                )
+            )
+            progress_renderer.render_stage("training started")
         if progress is not None:
             progress(
                 "training started: "
@@ -930,6 +1275,13 @@ def _execute_training(
             )
         phase = "fit"
         training_executed = True
+        epoch_observer = journal
+        if progress_renderer is not None:
+            from .training_progress import journal_then_progress_observer
+
+            epoch_observer = journal_then_progress_observer(
+                journal, progress_renderer
+            )
         result = run_checkpointed_fit(
             prepared.loaded.model,
             optimizer,
@@ -948,7 +1300,7 @@ def _execute_training(
             checkpoint_metadata,
             config.checkpointed_fit,
             epoch_metrics_provenance=provenance,
-            epoch_metrics_observer=journal,
+            epoch_metrics_observer=epoch_observer,
         )
         status = _completed_status(
             config, resolved, result, baseline, journal
@@ -977,7 +1329,7 @@ def _execute_training(
         )
         stored_error = _write_failure_status(directory, status, error)
         details = status
-        raise CLIInterruptedError(
+        interrupted_error = CLIInterruptedError(
             "TRAINING_INTERRUPTED",
             "training was interrupted; recoverable completed checkpoints were retained",
             stage=f"training.{details['failure_phase']}",
@@ -992,7 +1344,8 @@ def _execute_training(
             solver_path=TRAIN_FIXED,
             underlying_reason_code="KEYBOARD_INTERRUPT",
             original_error=stored_error,
-        ) from error
+        )
+        raise _attach_progress_context(interrupted_error, details) from error
     except Exception as error:
         status = _failed_status(
             "failed",
@@ -1012,11 +1365,12 @@ def _execute_training(
         ) from error
 
 
-def run_training(
+def _run_training_impl(
     path: str | os.PathLike[str],
     *,
     dry_run: bool = False,
     progress: Callable[[str], None] | None = None,
+    progress_renderer: Any | None = None,
     overrides: TrainingRunConfigOverrides | None = None,
     cli_cwd: str | os.PathLike[str] | None = None,
 ) -> (
@@ -1029,11 +1383,18 @@ def run_training(
 
     if type(dry_run) is not bool:
         raise TypeError("dry_run must be a bool")
+    if progress_renderer is not None:
+        progress_renderer.render_stage("loading training configuration")
     effective_cli_cwd = Path.cwd() if cli_cwd is None else Path(cli_cwd)
     config, resolved = _load_preflight(
         path,
         overrides=overrides,
         cli_cwd=effective_cli_cwd,
+        stage=(
+            None
+            if progress_renderer is None
+            else progress_renderer.render_stage
+        ),
     )
     if dry_run:
         return resolved
@@ -1046,10 +1407,30 @@ def run_training(
         )
 
         try:
+            if progress_renderer is not None:
+                progress_renderer.render_stage("initializing training run")
+
+            def observe_startup(startup: Any) -> None:
+                if progress_renderer is None:
+                    return
+                progress_renderer.render_start_from(
+                    lambda: _scratch_training_start_summary(
+                        config, resolved, startup
+                    )
+                )
+                progress_renderer.render_stage("training started")
+
+            scratch_presentation: dict[str, Any] = {}
+            if progress_renderer is not None:
+                scratch_presentation.update(
+                    startup_observer=observe_startup,
+                    committed_epoch_observer=progress_renderer,
+                )
             result = run_scratch_checkpointed_training(
                 config,
                 resolved,
                 progress=progress,
+                **scratch_presentation,
             )
         except KeyboardInterrupt as error:
             retained = getattr(error, "scratch_training_error", error)
@@ -1081,6 +1462,8 @@ def run_training(
             underlying_reason_code="SCRATCH_FULL_PREFLIGHT_REQUIRED",
         )
 
+    if progress_renderer is not None:
+        progress_renderer.render_stage("initializing training run")
     seed_training_runtime(config.runtime.seed)
     output = Path(str(resolved.runtime_paths["output_directory"]))
     try:
@@ -1109,6 +1492,7 @@ def run_training(
                 directory,
                 lock,
                 progress=progress,
+                progress_renderer=progress_renderer,
                 overrides=overrides,
                 cli_cwd=effective_cli_cwd,
             )
@@ -1121,6 +1505,121 @@ def run_training(
             resolved,
             {"failure_phase": "run_directory.lock", "rollback_performed": False},
         ) from error
+
+
+def _terminal_basename(value: Any) -> str | None:
+    return None if value is None else Path(str(value)).name
+
+
+def _nested_value(error: BaseException, name: str) -> Any:
+    current: BaseException | None = error
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        value = getattr(current, name, None)
+        if value is not None:
+            return value
+        current = current.__cause__ or current.__context__
+    return None
+
+
+def _render_terminal_result(progress_renderer: Any, report: Mapping[str, Any]) -> None:
+    fit = report.get("fit_result")
+    fit = fit if isinstance(fit, Mapping) else {}
+    stopped_early = bool(fit.get("stopped_early", False))
+    status = "early_stopped" if stopped_early else "completed"
+    progress_renderer.render_terminal(
+        status,
+        epochs=int(report.get("completed_epochs", 0)),
+        global_step=int(report.get("global_step", 0)),
+        best_epoch=(
+            None if fit.get("best_epoch") is None else int(fit["best_epoch"])
+        ),
+        best_value=(
+            None if fit.get("best_metric") is None else float(fit["best_metric"])
+        ),
+        latest_checkpoint=_terminal_basename(report.get("latest_checkpoint")),
+        reason=(None if fit.get("stop_reason") is None else str(fit["stop_reason"])),
+        recoverable=_terminal_basename(report.get("recoverable_checkpoint")),
+    )
+
+
+def _render_terminal_error(progress_renderer: Any, error: BaseException) -> None:
+    interrupted = isinstance(error, (KeyboardInterrupt, CLIInterruptedError))
+    status = "interrupted" if interrupted else "failed"
+    completed = _nested_value(error, "completed_epochs")
+    epoch_index = _nested_value(error, "epoch_index")
+    global_step = _nested_value(error, "global_step")
+    phase = _nested_value(error, "failure_phase") or _nested_value(
+        error, "stage"
+    )
+    recoverable = _nested_value(error, "recoverable_checkpoint")
+    if recoverable is None:
+        recoverable = _nested_value(error, "recoverable_initial_bundle")
+    # Epoch indices in structured runtime failures are persisted 0-based,
+    # while console epoch numbers are consistently human-facing and 1-based.
+    # Preflight/startup failures have no epoch index and retain the completed
+    # epoch count (normally zero).
+    displayed_epoch = (
+        max(0, int(epoch_index)) + 1
+        if epoch_index is not None
+        else (0 if completed is None else max(0, int(completed)))
+    )
+    progress_renderer.render_terminal(
+        status,
+        epochs=displayed_epoch,
+        global_step=0 if global_step is None else max(0, int(global_step)),
+        phase=None if phase is None else str(phase),
+        recoverable=_terminal_basename(recoverable),
+    )
+
+
+def run_training(
+    path: str | os.PathLike[str],
+    *,
+    dry_run: bool = False,
+    progress: Callable[[str], None] | None = None,
+    progress_renderer: Any | None = None,
+    overrides: TrainingRunConfigOverrides | None = None,
+    cli_cwd: str | os.PathLike[str] | None = None,
+) -> (
+    ResolvedTrainingRun
+    | ResolvedScratchTrainingRun
+    | ScratchTrainingPreparation
+    | dict[str, Any]
+):
+    """Run training while keeping progress presentation non-semantic."""
+
+    try:
+        result = _run_training_impl(
+            path,
+            dry_run=dry_run,
+            progress=progress,
+            progress_renderer=progress_renderer,
+            overrides=overrides,
+            cli_cwd=cli_cwd,
+        )
+    except BaseException as error:
+        if progress_renderer is not None:
+            try:
+                _render_terminal_error(progress_renderer, error)
+            except Exception as presentation_error:
+                # Presentation is never allowed to replace the primary
+                # training/configuration/interrupt failure.
+                setattr(error, "training_progress_error", presentation_error)
+        raise
+    if (
+        progress_renderer is not None
+        and not dry_run
+        and isinstance(result, Mapping)
+    ):
+        try:
+            _render_terminal_result(progress_renderer, result)
+        except Exception:
+            # A malformed or unavailable console must not retroactively turn a
+            # successfully checkpointed run into a failure.
+            pass
+    return result
 
 
 def render_training_json(report: Mapping[str, Any]) -> str:

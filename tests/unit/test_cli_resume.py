@@ -56,12 +56,20 @@ def _ready_report():
 def test_resume_parser_requires_positive_max_epochs():
     parser = build_parser()
     args = parser.parse_args(
-        ["resume", "run", "--max-epochs", "20", "--dry-run", "--json"]
+        [
+            "resume",
+            "run",
+            "--max-epochs",
+            "20",
+            "--dry-run",
+            "--json",
+            "--quiet",
+        ]
     )
     assert args.command == "resume"
     assert args.run_directory == "run"
     assert args.max_epochs == 20
-    assert args.dry_run and args.json_output
+    assert args.dry_run and args.json_output and args.quiet
     with pytest.raises(SystemExit) as caught:
         parser.parse_args(["resume", "run", "--max-epochs", "0"])
     assert caught.value.code == 2
@@ -240,17 +248,26 @@ def test_resume_cli_routes_json_and_interrupt(monkeypatch, capsys):
     report = _ready_report()
     calls = []
 
-    def fake(path, *, max_epochs, dry_run, progress):
-        calls.append((path, max_epochs, dry_run, progress))
+    def fake(path, *, max_epochs, dry_run, progress_renderer):
+        calls.append((path, max_epochs, dry_run, progress_renderer))
         return report
 
     monkeypatch.setattr(module, "resume_training", fake)
     assert main(
-        ["resume", "run", "--max-epochs", "3", "--dry-run", "--json"]
+        [
+            "resume",
+            "run",
+            "--max-epochs",
+            "3",
+            "--dry-run",
+            "--json",
+            "--quiet",
+        ]
     ) == 0
     captured = capsys.readouterr()
     assert json.loads(captured.out) == report and captured.err == ""
     assert calls[0][:3] == ("run", 3, True)
+    assert calls[0][3].config.enabled is False
 
     def interrupted(*args, **kwargs):
         del args, kwargs

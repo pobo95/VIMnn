@@ -24,6 +24,8 @@ from ._scratch_run_metadata import scratch_runtime_template_fingerprints
 from .checkpoint_manager import CheckpointManager, CheckpointManagerConfig
 from .checkpointed_fit import CheckpointedFitResult, run_checkpointed_fit
 from .metrics_journal import (
+    CommittedEpochMetrics,
+    EpochMetricsObserver,
     MetricsJournal,
     MetricsJournalError,
     committed_epoch_provenance_from_checkpoint_metadata,
@@ -749,6 +751,8 @@ def _validate_inputs(
     preparation: ScratchTrainingPreparation,
     progress: Callable[[str], None] | None,
     event_callback: Callable[[str], None] | None,
+    startup_observer: Callable[[ScratchTrainingStartup], None] | None,
+    committed_epoch_observer: EpochMetricsObserver | None,
 ) -> Path:
     # Import lazily: training-run configuration reuses training dataclasses,
     # so importing it while ``refsite_mlip.training`` is initializing would
@@ -775,6 +779,12 @@ def _validate_inputs(
         raise TypeError("progress must be callable or None")
     if event_callback is not None and not callable(event_callback):
         raise TypeError("event_callback must be callable or None")
+    if startup_observer is not None and not callable(startup_observer):
+        raise TypeError("startup_observer must be callable or None")
+    if committed_epoch_observer is not None and not callable(
+        committed_epoch_observer
+    ):
+        raise TypeError("committed_epoch_observer must be callable or None")
     if config.config_fingerprint != preparation.config_fingerprint:
         raise ValueError("config fingerprint differs from scratch preparation")
     if config.to_dict() != preparation.config.to_dict():
@@ -854,11 +864,20 @@ def run_scratch_checkpointed_training(
     *,
     progress: Callable[[str], None] | None = None,
     event_callback: Callable[[str], None] | None = None,
+    startup_observer: Callable[[ScratchTrainingStartup], None] | None = None,
+    committed_epoch_observer: EpochMetricsObserver | None = None,
 ) -> ScratchCheckpointedTrainingResult:
     """Run one fresh scratch fit without duplicating the epoch loop."""
 
     try:
-        output = _validate_inputs(config, preparation, progress, event_callback)
+        output = _validate_inputs(
+            config,
+            preparation,
+            progress,
+            event_callback,
+            startup_observer,
+            committed_epoch_observer,
+        )
     except Exception as error:
         raise _error_from(
             "validation",
@@ -988,6 +1007,21 @@ def run_scratch_checkpointed_training(
         )
         journal = MetricsJournal(directory, lock, provenance)
 
+        # Presentation is deliberately downstream of durable startup and is
+        # handed an immutable-facing runtime snapshot only.  The committed
+        # epoch observer below is ordered after the journal, so a journal
+        # failure can never be rendered as a successfully recorded epoch.
+        if startup_observer is not None:
+            startup_observer(startup)
+
+        epoch_observer: EpochMetricsObserver = journal
+        if committed_epoch_observer is not None:
+            def journal_then_observer(event: CommittedEpochMetrics) -> None:
+                journal(event)
+                committed_epoch_observer(event)
+
+            epoch_observer = journal_then_observer
+
         if progress is not None:
             progress(
                 "scratch training started: "
@@ -1018,7 +1052,7 @@ def run_scratch_checkpointed_training(
             checkpoint_metadata,
             config.checkpointed_fit,
             epoch_metrics_provenance=provenance,
-            epoch_metrics_observer=journal,
+            epoch_metrics_observer=epoch_observer,
         )
         phase = "event.after_fit"
         _emit(event_callback, "after_fit")

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib
+import io
 import json
 import os
 from pathlib import Path
@@ -20,6 +21,7 @@ from refsite_mlip.cli.export_bundle import ExportBundleConfig, export_bundle
 from refsite_mlip.cli.main import main
 from refsite_mlip.cli.resume import resume_training
 from refsite_mlip.cli.train import run_training
+from refsite_mlip.cli.training_progress import TrainingProgressRenderer
 from refsite_mlip.config import load_training_run_config
 from refsite_mlip.models import load_reference_site_model_bundle
 from refsite_mlip.training import (
@@ -323,13 +325,24 @@ def test_scratch_continuous_two_epochs_equals_one_plus_exact_resume(tmp_path):
     first = run_scratch_checkpointed_training(split_config, split_preparation)
     first_epoch = Path(first.latest_path).with_name("epoch_000000.pt")
     first_epoch_bytes = first_epoch.read_bytes()
+    resume_stream = io.StringIO()
+    resume_clock = iter((100.0, 102.0))
     resumed = resume_training(
-        split_preparation.runtime_paths["output_directory"], max_epochs=2
+        split_preparation.runtime_paths["output_directory"],
+        max_epochs=2,
+        progress_renderer=TrainingProgressRenderer(
+            stream=resume_stream,
+            monotonic=lambda: next(resume_clock),
+        ),
     )
     resumed_checkpoint = load_training_checkpoint(resumed["latest_checkpoint"])
     resumed_draws = _next_rng_draws()
 
     assert resumed["source_kind"] == "scratch"
+    resume_output = resume_stream.getvalue()
+    assert "Source: scratch (resumed)" in resume_output
+    assert "Epoch 002/2" in resume_output
+    assert "Epoch 001/2" not in resume_output
     assert resumed["initial_bundle_fingerprint"] == (
         first.startup.initial_bundle_fingerprint
     )
@@ -638,6 +651,7 @@ def test_metrics_journal_failure_preserves_committed_checkpoint_and_status(
     )
     output = Path(preparation.runtime_paths["output_directory"])
     observed_epochs: list[int] = []
+    rendered_epochs: list[int] = []
 
     def fail_after_checkpoint(self, event):
         observed_epochs.append(event.epoch_index)
@@ -655,10 +669,17 @@ def test_metrics_journal_failure_preserves_committed_checkpoint_and_status(
 
     monkeypatch.setattr(MetricsJournal, "append", fail_after_checkpoint)
     with pytest.raises(ScratchCheckpointedTrainingError) as caught:
-        run_scratch_checkpointed_training(config, preparation)
+        run_scratch_checkpointed_training(
+            config,
+            preparation,
+            committed_epoch_observer=(
+                lambda event: rendered_epochs.append(event.epoch_index)
+            ),
+        )
 
     error = caught.value
     assert observed_epochs == [0]
+    assert rendered_epochs == []
     assert error.stage == "metrics_journal"
     assert error.reason_code == "INJECTED_METRICS_JOURNAL_FAILURE"
     assert error.completed_epochs == 1
@@ -769,7 +790,10 @@ def test_cli_positional_and_config_alias_execute_scratch_training(tmp_path, caps
     positional = capsys.readouterr()
     positional_report = json.loads(positional.out)
     assert positional_report["status"] == "completed"
-    assert "scratch training started" in positional.err
+    assert "refsite-mlip: training started" in positional.err
+    assert "Reference-site MLIP training" in positional.err
+    assert "Source: scratch" in positional.err
+    assert "Epoch 001/1" in positional.err
     first_checkpoint = load_training_checkpoint(
         positional_report["latest_checkpoint"]
     )
@@ -784,7 +808,7 @@ def test_cli_positional_and_config_alias_execute_scratch_training(tmp_path, caps
     option = capsys.readouterr()
     option_report = json.loads(option.out)
     assert option_report["status"] == "completed"
-    assert "scratch training started" in option.err
+    assert "refsite-mlip: training started" in option.err
     second_checkpoint = load_training_checkpoint(
         option_report["latest_checkpoint"]
     )
@@ -843,7 +867,7 @@ def test_python_module_config_alias_executes_scratch_training(tmp_path):
     assert completed.returncode == 0, completed.stderr
     report = json.loads(completed.stdout)
     assert report["status"] == "completed"
-    assert "scratch training started" in completed.stderr
+    assert "refsite-mlip: training started" in completed.stderr
     assert Path(report["latest_checkpoint"]).is_file()
     assert not Path(preparation.runtime_paths["output_directory"]).joinpath(
         ".resume.lock"

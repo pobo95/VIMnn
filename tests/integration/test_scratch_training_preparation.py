@@ -1087,7 +1087,10 @@ def test_cli_validate_and_train_dry_run_share_preparation_and_never_execute(
 
     assert main(["train", str(config_path), "--dry-run", "--json"]) == 0
     dry_run = capsys.readouterr()
-    assert dry_run.err == ""
+    assert dry_run.err == (
+        "refsite-mlip: loading training configuration\n"
+        "refsite-mlip: preparing data and reference templates\n"
+    )
     assert json.loads(dry_run.out) == validated_report
 
     assert not (tmp_path / "scratch-output").exists()

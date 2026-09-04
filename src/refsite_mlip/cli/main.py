@@ -372,6 +372,11 @@ def build_parser() -> argparse.ArgumentParser:
         dest="json_output",
         help="emit only deterministic final JSON on stdout",
     )
+    train.add_argument(
+        "--quiet",
+        action="store_true",
+        help="suppress presentation-only training progress on stderr",
+    )
     _add_debug_argument(train, hidden=True)
     train.set_defaults(command_handler=_run_train)
 
@@ -404,6 +409,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         dest="json_output",
         help="emit only deterministic final JSON on stdout",
+    )
+    resume.add_argument(
+        "--quiet",
+        action="store_true",
+        help="suppress presentation-only training progress on stderr",
     )
     _add_debug_argument(resume, hidden=True)
     resume.set_defaults(command_handler=_run_resume)
@@ -576,16 +586,16 @@ def _run_train(args: argparse.Namespace) -> int:
         render_train_result_json,
         run_training,
     )
+    from .training_progress import TrainingProgressConfig, TrainingProgressRenderer
 
-    progress = None
-    if not args.dry_run:
-        progress = lambda message: print(
-            f"refsite-mlip: {message}", file=sys.stderr
-        )
+    progress_renderer = TrainingProgressRenderer(
+        TrainingProgressConfig(enabled=not args.quiet),
+        stream=sys.stderr,
+    )
     result = run_training(
         _training_config_path(args),
         dry_run=args.dry_run,
-        progress=progress,
+        progress_renderer=progress_renderer,
         overrides=_training_config_overrides(args),
     )
     output = (
@@ -603,17 +613,17 @@ def _run_resume(args: argparse.Namespace) -> int:
         render_resume_json,
         resume_training,
     )
+    from .training_progress import TrainingProgressConfig, TrainingProgressRenderer
 
-    progress = None
-    if not args.dry_run:
-        progress = lambda message: print(
-            f"refsite-mlip: {message}", file=sys.stderr
-        )
+    progress_renderer = TrainingProgressRenderer(
+        TrainingProgressConfig(enabled=not args.quiet),
+        stream=sys.stderr,
+    )
     result = resume_training(
         args.run_directory,
         max_epochs=args.max_epochs,
         dry_run=args.dry_run,
-        progress=progress,
+        progress_renderer=progress_renderer,
     )
     output = (
         render_resume_json(result)

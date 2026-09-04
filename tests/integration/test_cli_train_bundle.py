@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import importlib
+import io
 import json
 from pathlib import Path
+import random
 
+import numpy as np
 import pytest
 import torch
 
@@ -17,6 +20,10 @@ from refsite_mlip.cli.train import (
     render_train_result_json,
     run_training,
     seed_training_runtime,
+)
+from refsite_mlip.cli.training_progress import (
+    TrainingProgressConfig,
+    TrainingProgressRenderer,
 )
 from refsite_mlip.cli.validate_train_config import validate_train_config
 from refsite_mlip.config import (
@@ -88,7 +95,10 @@ def test_train_dry_run_exact_validate_parity_and_no_execution(
     assert main(["train", str(config_path), "--dry-run", "--json"]) == 0
     trained = capsys.readouterr()
     assert trained.out == validated.out
-    assert trained.err == ""
+    assert trained.err == (
+        "refsite-mlip: loading training configuration\n"
+        "refsite-mlip: preparing data and model bundle\n"
+    )
     assert json.loads(trained.out)["runtime"]["seed"] == 17
     assert not (tmp_path / "run-output").exists()
 
@@ -109,7 +119,7 @@ def test_synthetic_cpu_float64_one_epoch_writes_recoverable_state(
     report = json.loads(captured.out)
     assert captured.out.count("\n") == 1
     assert "training started" in captured.err
-    assert "training completed" in captured.err
+    assert "Training completed" in captured.err
     assert report["status"] == "completed"
     assert report["training_executed"] is True
     assert report["seed"] == 17
@@ -164,6 +174,80 @@ def test_synthetic_cpu_float64_one_epoch_writes_recoverable_state(
     assert config_path.read_bytes() == config_before
     assert training_bundle["path"].read_bytes() == bundle_before
     assert (train_path.read_bytes(), validation_path.read_bytes()) == inputs_before
+
+
+def test_bundle_progress_summary_and_quiet_are_trajectory_neutral(
+    training_bundle, tmp_path
+):
+    visible_root = tmp_path / "visible"
+    quiet_root = tmp_path / "quiet"
+    visible_root.mkdir()
+    quiet_root.mkdir()
+    config_path, _ = _simple_case(visible_root, training_bundle)
+    _set_epochs(config_path, 1)
+    visible_stream = io.StringIO()
+    times = iter((10.0, 12.5))
+    visible = TrainingProgressRenderer(
+        stream=visible_stream, monotonic=lambda: next(times)
+    )
+    first = run_training(config_path, progress_renderer=visible)
+    first_journal = (visible_root / "run-output" / "metrics.jsonl").read_bytes()
+    first_checkpoint = load_training_checkpoint(first["latest_checkpoint"])
+    first_draws = (random.random(), float(np.random.random()), torch.rand(()).item())
+
+    quiet_path, _ = _simple_case(quiet_root, training_bundle)
+    _set_epochs(quiet_path, 1)
+    quiet_stream = io.StringIO()
+    quiet = TrainingProgressRenderer(
+        TrainingProgressConfig(enabled=False), stream=quiet_stream
+    )
+    second = run_training(quiet_path, progress_renderer=quiet)
+    second_journal = (quiet_root / "run-output" / "metrics.jsonl").read_bytes()
+    second_checkpoint = load_training_checkpoint(second["latest_checkpoint"])
+    second_draws = (random.random(), float(np.random.random()), torch.rand(()).item())
+
+    rendered = visible_stream.getvalue()
+    assert rendered.count("refsite-mlip: loading training configuration") == 1
+    assert rendered.count("refsite-mlip: preparing data and model bundle") == 1
+    assert rendered.count("refsite-mlip: initializing training run") == 1
+    assert rendered.count("refsite-mlip: training started") == 1
+    assert "Reference-site MLIP training\n" in rendered
+    assert "Source: bundle" in rendered
+    assert "Device: cpu, dtype=float64" in rendered
+    assert "Epoch 001/1" in rendered
+    assert "checkpoint=epoch_000000.pt" in rendered
+    assert "elapsed=2.5s eta=0.0s" in rendered
+    assert rendered.rstrip().endswith("latest=latest.pt")
+    assert quiet_stream.getvalue().startswith("Training completed |")
+    assert "Epoch " not in quiet_stream.getvalue()
+    assert first_journal == second_journal
+    assert first_draws == second_draws
+    assert first["config_fingerprint"] == second["config_fingerprint"]
+    assert first["metrics_semantic_sha256"] == second["metrics_semantic_sha256"]
+    assert first["fit_result"] == second["fit_result"]
+    assert _tree_equal(first_checkpoint.to_dict(), second_checkpoint.to_dict())
+    assert _tree_equal(
+        first_checkpoint.model_state_dict, second_checkpoint.model_state_dict
+    )
+    assert _tree_equal(
+        first_checkpoint.optimizer_state_dict,
+        second_checkpoint.optimizer_state_dict,
+    )
+    assert _tree_equal(
+        first_checkpoint.scheduler_state_dict,
+        second_checkpoint.scheduler_state_dict,
+    )
+    assert first_checkpoint.selection_state == second_checkpoint.selection_state
+    runtime_path_fields = {
+        "latest_checkpoint",
+        "best_checkpoint",
+        "recoverable_checkpoint",
+    }
+    assert {
+        key: value for key, value in first.items() if key not in runtime_path_fields
+    } == {
+        key: value for key, value in second.items() if key not in runtime_path_fields
+    }
 
 
 def test_v2_bundle_source_dry_run_uses_existing_preflight_contract(

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 import hashlib
+import io
 import json
 from pathlib import Path
 import random
@@ -16,6 +17,7 @@ from ase.io import read, write
 from refsite_mlip.cli.main import main
 from refsite_mlip.cli.errors import CLIError, CLIInterruptedError
 from refsite_mlip.cli.resume import resume_training
+from refsite_mlip.cli.training_progress import TrainingProgressRenderer
 from refsite_mlip.cli.train import run_training
 from refsite_mlip.training import (
     CheckpointManager,
@@ -176,7 +178,12 @@ def test_cpu_float64_continuous_three_epoch_equals_train_one_resume_two(
         tmp_path / "validation.xyz",
     )
     read_only_before = tuple(path.read_bytes() for path in read_only_paths)
-    resumed = resume_training(tmp_path / "split-output", max_epochs=3)
+    resume_progress = io.StringIO()
+    resumed = resume_training(
+        tmp_path / "split-output",
+        max_epochs=3,
+        progress_renderer=TrainingProgressRenderer(stream=resume_progress),
+    )
     resumed_checkpoint = load_training_checkpoint(resumed["latest_checkpoint"])
     resumed_draws = (
         random.random(),
@@ -213,6 +220,8 @@ def test_cpu_float64_continuous_three_epoch_equals_train_one_resume_two(
     assert (tmp_path / "continuous-output" / "metrics.jsonl").read_bytes() == (
         tmp_path / "split-output" / "metrics.jsonl"
     ).read_bytes()
+    assert "Epoch 002/3" in resume_progress.getvalue()
+    assert "Epoch 003/3" in resume_progress.getvalue()
     assert not (tmp_path / "split-output" / ".resume.lock").exists()
 
 
@@ -240,7 +249,17 @@ def test_resume_recovers_a_missing_committed_journal_suffix_before_continuing(
     assert not journal_path.exists()
     assert status_path.read_bytes() == status_before_dry_run
 
-    resumed = resume_training(run_directory, max_epochs=2)
+    progress_output = io.StringIO()
+    times = iter((10.0, 12.0))
+    renderer = TrainingProgressRenderer(
+        stream=progress_output,
+        monotonic=lambda: next(times),
+    )
+    resumed = resume_training(
+        run_directory,
+        max_epochs=2,
+        progress_renderer=renderer,
+    )
 
     events = [
         json.loads(line)
@@ -252,6 +271,15 @@ def test_resume_recovers_a_missing_committed_journal_suffix_before_continuing(
     assert resumed["metrics_semantic_sha256"] == hashlib.sha256(
         journal_path.read_bytes()
     ).hexdigest()
+    rendered = progress_output.getvalue()
+    assert "Source: bundle (resumed)" in rendered
+    assert "checkpoint_epoch=1, step=1, requested_epochs=2" in rendered
+    assert "journal_recovered=1" in rendered
+    assert "Epoch 002/2 | step=2" in rendered
+    assert "Epoch 001/2" not in rendered
+    assert "elapsed=2.0s eta=0.0s" in rendered
+    assert "Training completed | epochs=2 step=2" in rendered
+    assert renderer.session_event_count == 1
 
 
 def test_resume_journal_failure_preserves_checkpoint_and_next_resume_recovers(
@@ -274,8 +302,14 @@ def test_resume_journal_failure_preserves_checkpoint_and_next_resume_recovers(
         return real_observer(self, event)
 
     monkeypatch.setattr(MetricsJournal, "__call__", fail_resumed_epoch)
+    progress_output = io.StringIO()
+    renderer = TrainingProgressRenderer(stream=progress_output)
     with pytest.raises(CLIError) as caught:
-        resume_training(run_directory, max_epochs=2)
+        resume_training(
+            run_directory,
+            max_epochs=2,
+            progress_renderer=renderer,
+        )
     assert caught.value.failure_phase == "metrics_journal"
 
     latest = load_training_checkpoint(run_directory / "checkpoints" / "latest.pt")
@@ -287,6 +321,9 @@ def test_resume_journal_failure_preserves_checkpoint_and_next_resume_recovers(
     assert status["completed_epochs"] == 2
     assert status["metrics_event_count"] == 1
     assert status["metrics_last_epoch"] == 0
+    rendered = progress_output.getvalue()
+    assert "Epoch 002/2" not in rendered
+    assert "Training failed | phase=metrics_journal" in rendered
 
     monkeypatch.setattr(MetricsJournal, "__call__", real_observer)
     resumed = resume_training(run_directory, max_epochs=3)
@@ -299,6 +336,40 @@ def test_resume_journal_failure_preserves_checkpoint_and_next_resume_recovers(
     assert [event["epoch_index"] for event in events] == [0, 1, 2]
     assert resumed["completed_epochs"] == 3
     assert resumed["metrics_event_count"] == 3
+
+
+def test_resume_console_broken_pipe_is_nonfatal_after_journal_commit(
+    training_bundle, tmp_path
+):
+    _, run_directory, _ = _fresh_one_epoch(tmp_path, training_bundle)
+
+    class BreakOnEpoch(io.StringIO):
+        def write(self, value):
+            if value.startswith("Epoch "):
+                raise BrokenPipeError("injected closed batch-log pipe")
+            return super().write(value)
+
+    stream = BreakOnEpoch()
+    renderer = TrainingProgressRenderer(stream=stream)
+    resumed = resume_training(
+        run_directory,
+        max_epochs=2,
+        progress_renderer=renderer,
+    )
+
+    assert resumed["status"] == "completed"
+    assert resumed["completed_epochs"] == 2
+    assert resumed["metrics_event_count"] == 2
+    assert renderer.presentation_error is not None
+    assert renderer.presentation_error.original_exception_type == "BrokenPipeError"
+    assert renderer.session_event_count == 0
+    events = (
+        (run_directory / "metrics.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    )
+    assert len(events) == 2
+    assert not (run_directory / ".resume.lock").exists()
 
 
 def test_resume_rejects_nonincrease_lock_and_data_change(
@@ -476,7 +547,9 @@ def test_repeated_resume_epoch_continuity_and_best_update_policy(
     captured = capsys.readouterr()
     second = json.loads(captured.out)
     assert captured.out.count("\n") == 1
-    assert "resume started" in captured.err and "resume completed" in captured.err
+    assert "refsite-mlip: training started" in captured.err
+    assert "Epoch 002/2" in captured.err
+    assert "Training completed | epochs=2 step=2" in captured.err
     second_checkpoint = load_training_checkpoint(second["latest_checkpoint"])
     second_is_best = second_checkpoint.fit_history[-1]["decision"]["is_best"]
     if not second_is_best:
@@ -524,8 +597,13 @@ def test_resume_failure_and_interrupt_preserve_recoverable_latest_and_unlock(
         )
 
     monkeypatch.setattr(module, "run_checkpointed_resumed_fit", failed)
+    failed_output = io.StringIO()
     with pytest.raises(Exception) as caught:
-        resume_training(run_directory, max_epochs=3)
+        resume_training(
+            run_directory,
+            max_epochs=3,
+            progress_renderer=TrainingProgressRenderer(stream=failed_output),
+        )
     assert getattr(caught.value, "failure_phase", None) == "train"
     status = json.loads((run_directory / "run_status.json").read_text())
     assert status["status"] == "failed"
@@ -534,19 +612,35 @@ def test_resume_failure_and_interrupt_preserve_recoverable_latest_and_unlock(
     assert status["rollback_performed"] is False
     assert latest.read_bytes() == latest_before
     assert not (run_directory / ".resume.lock").exists()
+    assert "Training failed | phase=train" in failed_output.getvalue()
 
     monkeypatch.setattr(
         module,
         "run_checkpointed_resumed_fit",
         lambda *args, **kwargs: (_ for _ in ()).throw(KeyboardInterrupt()),
     )
+    interrupted_output = io.StringIO()
+    interrupted_renderer = TrainingProgressRenderer(
+        stream=interrupted_output
+    )
     with pytest.raises(CLIInterruptedError):
-        resume_training(run_directory, max_epochs=3)
+        resume_training(
+            run_directory,
+            max_epochs=3,
+            progress_renderer=interrupted_renderer,
+        )
     status = json.loads((run_directory / "run_status.json").read_text())
     assert status["status"] == "interrupted"
     assert status["recoverable_checkpoint"] == str(latest)
     assert latest.read_bytes() == latest_before
     assert not (run_directory / ".resume.lock").exists()
+    assert interrupted_renderer.presentation_error is None, (
+        interrupted_renderer.presentation_error.original_exception_type,
+        interrupted_renderer.presentation_error.original_exception_message,
+    )
+    assert "Training interrupted | epoch=1 step=1" in (
+        interrupted_output.getvalue()
+    )
 
 
 def test_resume_interrupt_after_new_epoch_reports_new_recoverable_latest(

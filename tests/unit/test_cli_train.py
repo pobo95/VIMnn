@@ -93,10 +93,9 @@ def test_train_cli_json_progress_and_dry_run_wiring(monkeypatch, capsys):
     module = importlib.import_module("refsite_mlip.cli.train")
     calls = []
 
-    def fake_run(path, *, dry_run, progress, overrides):
-        calls.append((path, dry_run, progress is not None, overrides))
-        if progress is not None:
-            progress("synthetic progress")
+    def fake_run(path, *, dry_run, progress_renderer, overrides):
+        calls.append((path, dry_run, progress_renderer.enabled, overrides))
+        progress_renderer.render_stage("synthetic progress")
         return {"status": "completed"}
 
     monkeypatch.setattr(module, "run_training", fake_run)
@@ -115,8 +114,8 @@ def test_train_cli_json_progress_and_dry_run_wiring(monkeypatch, capsys):
     assert main(["train", "run.json", "--dry-run"]) == 0
     captured = capsys.readouterr()
     assert captured.out == "done\n"
-    assert captured.err == ""
-    assert calls[-1][:3] == ("run.json", True, False)
+    assert "synthetic progress" in captured.err
+    assert calls[-1][:3] == ("run.json", True, True)
 
     assert main(
         [
@@ -145,13 +144,20 @@ def test_train_cli_json_progress_and_dry_run_wiring(monkeypatch, capsys):
         ]
     ) == 0
     captured = capsys.readouterr()
-    assert captured.out == "done\n" and captured.err == ""
+    assert captured.out == "done\n"
+    assert "synthetic progress" in captured.err
     path, dry_run, progress_enabled, overrides = calls[-1]
-    assert (path, dry_run, progress_enabled) == ("run.yaml", True, False)
+    assert (path, dry_run, progress_enabled) == ("run.yaml", True, True)
     assert overrides.dtype == "float32"
     assert overrides.max_epochs == 7
     assert overrides.validation_batch_size == 2
     assert overrides.output_directory == "override-output"
+
+    assert main(["train", "run.json", "--dry-run", "--quiet"]) == 0
+    captured = capsys.readouterr()
+    assert captured.out == "done\n"
+    assert captured.err == ""
+    assert calls[-1][:3] == ("run.json", True, False)
 
 
 def test_training_config_positional_alias_ambiguity_is_usage_error():
@@ -442,3 +448,98 @@ def test_scratch_nested_result_has_human_terminal_summary():
     assert "Status: completed" in rendered
     assert "Epochs completed: 2" in rendered
     assert "Global step: 4" in rendered
+
+
+def test_training_terminal_presentation_preserves_primary_outcome(monkeypatch):
+    module = importlib.import_module("refsite_mlip.cli.train")
+
+    class Recorder:
+        def __init__(self):
+            self.calls = []
+
+        def render_terminal(self, status, **values):
+            self.calls.append((status, values))
+
+    success = {
+        "status": "completed",
+        "completed_epochs": 1,
+        "global_step": 3,
+        "latest_checkpoint": "/display/checkpoints/latest.pt",
+        "recoverable_checkpoint": "/display/checkpoints/latest.pt",
+        "fit_result": {
+            "stopped_early": False,
+            "best_epoch": 0,
+            "best_metric": 1.25,
+            "stop_reason": None,
+        },
+    }
+    renderer = Recorder()
+    monkeypatch.setattr(module, "_run_training_impl", lambda *args, **kwargs: success)
+    assert module.run_training("run.json", progress_renderer=renderer) is success
+    assert renderer.calls == [
+        (
+            "completed",
+            {
+                "epochs": 1,
+                "global_step": 3,
+                "best_epoch": 0,
+                "best_value": 1.25,
+                "latest_checkpoint": "latest.pt",
+                "reason": None,
+                "recoverable": "latest.pt",
+            },
+        )
+    ]
+
+    failure = CLIError(
+        "SYNTHETIC_FAILURE",
+        "synthetic failure",
+        stage="training.fit",
+        failure_phase="fit",
+        epoch_index=1,
+        global_step=4,
+    )
+    failure.completed_epochs = 1
+    failure.recoverable_checkpoint = "/display/checkpoints/latest.pt"
+    renderer.calls.clear()
+
+    def fail(*args, **kwargs):
+        del args, kwargs
+        raise failure
+
+    monkeypatch.setattr(module, "_run_training_impl", fail)
+    with pytest.raises(CLIError) as caught:
+        module.run_training("run.json", progress_renderer=renderer)
+    assert caught.value is failure
+    assert renderer.calls == [
+        (
+            "failed",
+            {
+                "epochs": 2,
+                "global_step": 4,
+                "phase": "fit",
+                "recoverable": "latest.pt",
+            },
+        )
+    ]
+
+    interrupt = CLIInterruptedError(
+        "TRAINING_INTERRUPTED",
+        "synthetic interrupt",
+        stage="training.fit",
+        global_step=5,
+    )
+    interrupt.completed_epochs = 2
+    renderer.calls.clear()
+
+    def interrupted(*args, **kwargs):
+        del args, kwargs
+        raise interrupt
+
+    monkeypatch.setattr(module, "_run_training_impl", interrupted)
+    with pytest.raises(CLIInterruptedError) as caught:
+        module.run_training("run.json", progress_renderer=renderer)
+    assert caught.value is interrupt
+    assert renderer.calls[0][0] == "interrupted"
+    assert renderer.calls[0][1]["epochs"] == 2
+    assert renderer.calls[0][1]["global_step"] == 5

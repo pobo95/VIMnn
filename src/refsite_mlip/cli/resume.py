@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import Counter
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import copy
 import json
 from numbers import Integral
@@ -78,14 +78,22 @@ from refsite_mlip.training.scratch_preparation import (
 from refsite_mlip.transport import TRAIN_FIXED
 
 from .errors import CLIError, CLIInterruptedError
+from .training_progress import (
+    TrainingProgressRenderer,
+    TrainingStartSummary,
+    journal_then_progress_observer,
+)
 from .train import (
     _PreparedTrainingRuntime,
     _batch_context,
     _batch_samples,
+    _composition_summary,
+    _label_presence,
     _nested_exception,
     _nested_reason,
     _nested_text_attribute,
     _prepare_training_runtime,
+    _start_summary,
     seed_training_runtime,
 )
 from .validate_train_config import _cli_error as _training_config_cli_error
@@ -100,6 +108,14 @@ _METRICS_STATUS_FIELDS = {
     "metrics_last_epoch",
     "metrics_semantic_sha256",
 }
+
+
+def _progress_stage(
+    renderer: TrainingProgressRenderer | None,
+    message: str,
+) -> None:
+    if renderer is not None:
+        renderer.render_stage(message)
 
 
 @dataclass(frozen=True)
@@ -1230,6 +1246,7 @@ def _prepare_resume(
     run_directory: str | os.PathLike[str],
     *,
     max_epochs: int,
+    progress_renderer: TrainingProgressRenderer | None = None,
 ) -> _ResumePreflight:
     if isinstance(max_epochs, bool) or not isinstance(max_epochs, Integral):
         raise CLIError(
@@ -1252,6 +1269,10 @@ def _prepare_resume(
         directory = TrainingRunDirectory.open_existing(run_directory)
         directory.validate_resume_lock_available()
         config = _load_config(directory)
+        _progress_stage(
+            progress_renderer,
+            "preparing resume checkpoint and training data",
+        )
         preflight = load_runtime_json(
             directory.preflight_path, stage="resume.metadata.preflight"
         )
@@ -1810,6 +1831,111 @@ def _resolved_checkpoint_configs(
     }
 
 
+def _resume_start_summary(
+    preflight: _ResumePreflight,
+    prepared: _PreparedTrainingRuntime,
+    *,
+    max_epochs: int,
+) -> TrainingStartSummary:
+    """Create a tensor-free snapshot of the effective resumed runtime."""
+
+    config = preflight.config
+    checkpoint = preflight.checkpoint
+    data = _require_mapping(preflight.stored_preflight["data"], field="data")
+    train_data = _require_mapping(data["train"], field="data.train")
+    validation_data = _require_mapping(
+        data["validation"], field="data.validation"
+    )
+    train_template_counts = train_data["template_frame_counts"]
+    validation_template_counts = validation_data["template_frame_counts"]
+    template_ids = tuple(sorted(prepared.loaded.template_contexts))
+    templates = tuple(
+        (
+            template_id,
+            int(
+                prepared.loaded.template_contexts[
+                    template_id
+                ].topology.num_sites
+            ),
+        )
+        for template_id in template_ids
+    )
+    template_frame_counts = tuple(
+        (
+            template_id,
+            int(train_template_counts.get(template_id, 0)),
+            int(validation_template_counts.get(template_id, 0)),
+        )
+        for template_id in template_ids
+    )
+
+    baseline = checkpoint.metadata.baseline_fit_metadata
+    if not isinstance(baseline, Mapping):
+        raise CLIError(
+            "CHECKPOINT_BASELINE_METADATA_MISSING",
+            "checkpoint baseline metadata is required for progress summary",
+            stage="resume.progress.summary",
+        )
+    optimizer_groups = checkpoint.optimizer_state_dict.get("param_groups")
+    if not isinstance(optimizer_groups, list) or len(optimizer_groups) != 1:
+        raise CLIError(
+            "CHECKPOINT_OPTIMIZER_STATE_MISMATCH",
+            "resume progress requires the single validated optimizer parameter group",
+            stage="resume.progress.summary",
+        )
+    initial_learning_rate = float(optimizer_groups[0]["lr"])
+    source_kind = (
+        "scratch"
+        if isinstance(config.model_source, ScratchModelSourceConfig)
+        else "bundle"
+    )
+    initialization_seed = (
+        config.model_source.initialization_seed
+        if isinstance(config.model_source, ScratchModelSourceConfig)
+        else None
+    )
+    summary = _start_summary(
+        config=config,
+        source_kind=source_kind,
+        model=prepared.loaded.model,
+        device=preflight.resolved.resolved_device,
+        dtype=preflight.resolved.resolved_dtype,
+        initialization_seed=initialization_seed,
+        species_vocabulary=preflight.resolved.species_vocabulary,
+        templates=templates,
+        default_template_id=prepared.bundle.default_template_id,
+        train_frame_count=int(train_data["frame_count"]),
+        validation_frame_count=int(validation_data["frame_count"]),
+        train_batch_count=preflight.resolved.train_batch_count,
+        validation_batch_count=preflight.resolved.validation_batch_count,
+        template_frame_counts=template_frame_counts,
+        composition_summary=_composition_summary(
+            train_data["composition_statistics"],
+            validation_data["composition_statistics"],
+        ),
+        label_presence=_label_presence(
+            train_data["label_statistics"],
+            validation_data["label_statistics"],
+        ),
+        baseline_metadata=baseline,
+        initial_bundle_fingerprint=preflight.resolved.bundle_fingerprint,
+        train_semantic_digest=preflight.resolved.train_semantic_digest,
+        validation_semantic_digest=preflight.resolved.validation_semantic_digest,
+        output_directory=str(preflight.directory.root),
+    )
+    return replace(
+        summary,
+        initial_learning_rate=initial_learning_rate,
+        max_epochs=max_epochs,
+        resumed=True,
+        resume_checkpoint_epoch=checkpoint.progress.last_completed_epoch,
+        resume_global_step=checkpoint.progress.global_step,
+        existing_best_epoch=checkpoint.selection_state.best_epoch,
+        existing_best_value=checkpoint.selection_state.best_metric,
+        recovered_journal_event_count=len(preflight.journal_missing_events),
+    )
+
+
 def _recheck_resume_sources(
     preflight: _ResumePreflight,
     lock: ResumeRunLock,
@@ -1910,11 +2036,74 @@ def _recheck_resume_sources(
     return journal, provenance
 
 
+def _render_resume_terminal(
+    renderer: TrainingProgressRenderer | None,
+    status: Mapping[str, Any],
+) -> None:
+    """Best-effort terminal presentation that never changes resume outcome."""
+
+    if renderer is None:
+        return
+    try:
+        fit = status.get("fit_result")
+        fit = fit if isinstance(fit, Mapping) else {}
+        selection = status.get("terminal_selection_state")
+        selection = selection if isinstance(selection, Mapping) else {}
+        raw_status = status.get("status")
+        terminal_status = str(raw_status)
+        reason = None
+        if raw_status == "completed" and bool(fit.get("stopped_early")):
+            terminal_status = "early_stopped"
+            reason = fit.get("stop_reason")
+        error = status.get("error")
+        if isinstance(error, Mapping):
+            reason = error.get("reason_code") or error.get("message")
+        reason_text = None if reason in (None, "") else str(reason)
+        recoverable = status.get("recoverable_checkpoint")
+        if isinstance(recoverable, str) and recoverable:
+            recoverable = Path(recoverable).name
+        else:
+            recoverable = None
+        latest = status.get("latest_checkpoint")
+        if isinstance(latest, str) and latest:
+            latest = Path(latest).name
+        else:
+            latest = None
+        best_value = selection.get("best_metric")
+        best_epoch = selection.get("best_epoch")
+        displayed_epoch = int(status.get("completed_epochs", 0))
+        if terminal_status in ("failed", "interrupted"):
+            failure_epoch = status.get("epoch_index")
+            if failure_epoch is not None:
+                displayed_epoch = int(failure_epoch) + 1
+        renderer.render_terminal(
+            terminal_status,
+            epochs=displayed_epoch,
+            global_step=int(status.get("global_step", 0)),
+            best_epoch=None if best_epoch is None else int(best_epoch),
+            best_value=None if best_value is None else float(best_value),
+            latest_checkpoint=latest,
+            reason=reason_text,
+            phase=(
+                None
+                if status.get("failure_phase") is None
+                else str(status["failure_phase"])
+            ),
+            recoverable=recoverable,
+        )
+    except Exception:
+        # Rendering is strictly presentation-only.  The standard renderer
+        # retains its first write failure for debug inspection; an injected
+        # renderer must never replace the primary training outcome.
+        pass
+
+
 def _execute_resume(
     preflight: _ResumePreflight,
     lock: ResumeRunLock,
     *,
     progress: Callable[[str], None] | None,
+    progress_renderer: TrainingProgressRenderer | None,
 ) -> dict[str, Any]:
     max_epochs = int(preflight.report["requested_max_epochs"])
     journal, provenance = _recheck_resume_sources(preflight, lock)
@@ -1947,6 +2136,14 @@ def _execute_resume(
         resolved_configs = _resolved_checkpoint_configs(
             preflight, prepared, max_epochs
         )
+        if progress_renderer is not None:
+            progress_renderer.render_start_from(
+                lambda: _resume_start_summary(
+                    preflight,
+                    prepared,
+                    max_epochs=max_epochs,
+                )
+            )
         if progress is not None:
             progress(
                 "resume started: "
@@ -1954,12 +2151,18 @@ def _execute_resume(
                 f"max_epochs={max_epochs}, "
                 f"global_step={preflight.checkpoint.progress.global_step}"
             )
+        _progress_stage(progress_renderer, "training started")
         phase = "fit"
         training_executed = True
         checkpoint_contexts = {
             template_id: prepared.loaded.template_contexts[template_id]
             for template_id in preflight.checkpoint.metadata.template_fingerprints
         }
+        epoch_observer = (
+            journal
+            if progress_renderer is None
+            else journal_then_progress_observer(journal, progress_renderer)
+        )
         result = run_checkpointed_resumed_fit(
             preflight.checkpoint,
             prepared.loaded.model,
@@ -1979,7 +2182,7 @@ def _execute_resume(
             resumed_max_epochs=max_epochs,
             policy=ResumePolicy(),
             epoch_metrics_provenance=provenance,
-            epoch_metrics_observer=journal,
+            epoch_metrics_observer=epoch_observer,
         )
         status = _completed_status(preflight, result, journal=journal)
         phase = "metadata.completed_status"
@@ -2002,6 +2205,7 @@ def _execute_resume(
             journal=journal,
         )
         stored_error = _write_failure_status(preflight, status, error)
+        _render_resume_terminal(progress_renderer, status)
         raise CLIInterruptedError(
             "RESUME_INTERRUPTED",
             "resume was interrupted; the recoverable latest checkpoint was retained",
@@ -2029,6 +2233,7 @@ def _execute_resume(
             journal=journal,
         )
         stored_error = _write_failure_status(preflight, status, error)
+        _render_resume_terminal(progress_renderer, status)
         raise _execution_error(preflight, stored_error, status) from error
 
 
@@ -2038,39 +2243,98 @@ def resume_training(
     max_epochs: int,
     dry_run: bool = False,
     progress: Callable[[str], None] | None = None,
+    progress_renderer: TrainingProgressRenderer | None = None,
 ) -> dict[str, Any]:
     """Preflight and optionally resume exactly from checkpoints/latest.pt."""
 
     if type(dry_run) is not bool:
         raise TypeError("dry_run must be a bool")
-    preflight = _prepare_resume(run_directory, max_epochs=max_epochs)
+    _progress_stage(progress_renderer, "loading training configuration")
+    try:
+        preflight = _prepare_resume(
+            run_directory,
+            max_epochs=max_epochs,
+            progress_renderer=progress_renderer,
+        )
+    except Exception as error:
+        if progress_renderer is not None:
+            try:
+                progress_renderer.render_terminal(
+                    "failed",
+                    epochs=0,
+                    global_step=0,
+                    reason=_nested_reason(error) or type(error).__name__,
+                    phase=getattr(error, "stage", "resume.preflight"),
+                )
+            except Exception:
+                pass
+        raise
     if dry_run:
         return dict(preflight.report)
+    _progress_stage(progress_renderer, "initializing training run")
     try:
         lock = preflight.directory.acquire_resume_lock()
     except RunDirectoryError as error:
-        raise CLIError(
+        converted = CLIError(
             error.reason_code,
             "resume lock could not be acquired",
             stage=error.stage,
             path=error.path,
             underlying_reason_code=error.reason_code,
             original_error=error,
-        ) from error
+        )
+        if progress_renderer is not None:
+            try:
+                progress_renderer.render_terminal(
+                    "failed",
+                    epochs=preflight.checkpoint.progress.completed_epochs,
+                    global_step=preflight.checkpoint.progress.global_step,
+                    best_epoch=preflight.checkpoint.selection_state.best_epoch,
+                    best_value=preflight.checkpoint.selection_state.best_metric,
+                    reason=error.reason_code,
+                    phase=error.stage,
+                    recoverable="latest.pt",
+                )
+            except Exception:
+                pass
+        raise converted from error
     try:
         with lock:
-            return _execute_resume(preflight, lock, progress=progress)
+            result = _execute_resume(
+                preflight,
+                lock,
+                progress=progress,
+                progress_renderer=progress_renderer,
+            )
     except (CLIError, CLIInterruptedError):
         raise
     except RunDirectoryError as error:
-        raise CLIError(
+        converted = CLIError(
             error.reason_code,
             "resume lock operation failed; a foreign lock was not removed",
             stage=error.stage,
             path=error.path,
             underlying_reason_code=error.reason_code,
             original_error=error,
-        ) from error
+        )
+        if progress_renderer is not None:
+            try:
+                latest = _recoverable(preflight)
+                progress_renderer.render_terminal(
+                    "failed",
+                    epochs=latest.progress.completed_epochs,
+                    global_step=latest.progress.global_step,
+                    best_epoch=latest.selection_state.best_epoch,
+                    best_value=latest.selection_state.best_metric,
+                    reason=error.reason_code,
+                    phase=error.stage,
+                    recoverable="latest.pt",
+                )
+            except Exception:
+                pass
+        raise converted from error
+    _render_resume_terminal(progress_renderer, result)
+    return result
 
 
 def render_resume_json(report: Mapping[str, Any]) -> str:
