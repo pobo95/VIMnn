@@ -25,7 +25,7 @@ from refsite_mlip.config.radii import (
     validate_radius_model_compatibility,
 )
 from refsite_mlip.config.training_run import (
-    TRAINING_RUN_CONFIG_SCHEMA_VERSION,
+    TRAINING_RUN_CONFIG_SCHEMA_VERSION_V2,
     _baseline_preflight,
     _composition_statistics,
     _label_statistics,
@@ -272,7 +272,7 @@ def _validate_preflight_metadata(
     _require_equal(
         "preflight.schema_version",
         preflight["schema_version"],
-        TRAINING_RUN_CONFIG_SCHEMA_VERSION,
+        config.schema_version,
     )
     _require_equal(
         "preflight.config_fingerprint",
@@ -408,6 +408,10 @@ def _validate_preflight_metadata(
         "batch_size": config.data.batch_size,
         "shuffle": False,
     }
+    if config.schema_version == TRAINING_RUN_CONFIG_SCHEMA_VERSION_V2:
+        expected_training["validation_batch_size"] = (
+            config.data.effective_validation_batch_size
+        )
     _require_equal(
         "training_configuration",
         preflight["training_configuration"],
@@ -755,7 +759,7 @@ def _validate_data(
     )
     validation_batches = _batch_samples(
         validation_samples,
-        batch_size=config.data.batch_size,
+        batch_size=config.data.effective_validation_batch_size,
         registry=registry,
         device="cpu",
         dtype=config.runtime.torch_dtype,

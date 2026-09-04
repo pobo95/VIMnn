@@ -17,7 +17,12 @@ from refsite_mlip.cli.train import (
     run_training,
     seed_training_runtime,
 )
-from refsite_mlip.config import load_training_run_config, resolve_training_run
+from refsite_mlip.cli.validate_train_config import validate_train_config
+from refsite_mlip.config import (
+    TrainingRunConfigOverrides,
+    load_training_run_config,
+    resolve_training_run,
+)
 from refsite_mlip.training import (
     CheckpointManager,
     CheckpointManagerConfig,
@@ -144,6 +149,33 @@ def test_synthetic_cpu_float64_one_epoch_writes_recoverable_state(
     assert config_path.read_bytes() == config_before
     assert training_bundle["path"].read_bytes() == bundle_before
     assert (train_path.read_bytes(), validation_path.read_bytes()) == inputs_before
+
+
+def test_v2_bundle_source_dry_run_uses_existing_preflight_contract(
+    training_bundle, tmp_path
+):
+    config_path, payload = _simple_case(tmp_path, training_bundle)
+    bundle_path = payload.pop("initial_bundle")
+    payload["schema_version"] = "refsite_training_run_config_v2"
+    payload["model_source"] = {"kind": "bundle", "path": bundle_path}
+    payload["data"]["validation_batch_size"] = 1
+    payload["fit"]["max_epochs"] = 1
+    payload["output_directory"] = "v2-output"
+    config_path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+
+    overrides = TrainingRunConfigOverrides(
+        max_epochs=3,
+        batch_size=1,
+        validation_batch_size=1,
+        learning_rate=2.0e-4,
+    )
+    report = run_training(config_path, dry_run=True, overrides=overrides)
+    validated = validate_train_config(config_path, overrides=overrides)
+    assert report.to_dict() == validated.to_dict()
+    assert report.config_schema_version == "refsite_training_run_config_v2"
+    assert report.training_configuration["validation_batch_size"] == 1
+    output = tmp_path / "v2-output"
+    assert not output.exists()
 
 
 def test_fresh_training_holds_common_run_lock_for_entire_fit(

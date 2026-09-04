@@ -9,6 +9,7 @@ import ase
 import numpy
 import pytest
 import torch
+import yaml
 
 import refsite_mlip
 from refsite_mlip.compatibility import import_e3nn_0_4_4
@@ -25,6 +26,7 @@ def test_required_versions():
     assert e3nn.__version__ == "0.4.4"
     assert (1, 24) <= _major_minor(numpy.__version__) < (3, 0)
     assert (3, 22) <= _major_minor(ase.__version__) < (4, 0)
+    assert (6, 0) <= _major_minor(yaml.__version__) < (7, 0)
     assert refsite_mlip.__version__
 
 

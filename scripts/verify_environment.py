@@ -5,6 +5,7 @@ from __future__ import annotations
 import ase
 import numpy
 import torch
+import yaml
 
 import refsite_mlip
 from refsite_mlip.compatibility import import_e3nn_0_4_4
@@ -32,6 +33,8 @@ def main() -> None:
         raise RuntimeError(f"expected numpy>=1.24,<3, got {numpy.__version__}")
     if not ((3, 22) <= _major_minor(ase.__version__) < (4, 0)):
         raise RuntimeError(f"expected ase>=3.22,<4, got {ase.__version__}")
+    if not ((6, 0) <= _major_minor(yaml.__version__) < (7, 0)):
+        raise RuntimeError(f"expected PyYAML>=6.0,<7, got {yaml.__version__}")
     vector = torch.zeros((1, 3), dtype=torch.float64, requires_grad=True)
     harmonics = o3.SphericalHarmonics(
         "0e + 1o + 2e",
@@ -48,6 +51,7 @@ def main() -> None:
     print(f"e3nn={e3nn.__version__}")
     print(f"numpy={numpy.__version__}")
     print(f"ase={ase.__version__}")
+    print(f"pyyaml={yaml.__version__}")
     print(f"refsite_mlip={refsite_mlip.__version__}")
     print("safe_globals_restored=True")
     print("eager_double_backward=ok")

@@ -7,9 +7,11 @@ from os import PathLike
 from typing import Any
 
 from refsite_mlip.config import (
+    ResolvedScratchTrainingRun,
     ResolvedTrainingRun,
+    TrainingRunConfigOverrides,
     TrainingRunConfigError,
-    load_training_run_config,
+    load_effective_training_run_config,
     resolve_training_run,
 )
 
@@ -41,21 +43,28 @@ def _cli_error(
 
 def validate_train_config(
     path: str | PathLike[str],
-) -> ResolvedTrainingRun:
-    """Load and fully preflight one config without creating a training runtime."""
+    *,
+    overrides: TrainingRunConfigOverrides | None = None,
+    cli_cwd: str | PathLike[str] | None = None,
+) -> ResolvedTrainingRun | ResolvedScratchTrainingRun:
+    """Resolve bundle preflight or scratch config without creating a runtime."""
 
     try:
-        config = load_training_run_config(path)
+        config = load_effective_training_run_config(
+            path, overrides, cli_cwd=cli_cwd
+        )
         return resolve_training_run(config)
     except TrainingRunConfigError as error:
         raise _cli_error(error, requested_path=path) from error
 
 
-def render_train_config_json(resolved: ResolvedTrainingRun) -> str:
+def render_train_config_json(
+    resolved: ResolvedTrainingRun | ResolvedScratchTrainingRun,
+) -> str:
     """Render strict deterministic JSON preflight metadata."""
 
-    if not isinstance(resolved, ResolvedTrainingRun):
-        raise TypeError("resolved must be a ResolvedTrainingRun")
+    if not isinstance(resolved, (ResolvedTrainingRun, ResolvedScratchTrainingRun)):
+        raise TypeError("resolved must be resolved training-run metadata")
     return _render_json(resolved.to_dict())
 
 
@@ -83,12 +92,38 @@ def _label_lines(
         )
 
 
-def render_train_config_human(resolved: ResolvedTrainingRun) -> str:
+def render_train_config_human(
+    resolved: ResolvedTrainingRun | ResolvedScratchTrainingRun,
+) -> str:
     """Render a deterministic, concise human-readable preflight report."""
 
-    if not isinstance(resolved, ResolvedTrainingRun):
-        raise TypeError("resolved must be a ResolvedTrainingRun")
+    if not isinstance(resolved, (ResolvedTrainingRun, ResolvedScratchTrainingRun)):
+        raise TypeError("resolved must be resolved training-run metadata")
     report = resolved.to_dict()
+    if isinstance(resolved, ResolvedScratchTrainingRun):
+        source = report["model_source"]
+        paths = report["runtime"]["paths"]
+        template_ids = [
+            item["builder"]["template_id"]
+            for item in source["reference_templates"]
+        ]
+        return "\n".join(
+            (
+                "Reference-site MLIP scratch configuration",
+                "Status: config ready",
+                f"Config schema: {report['schema_version']}",
+                f"Config SHA-256: {report['config_fingerprint']}",
+                "Model source: scratch",
+                f"Initialization seed: {source['initialization_seed']}",
+                f"Default template: {source['default_template_id']}",
+                f"Template IDs: {_display(template_ids)}",
+                f"Device: {report['runtime']['device']}",
+                f"Dtype: {report['runtime']['dtype']}",
+                f"Output directory: {paths['output_directory']}",
+                "Scratch execution: not implemented (Milestone 10A-2)",
+                "No POSCAR/artifact/model construction or training was executed.",
+            )
+        )
     train = report["data"]["train"]
     validation = report["data"]["validation"]
     radii = report["radii"]

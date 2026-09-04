@@ -78,6 +78,79 @@ def _device_argument(value: str) -> str:
     return value
 
 
+def _add_training_config_arguments(parser: argparse.ArgumentParser) -> None:
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument(
+        "config_path",
+        nargs="?",
+        help="training-run JSON or YAML configuration path",
+    )
+    source.add_argument(
+        "--config",
+        dest="config_option",
+        metavar="PATH",
+        help="alias for the positional configuration path",
+    )
+    parser.add_argument("--device", type=_device_argument, default=None)
+    parser.add_argument(
+        "--dtype", choices=("float32", "float64"), default=None
+    )
+    parser.add_argument(
+        "--max-epochs", type=_positive_integer, default=None, metavar="INTEGER"
+    )
+    parser.add_argument(
+        "--batch-size", type=_positive_integer, default=None, metavar="INTEGER"
+    )
+    parser.add_argument(
+        "--validation-batch-size",
+        type=_positive_integer,
+        default=None,
+        metavar="INTEGER",
+    )
+    parser.add_argument(
+        "--learning-rate", type=_positive_float, default=None, metavar="FLOAT"
+    )
+    parser.add_argument("--r-ot", type=_positive_float, default=None, metavar="FLOAT")
+    parser.add_argument("--r-mp", type=_positive_float, default=None, metavar="FLOAT")
+    parser.add_argument(
+        "--output-directory", default=None, metavar="PATH"
+    )
+
+
+def _training_config_path(args: argparse.Namespace) -> str:
+    return args.config_path if args.config_path is not None else args.config_option
+
+
+def _training_config_overrides(args: argparse.Namespace):
+    from refsite_mlip.config import (
+        TrainingRunConfigError,
+        TrainingRunConfigOverrides,
+    )
+
+    try:
+        return TrainingRunConfigOverrides(
+            device=args.device,
+            dtype=args.dtype,
+            max_epochs=args.max_epochs,
+            batch_size=args.batch_size,
+            validation_batch_size=args.validation_batch_size,
+            learning_rate=args.learning_rate,
+            r_ot=args.r_ot,
+            r_mp=args.r_mp,
+            output_directory=args.output_directory,
+        )
+    except TrainingRunConfigError as error:
+        raise CLIError(
+            error.reason_code,
+            error.message,
+            stage=error.stage,
+            path=_training_config_path(args),
+            config_field=error.field,
+            underlying_reason_code=error.reason_code,
+            original_error=error,
+        ) from error
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="refsite-mlip",
@@ -264,9 +337,7 @@ def build_parser() -> argparse.ArgumentParser:
             "training controls without model execution or filesystem writes."
         ),
     )
-    validate_train.add_argument(
-        "config_path", help="canonical training-run JSON configuration path"
-    )
+    _add_training_config_arguments(validate_train)
     validate_train.add_argument(
         "--json",
         action="store_true",
@@ -284,9 +355,7 @@ def build_parser() -> argparse.ArgumentParser:
             "baseline, optimizer, scheduler, and checkpointed-fit engine."
         ),
     )
-    train.add_argument(
-        "config_path", help="canonical training-run JSON configuration path"
-    )
+    _add_training_config_arguments(train)
     train.add_argument(
         "--dry-run",
         action="store_true",
@@ -483,7 +552,10 @@ def _run_validate_train_config(args: argparse.Namespace) -> int:
         validate_train_config,
     )
 
-    resolved = validate_train_config(args.config_path)
+    resolved = validate_train_config(
+        _training_config_path(args),
+        overrides=_training_config_overrides(args),
+    )
     output = (
         render_train_config_json(resolved)
         if args.json_output
@@ -506,9 +578,10 @@ def _run_train(args: argparse.Namespace) -> int:
             f"refsite-mlip: {message}", file=sys.stderr
         )
     result = run_training(
-        args.config_path,
+        _training_config_path(args),
         dry_run=args.dry_run,
         progress=progress,
+        overrides=_training_config_overrides(args),
     )
     output = (
         render_train_result_json(result)
@@ -601,6 +674,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             bundle_path=getattr(args, "bundle_path", None),
             path=(
                 getattr(args, "config_path", None)
+                or getattr(args, "config_option", None)
                 or getattr(args, "run_directory", None)
             ),
             original_error=error,
@@ -617,6 +691,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 stage=f"command.{args.command}",
                 path=(
                     getattr(args, "config_path", None)
+                    or getattr(args, "config_option", None)
                     or getattr(args, "run_directory", None)
                 ),
                 original_error=error,

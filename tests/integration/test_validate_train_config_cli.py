@@ -8,6 +8,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 import torch
+import yaml
 
 pytest.importorskip("ase")
 from ase import Atoms
@@ -23,7 +24,11 @@ from refsite_mlip.cli.validate_train_config import (
     render_train_config_json,
     validate_train_config,
 )
-from refsite_mlip.config import load_training_run_config, resolve_training_run
+from refsite_mlip.config import (
+    TrainingRunConfigOverrides,
+    load_training_run_config,
+    resolve_training_run,
+)
 from refsite_mlip.data import (
     ReferenceTemplate,
     StrictTemplateDomain,
@@ -286,6 +291,75 @@ def test_cli_relative_paths_deterministic_output_and_no_execution(
     second_cli = capsys.readouterr()
     assert "No training was executed." in second_cli.out
     assert second_cli.err == ""
+
+
+def test_v2_bundle_json_yaml_and_cli_override_precedence(
+    training_bundle, tmp_path, monkeypatch, capsys
+):
+    config_path, payload = _simple_case(tmp_path, training_bundle)
+    bundle_path = payload.pop("initial_bundle")
+    payload["schema_version"] = "refsite_training_run_config_v2"
+    payload["model_source"] = {"kind": "bundle", "path": bundle_path}
+    payload["data"]["validation_batch_size"] = 1
+    json_path = tmp_path / "v2.json"
+    yaml_path = tmp_path / "v2.yaml"
+    json_path.write_text(json.dumps(payload), encoding="utf-8")
+    yaml_path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+
+    json_config = load_training_run_config(json_path)
+    yaml_config = load_training_run_config(yaml_path)
+    assert json_config.to_dict() == yaml_config.to_dict()
+    assert json_config.config_fingerprint == yaml_config.config_fingerprint
+    json_resolved = resolve_training_run(json_config)
+    yaml_resolved = resolve_training_run(yaml_config)
+    assert json_resolved.config_schema_version == "refsite_training_run_config_v2"
+    assert json_resolved.train_semantic_digest == yaml_resolved.train_semantic_digest
+
+    cli_cwd = tmp_path / "cli-cwd"
+    cli_cwd.mkdir()
+    overrides = TrainingRunConfigOverrides(
+        max_epochs=5,
+        batch_size=1,
+        validation_batch_size=1,
+        learning_rate=2.0e-4,
+        output_directory="overridden-output",
+    )
+    expected = validate_train_config(
+        config_path,
+        overrides=overrides,
+        cli_cwd=cli_cwd,
+    )
+    assert expected.runtime_paths["output_directory"] == str(
+        cli_cwd / "overridden-output"
+    )
+    assert expected.config_schema_version == "refsite_training_run_config_v2"
+    assert expected.training_configuration["batch_size"] == 1
+    assert expected.training_configuration["validation_batch_size"] == 1
+
+    monkeypatch.chdir(cli_cwd)
+    assert main(
+        [
+            "validate-train-config",
+            "--config",
+            str(config_path),
+            "--max-epochs",
+            "5",
+            "--batch-size",
+            "1",
+            "--validation-batch-size",
+            "1",
+            "--learning-rate",
+            "0.0002",
+            "--output-directory",
+            "overridden-output",
+            "--json",
+        ]
+    ) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["config_fingerprint"] == expected.config_fingerprint
+    assert report["runtime"]["paths"]["output_directory"] == str(
+        cli_cwd / "overridden-output"
+    )
 
 
 def test_mixed_template_key_partial_masks_digests_order_and_plain_metadata(

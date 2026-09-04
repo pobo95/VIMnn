@@ -8,7 +8,7 @@ from dataclasses import dataclass, field, fields as dataclass_fields, replace
 import hashlib
 import json
 import math
-from numbers import Integral
+from numbers import Integral, Real
 import os
 from pathlib import Path
 import re
@@ -16,6 +16,7 @@ from types import MappingProxyType
 from typing import Any
 
 import torch
+import yaml
 
 from refsite_mlip.data import (
     EXTXYZ_LOADER_CONVENTION_VERSION,
@@ -54,14 +55,28 @@ from .radii import (
     DerivedInteractionRadii,
     InteractionRadiusConfig,
     RadiusConfigError,
+    transport_support_config_from_radii,
     validate_radius_artifact_compatibility,
     validate_radius_model_compatibility,
 )
+from .model_source import (
+    BundleModelSourceConfig,
+    ModelSourceConfig,
+    ModelSourceConfigError,
+    ScratchModelSourceConfig,
+    model_source_from_dict,
+)
 
 
-TRAINING_RUN_CONFIG_SCHEMA_VERSION = "refsite_training_run_config_v1"
+TRAINING_RUN_CONFIG_SCHEMA_VERSION_V1 = "refsite_training_run_config_v1"
+TRAINING_RUN_CONFIG_SCHEMA_VERSION_V2 = "refsite_training_run_config_v2"
+# Compatibility alias retained for callers that explicitly construct v1.
+TRAINING_RUN_CONFIG_SCHEMA_VERSION = TRAINING_RUN_CONFIG_SCHEMA_VERSION_V1
+SUPPORTED_TRAINING_RUN_CONFIG_SCHEMA_VERSIONS = frozenset(
+    {TRAINING_RUN_CONFIG_SCHEMA_VERSION_V1, TRAINING_RUN_CONFIG_SCHEMA_VERSION_V2}
+)
 
-_TOP_LEVEL_KEYS = frozenset(
+_TOP_LEVEL_KEYS_V1 = frozenset(
     {
         "schema_version",
         "initial_bundle",
@@ -79,6 +94,9 @@ _TOP_LEVEL_KEYS = frozenset(
         "checkpointed_fit",
         "output_directory",
     }
+)
+_TOP_LEVEL_KEYS_V2 = frozenset(
+    (_TOP_LEVEL_KEYS_V1 - {"initial_bundle"}) | {"model_source"}
 )
 _RADIUS_SHORT_KEYS = frozenset(
     {"r_ot", "r_mp", "ot_switch_width", "ot_skin", "mp_skin"}
@@ -328,6 +346,7 @@ class TrainingDataConfig:
     validation: tuple[TrainingDataSourceConfig, ...]
     batch_size: int = 4
     shuffle: bool = False
+    validation_batch_size: int | None = None
 
     def __post_init__(self) -> None:
         def sources(values):
@@ -371,6 +390,24 @@ class TrainingDataConfig:
                 actual=self.batch_size,
             )
         object.__setattr__(self, "batch_size", int(self.batch_size))
+        if self.validation_batch_size is not None:
+            if (
+                isinstance(self.validation_batch_size, bool)
+                or not isinstance(self.validation_batch_size, Integral)
+                or int(self.validation_batch_size) <= 0
+            ):
+                raise _error(
+                    "INVALID_BATCH_SIZE",
+                    "validation_batch_size must be a positive integer and bool is not accepted",
+                    stage="config.validation",
+                    field="data.validation_batch_size",
+                    actual=self.validation_batch_size,
+                )
+            object.__setattr__(
+                self,
+                "validation_batch_size",
+                int(self.validation_batch_size),
+            )
         if type(self.shuffle) is not bool:
             raise _error(
                 "INVALID_SHUFFLE",
@@ -382,32 +419,64 @@ class TrainingDataConfig:
         if self.shuffle:
             raise _error(
                 "UNSUPPORTED_SHUFFLE",
-                "schema v1 requires shuffle=false because no deterministic epoch plan exists",
+                "training-run schemas require shuffle=false because no deterministic epoch plan exists",
                 stage="config.validation",
                 field="data.shuffle",
                 actual=True,
             )
 
+    @property
+    def effective_validation_batch_size(self) -> int:
+        return (
+            self.batch_size
+            if self.validation_batch_size is None
+            else self.validation_batch_size
+        )
+
     def to_dict(self) -> dict[str, Any]:
-        return {
+        result = {
             "train": [item.to_dict() for item in self.train],
             "validation": [item.to_dict() for item in self.validation],
             "batch_size": self.batch_size,
             "shuffle": self.shuffle,
         }
+        if self.validation_batch_size is not None:
+            result["validation_batch_size"] = self.validation_batch_size
+        return result
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "TrainingDataConfig":
-        payload = _strict_keys(
-            value,
-            frozenset({"train", "validation", "batch_size", "shuffle"}),
-            name="data",
-        )
+        if not isinstance(value, Mapping):
+            raise _error(
+                "INVALID_CONFIG_SECTION",
+                "data must be a JSON object",
+                stage="config.schema",
+                field="data",
+            )
+        required = frozenset({"train", "validation", "batch_size", "shuffle"})
+        unknown = frozenset(value) - (required | {"validation_batch_size"})
+        missing = required - frozenset(value)
+        if unknown:
+            raise _error(
+                "UNKNOWN_CONFIG_KEY",
+                "data contains unknown keys",
+                stage="config.schema",
+                field=", ".join(sorted(repr(key) for key in unknown)),
+            )
+        if missing:
+            raise _error(
+                "MISSING_CONFIG_KEY",
+                "data is missing required keys",
+                stage="config.schema",
+                field=", ".join(sorted(missing)),
+            )
+        payload = value
         return cls(
             train=_source_sequence(payload["train"], split="train"),
             validation=_source_sequence(payload["validation"], split="validation"),
             batch_size=payload["batch_size"],
             shuffle=payload["shuffle"],
+            validation_batch_size=payload.get("validation_batch_size"),
         )
 
 
@@ -561,7 +630,7 @@ def _parse_radii(value: Any) -> InteractionRadiusConfig:
 @dataclass(frozen=True)
 class TrainingRunConfig:
     schema_version: str
-    initial_bundle: str
+    initial_bundle: str | None
     radii: InteractionRadiusConfig
     data: TrainingDataConfig
     runtime: TrainingRuntimeConfig
@@ -576,22 +645,75 @@ class TrainingRunConfig:
     checkpointed_fit: CheckpointedFitConfig
     output_directory: str
     source_path: str | None = field(default=None, repr=False, compare=False)
+    model_source: ModelSourceConfig | None = field(
+        default=None, repr=False
+    )
+    output_directory_base: str | None = field(
+        default=None, repr=False, compare=False
+    )
 
     def __post_init__(self) -> None:
-        if self.schema_version != TRAINING_RUN_CONFIG_SCHEMA_VERSION:
+        if (
+            type(self.schema_version) is not str
+            or self.schema_version
+            not in SUPPORTED_TRAINING_RUN_CONFIG_SCHEMA_VERSIONS
+        ):
             raise _error(
                 "UNSUPPORTED_TRAINING_RUN_SCHEMA",
                 "unsupported training-run config schema",
                 stage="config.schema",
                 field="schema_version",
-                expected=TRAINING_RUN_CONFIG_SCHEMA_VERSION,
+                expected=tuple(sorted(SUPPORTED_TRAINING_RUN_CONFIG_SCHEMA_VERSIONS)),
                 actual=self.schema_version,
             )
-        object.__setattr__(
-            self,
-            "initial_bundle",
-            _path_text(self.initial_bundle, field_name="initial_bundle"),
-        )
+        source = self.model_source
+        if self.schema_version == TRAINING_RUN_CONFIG_SCHEMA_VERSION_V1:
+            if self.initial_bundle is None:
+                raise _error(
+                    "MISSING_MODEL_SOURCE",
+                    "schema v1 requires initial_bundle",
+                    stage="config.schema",
+                    field="initial_bundle",
+                )
+            initial_bundle = _path_text(
+                self.initial_bundle, field_name="initial_bundle"
+            )
+            if source is None:
+                source = BundleModelSourceConfig(initial_bundle)
+            elif not isinstance(source, BundleModelSourceConfig) or (
+                source.path != initial_bundle
+            ):
+                raise _error(
+                    "CONFLICTING_MODEL_SOURCE",
+                    "schema v1 initial_bundle conflicts with model_source",
+                    stage="config.schema",
+                    field="initial_bundle,model_source",
+                )
+            object.__setattr__(self, "initial_bundle", initial_bundle)
+        else:
+            if source is None:
+                raise _error(
+                    "MISSING_MODEL_SOURCE",
+                    "schema v2 requires tagged model_source",
+                    stage="config.schema",
+                    field="model_source",
+                )
+            if not isinstance(
+                source, (BundleModelSourceConfig, ScratchModelSourceConfig)
+            ):
+                raise TypeError("model_source must be a supported model source")
+            expected_bundle = (
+                source.path if isinstance(source, BundleModelSourceConfig) else None
+            )
+            if self.initial_bundle not in (None, expected_bundle):
+                raise _error(
+                    "CONFLICTING_MODEL_SOURCE",
+                    "schema v2 initial_bundle conflicts with tagged model_source",
+                    stage="config.schema",
+                    field="initial_bundle,model_source",
+                )
+            object.__setattr__(self, "initial_bundle", expected_bundle)
+        object.__setattr__(self, "model_source", source)
         object.__setattr__(
             self,
             "output_directory",
@@ -616,14 +738,32 @@ class TrainingRunConfig:
             self.baseline, AtomicBaselineConfig
         ):
             raise TypeError("baseline must be an AtomicBaselineConfig or None")
+        if (
+            self.schema_version == TRAINING_RUN_CONFIG_SCHEMA_VERSION_V1
+            and self.data.validation_batch_size is not None
+        ):
+            raise _error(
+                "UNKNOWN_CONFIG_KEY",
+                "schema v1 does not define data.validation_batch_size",
+                stage="config.schema",
+                field="data.validation_batch_size",
+            )
         if self.source_path is not None:
             object.__setattr__(self, "source_path", str(self.source_path))
+        if self.output_directory_base is not None:
+            object.__setattr__(
+                self,
+                "output_directory_base",
+                _path_text(
+                    self.output_directory_base,
+                    field_name="output_directory_base",
+                ),
+            )
         validate_training_run_config(self)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        result = {
             "schema_version": self.schema_version,
-            "initial_bundle": self.initial_bundle,
             "radii": self.radii.to_dict(),
             "data": self.data.to_dict(),
             "runtime": self.runtime.to_dict(),
@@ -640,13 +780,99 @@ class TrainingRunConfig:
             "checkpointed_fit": self.checkpointed_fit.to_dict(),
             "output_directory": self.output_directory,
         }
+        if self.schema_version == TRAINING_RUN_CONFIG_SCHEMA_VERSION_V1:
+            result["initial_bundle"] = self.initial_bundle
+        else:
+            assert self.model_source is not None
+            result["model_source"] = self.model_source.to_dict()
+        return result
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "TrainingRunConfig":
-        payload = _strict_keys(value, _TOP_LEVEL_KEYS, name="training_run")
+        if not isinstance(value, Mapping):
+            raise _error(
+                "INVALID_CONFIG_SECTION",
+                "training_run must be a JSON object",
+                stage="config.schema",
+                field="training_run",
+                actual=type(value).__name__,
+            )
+        schema = value.get("schema_version")
+        if (
+            type(schema) is not str
+            or schema not in SUPPORTED_TRAINING_RUN_CONFIG_SCHEMA_VERSIONS
+        ):
+            raise _error(
+                "UNSUPPORTED_TRAINING_RUN_SCHEMA",
+                "unsupported training-run config schema",
+                stage="config.schema",
+                field="schema_version",
+                expected=tuple(sorted(SUPPORTED_TRAINING_RUN_CONFIG_SCHEMA_VERSIONS)),
+                actual=schema,
+            )
+        if "initial_bundle" in value and "model_source" in value:
+            raise _error(
+                "CONFLICTING_MODEL_SOURCE",
+                "initial_bundle and model_source cannot both be present",
+                stage="config.schema",
+                field="initial_bundle,model_source",
+            )
+        if schema == TRAINING_RUN_CONFIG_SCHEMA_VERSION_V1:
+            if "model_source" in value:
+                raise _error(
+                    "CONFLICTING_MODEL_SOURCE",
+                    "schema v1 uses initial_bundle, not model_source",
+                    stage="config.schema",
+                    field="model_source",
+                )
+            expected_keys = _TOP_LEVEL_KEYS_V1
+            source = None
+            initial_bundle = value.get("initial_bundle")
+            data_value = value.get("data")
+            if (
+                isinstance(data_value, Mapping)
+                and "validation_batch_size" in data_value
+            ):
+                raise _error(
+                    "UNKNOWN_CONFIG_KEY",
+                    "schema v1 does not define data.validation_batch_size",
+                    stage="config.schema",
+                    field="data.validation_batch_size",
+                )
+        else:
+            if "initial_bundle" in value:
+                raise _error(
+                    "CONFLICTING_MODEL_SOURCE",
+                    "schema v2 uses model_source, not initial_bundle",
+                    stage="config.schema",
+                    field="initial_bundle",
+                )
+            if "model_source" not in value:
+                raise _error(
+                    "MISSING_MODEL_SOURCE",
+                    "schema v2 requires model_source",
+                    stage="config.schema",
+                    field="model_source",
+                )
+            expected_keys = _TOP_LEVEL_KEYS_V2
+            try:
+                source = model_source_from_dict(value.get("model_source"))
+            except ModelSourceConfigError as error:
+                raise _error(
+                    error.reason_code,
+                    error.message,
+                    stage="config.model_source",
+                    field=error.field,
+                    original_reason_code=error.reason_code,
+                    original_error=error,
+                ) from error
+            initial_bundle = (
+                source.path if isinstance(source, BundleModelSourceConfig) else None
+            )
+        payload = _strict_keys(value, expected_keys, name="training_run")
         return cls(
             schema_version=payload["schema_version"],
-            initial_bundle=payload["initial_bundle"],
+            initial_bundle=initial_bundle,
             radii=_parse_radii(payload["radii"]),
             data=TrainingDataConfig.from_dict(payload["data"]),
             runtime=TrainingRuntimeConfig.from_dict(payload["runtime"]),
@@ -682,6 +908,7 @@ class TrainingRunConfig:
                 payload["checkpointed_fit"],
             ),
             output_directory=payload["output_directory"],
+            model_source=source,
         )
 
     def canonical_json(self) -> str:
@@ -759,11 +986,269 @@ class TrainingRunConfig:
         return self.config_fingerprint
 
 
+@dataclass(frozen=True)
+class TrainingRunConfigOverrides:
+    """Explicit CLI values layered over one file-backed run config."""
+
+    device: str | None = None
+    dtype: str | None = None
+    max_epochs: int | None = None
+    batch_size: int | None = None
+    validation_batch_size: int | None = None
+    learning_rate: float | None = None
+    r_ot: float | None = None
+    r_mp: float | None = None
+    output_directory: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.device is not None and (
+            type(self.device) is not str or _DEVICE.fullmatch(self.device) is None
+        ):
+            raise _error(
+                "INVALID_RUNTIME_DEVICE",
+                "device override must be cpu, cuda, or cuda:N",
+                stage="config.override",
+                field="device",
+                actual=self.device,
+            )
+        if self.dtype is not None and self.dtype not in ("float32", "float64"):
+            raise _error(
+                "INVALID_RUNTIME_DTYPE",
+                "dtype override must be float32 or float64",
+                stage="config.override",
+                field="dtype",
+                actual=self.dtype,
+            )
+        for name in ("max_epochs", "batch_size", "validation_batch_size"):
+            value = getattr(self, name)
+            if value is not None:
+                if (
+                    isinstance(value, bool)
+                    or not isinstance(value, Integral)
+                    or int(value) <= 0
+                ):
+                    raise _error(
+                        "INVALID_CONFIG_OVERRIDE",
+                        f"{name} override must be a positive integer",
+                        stage="config.override",
+                        field=name,
+                        actual=value,
+                    )
+                object.__setattr__(self, name, int(value))
+        for name in ("learning_rate", "r_ot", "r_mp"):
+            value = getattr(self, name)
+            if value is not None:
+                if (
+                    isinstance(value, bool)
+                    or not isinstance(value, Real)
+                    or not math.isfinite(float(value))
+                    or float(value) <= 0.0
+                ):
+                    raise _error(
+                        "INVALID_CONFIG_OVERRIDE",
+                        f"{name} override must be a finite positive real",
+                        stage="config.override",
+                        field=name,
+                        actual=value,
+                    )
+                object.__setattr__(self, name, float(value))
+        if self.output_directory is not None:
+            object.__setattr__(
+                self,
+                "output_directory",
+                _path_text(
+                    self.output_directory,
+                    field_name="output_directory",
+                ),
+            )
+
+
+def apply_training_run_overrides(
+    config: TrainingRunConfig,
+    overrides: TrainingRunConfigOverrides | None = None,
+    *,
+    cli_cwd: str | os.PathLike[str] | None = None,
+) -> TrainingRunConfig:
+    """Return the validated effective config without mutating file values."""
+
+    if not isinstance(config, TrainingRunConfig):
+        raise TypeError("config must be a TrainingRunConfig")
+    if overrides is None:
+        return config
+    if not isinstance(overrides, TrainingRunConfigOverrides):
+        raise TypeError("overrides must be TrainingRunConfigOverrides or None")
+    if all(
+        getattr(overrides, item.name) is None
+        for item in dataclass_fields(TrainingRunConfigOverrides)
+    ):
+        return config
+
+    runtime = replace(
+        config.runtime,
+        device=(config.runtime.device if overrides.device is None else overrides.device),
+        dtype=(config.runtime.dtype if overrides.dtype is None else overrides.dtype),
+    )
+    data = replace(
+        config.data,
+        batch_size=(
+            config.data.batch_size
+            if overrides.batch_size is None
+            else overrides.batch_size
+        ),
+        validation_batch_size=(
+            config.data.validation_batch_size
+            if overrides.validation_batch_size is None
+            else overrides.validation_batch_size
+        ),
+    )
+    fit = replace(
+        config.fit,
+        max_epochs=(
+            config.fit.max_epochs
+            if overrides.max_epochs is None
+            else overrides.max_epochs
+        ),
+    )
+    optimizer = replace(
+        config.optimizer,
+        learning_rate=(
+            config.optimizer.learning_rate
+            if overrides.learning_rate is None
+            else overrides.learning_rate
+        ),
+    )
+    radii = replace(
+        config.radii,
+        r_ot=config.radii.r_ot if overrides.r_ot is None else overrides.r_ot,
+        r_mp=config.radii.r_mp if overrides.r_mp is None else overrides.r_mp,
+    )
+    model_source = config.model_source
+    if isinstance(model_source, ScratchModelSourceConfig) and (
+        overrides.r_ot is not None or overrides.r_mp is not None
+    ):
+        support = model_source.potential.transport_support
+        derived_support = transport_support_config_from_radii(
+            radii,
+            backend=support.backend,
+            candidate_backend=support.candidate_backend,
+            site_block_size=support.site_block_size,
+            atom_block_size=support.atom_block_size,
+        )
+        potential = replace(
+            model_source.potential,
+            feature=replace(model_source.potential.feature, r_cut=radii.r_mp),
+            higher_body=replace(
+                model_source.potential.higher_body, cutoff=radii.r_mp
+            ),
+            transport_support=derived_support,
+        )
+        templates = tuple(
+            replace(
+                template,
+                builder=replace(
+                    template.builder,
+                    graph_cutoff=radii.r_mp,
+                    graph_skin=radii.mp_skin,
+                ),
+            )
+            for template in model_source.reference_templates
+        )
+        model_source = replace(
+            model_source,
+            potential=potential,
+            reference_templates=templates,
+        )
+    output_directory = (
+        config.output_directory
+        if overrides.output_directory is None
+        else overrides.output_directory
+    )
+    output_base = config.output_directory_base
+    if overrides.output_directory is not None:
+        raw_base = Path.cwd() if cli_cwd is None else Path(cli_cwd)
+        try:
+            resolved_base = raw_base.resolve(strict=True)
+        except (OSError, RuntimeError) as error:
+            raise _error(
+                "INVALID_OVERRIDE_BASE_DIRECTORY",
+                "CLI working directory could not be resolved",
+                stage="config.override",
+                field="output_directory",
+                actual=str(raw_base),
+                original_error=error,
+            ) from error
+        if not resolved_base.is_dir():
+            raise _error(
+                "INVALID_OVERRIDE_BASE_DIRECTORY",
+                "CLI working directory must be a directory",
+                stage="config.override",
+                field="output_directory",
+                actual=str(resolved_base),
+            )
+        output_base = str(resolved_base)
+
+    schema = config.schema_version
+    if (
+        schema == TRAINING_RUN_CONFIG_SCHEMA_VERSION_V1
+        and overrides.validation_batch_size is not None
+    ):
+        schema = TRAINING_RUN_CONFIG_SCHEMA_VERSION_V2
+    return replace(
+        config,
+        schema_version=schema,
+        runtime=runtime,
+        data=data,
+        fit=fit,
+        optimizer=optimizer,
+        radii=radii,
+        model_source=model_source,
+        output_directory=output_directory,
+        output_directory_base=output_base,
+    )
+
+
 def validate_training_run_config(config: TrainingRunConfig) -> TrainingRunConfig:
     """Validate cross-config contracts without touching external resources."""
 
     if not isinstance(config, TrainingRunConfig):
         raise TypeError("config must be a TrainingRunConfig")
+    if isinstance(config.model_source, ScratchModelSourceConfig):
+        try:
+            validate_radius_model_compatibility(
+                config.radii, config.model_source.potential
+            )
+        except RadiusConfigError as error:
+            first = error.mismatches[0] if error.mismatches else (None, None, None)
+            raise _error(
+                error.reason_code,
+                "scratch PotentialConfig is incompatible with interaction radii",
+                stage="config.model_source.radii",
+                field=first[0],
+                expected=first[1],
+                actual=first[2],
+                original_reason_code=error.reason_code,
+                original_error=error,
+            ) from error
+        for index, template in enumerate(config.model_source.reference_templates):
+            builder = template.builder
+            for name, expected, actual in (
+                ("graph_cutoff", config.radii.r_mp, builder.graph_cutoff),
+                ("graph_skin", config.radii.mp_skin, builder.graph_skin),
+            ):
+                if not math.isclose(
+                    expected, actual, rel_tol=0.0, abs_tol=1.0e-12
+                ):
+                    raise _error(
+                        "SCRATCH_RADIUS_MISMATCH",
+                        "scratch builder graph radius differs from radii config",
+                        stage="config.model_source.radii",
+                        field=(
+                            f"model_source.reference_templates[{index}].builder.{name}"
+                        ),
+                        template_id=builder.template_id,
+                        expected=expected,
+                        actual=actual,
+                    )
     if config.train_step.solver_path != TRAIN_FIXED:
         raise _error(
             "UNSUPPORTED_TRAINING_SOLVER",
@@ -825,7 +1310,7 @@ def validate_training_run_config(config: TrainingRunConfig) -> TrainingRunConfig
     if config.fit.start_epoch != 0 or config.fit.global_step_start != 0:
         raise _error(
             "FRESH_RUN_PROGRESS_REQUIRED",
-            "initial_bundle config describes a fresh run; resume progress is unsupported",
+            "training config describes a fresh run; resume progress is unsupported",
             stage="config.cross_validation",
             field="fit.start_epoch,fit.global_step_start",
             expected=(0, 0),
@@ -834,8 +1319,121 @@ def validate_training_run_config(config: TrainingRunConfig) -> TrainingRunConfig
     return config
 
 
+class _UniqueKeySafeLoader(yaml.SafeLoader):
+    """Private safe loader; no process-global YAML constructor is modified."""
+
+
+def _construct_unique_mapping(loader, node, deep=False):
+    loader.flatten_mapping(node)
+    result = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        if type(key) is not str:
+            raise _error(
+                "INVALID_CONFIG_YAML_TYPE",
+                "YAML mapping keys must be strings",
+                stage="config.parse",
+                field=repr(key),
+            )
+        if key in result:
+            raise _error(
+                "CONFLICTING_CONFIG_KEY",
+                "duplicate YAML mapping key is forbidden",
+                stage="config.parse",
+                field=key,
+            )
+        result[key] = loader.construct_object(value_node, deep=deep)
+    return result
+
+
+_UniqueKeySafeLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+    _construct_unique_mapping,
+)
+
+
+def _validate_plain_config_tree(value: Any, *, field_name: str = "config") -> None:
+    active: set[int] = set()
+
+    def visit(item: Any, path: str) -> None:
+        if type(item) is float and not math.isfinite(item):
+            raise _error(
+                "NONFINITE_CONFIG_VALUE",
+                "NaN and Infinity are forbidden in training-run config",
+                stage="config.parse",
+                field=path,
+                actual=item,
+            )
+        if item is None or type(item) in (str, bool, int, float):
+            return
+        if isinstance(item, Mapping):
+            identity = id(item)
+            if identity in active:
+                raise _error(
+                    "INVALID_CONFIG_YAML_TYPE",
+                    "recursive YAML aliases are forbidden",
+                    stage="config.parse",
+                    field=path,
+                )
+            active.add(identity)
+            try:
+                for key, nested in item.items():
+                    if type(key) is not str:
+                        raise _error(
+                            "INVALID_CONFIG_YAML_TYPE",
+                            "config mapping keys must be strings",
+                            stage="config.parse",
+                            field=path,
+                        )
+                    visit(nested, f"{path}.{key}")
+            finally:
+                active.remove(identity)
+            return
+        if isinstance(item, list):
+            identity = id(item)
+            if identity in active:
+                raise _error(
+                    "INVALID_CONFIG_YAML_TYPE",
+                    "recursive YAML aliases are forbidden",
+                    stage="config.parse",
+                    field=path,
+                )
+            active.add(identity)
+            try:
+                for index, nested in enumerate(item):
+                    visit(nested, f"{path}[{index}]")
+            finally:
+                active.remove(identity)
+            return
+        raise _error(
+            "INVALID_CONFIG_YAML_TYPE",
+            "YAML must decode only to plain JSON-compatible values",
+            stage="config.parse",
+            field=path,
+            actual=type(item).__name__,
+        )
+
+    visit(value, field_name)
+
+
+def _from_yaml(value: str) -> TrainingRunConfig:
+    try:
+        payload = yaml.load(value, Loader=_UniqueKeySafeLoader)
+    except TrainingRunConfigError:
+        raise
+    except yaml.YAMLError as error:
+        raise _error(
+            "INVALID_CONFIG_YAML",
+            "training-run YAML could not be decoded safely",
+            stage="config.parse",
+            original_error=error,
+        ) from error
+    _validate_plain_config_tree(payload)
+    return TrainingRunConfig.from_dict(payload)
+
+
 def load_training_run_config(path: str | os.PathLike[str]) -> TrainingRunConfig:
-    """Load strict JSON while preserving its semantic relative path strings."""
+    """Load strict JSON/YAML while preserving semantic relative path strings."""
 
     raw_path = Path(path)
     try:
@@ -873,13 +1471,34 @@ def load_training_run_config(path: str | os.PathLike[str]) -> TrainingRunConfig:
             config_path=str(resolved),
             original_error=error,
         ) from error
+    suffix = resolved.suffix.lower()
     try:
-        config = TrainingRunConfig.from_json(encoded)
+        if suffix in (".yaml", ".yml"):
+            config = _from_yaml(encoded)
+        else:
+            # Preserve the v1 loader contract: JSON was accepted regardless
+            # of filename suffix. YAML is selected only when explicitly named.
+            config = TrainingRunConfig.from_json(encoded)
     except TrainingRunConfigError as error:
         if error.config_path is None:
             error.config_path = str(resolved)
         raise
     return replace(config, source_path=str(resolved))
+
+
+def load_effective_training_run_config(
+    path: str | os.PathLike[str],
+    overrides: TrainingRunConfigOverrides | None = None,
+    *,
+    cli_cwd: str | os.PathLike[str] | None = None,
+) -> TrainingRunConfig:
+    """Shared file/default/explicit-override precedence resolver."""
+
+    return apply_training_run_overrides(
+        load_training_run_config(path),
+        overrides,
+        cli_cwd=cli_cwd,
+    )
 
 
 def _freeze_plain(value: Any) -> Any:
@@ -937,6 +1556,7 @@ class ResolvedTrainingRun:
     expected_paths: Mapping[str, str]
     training_configuration: Mapping[str, Any]
     training_executed: bool = False
+    config_schema_version: str = TRAINING_RUN_CONFIG_SCHEMA_VERSION_V1
 
     def __post_init__(self) -> None:
         for name in (
@@ -979,6 +1599,8 @@ class ResolvedTrainingRun:
             raise ValueError("radius_config and derived radii disagree")
         if type(self.training_executed) is not bool or self.training_executed:
             raise ValueError("preflight metadata requires training_executed=False")
+        if self.config_schema_version not in SUPPORTED_TRAINING_RUN_CONFIG_SCHEMA_VERSIONS:
+            raise ValueError("unsupported resolved training config schema")
         species = tuple(self.species_vocabulary)
         if (
             not species
@@ -1011,7 +1633,7 @@ class ResolvedTrainingRun:
         return {
             "status": "preflight_ready",
             "training_executed": False,
-            "schema_version": TRAINING_RUN_CONFIG_SCHEMA_VERSION,
+            "schema_version": self.config_schema_version,
             "config_fingerprint": self.config_fingerprint,
             "bundle_fingerprint": self.bundle_fingerprint,
             "data": {
@@ -1070,6 +1692,86 @@ class ResolvedTrainingRun:
         }
 
 
+@dataclass(frozen=True)
+class ResolvedScratchTrainingRun:
+    """Config-only scratch resolution; no source file or model is materialized."""
+
+    config_fingerprint: str
+    model_source: ScratchModelSourceConfig
+    runtime: TrainingRuntimeConfig
+    data: TrainingDataConfig
+    radius_config: InteractionRadiusConfig
+    configured_paths: Mapping[str, Any]
+    runtime_paths: Mapping[str, Any]
+    training_configuration: Mapping[str, Any]
+    training_executed: bool = False
+    scratch_execution_implemented: bool = False
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.config_fingerprint) is not str
+            or _SHA256.fullmatch(self.config_fingerprint) is None
+        ):
+            raise ValueError("config_fingerprint must be a lowercase SHA-256 string")
+        if not isinstance(self.model_source, ScratchModelSourceConfig):
+            raise TypeError("model_source must be ScratchModelSourceConfig")
+        if not isinstance(self.runtime, TrainingRuntimeConfig):
+            raise TypeError("runtime must be TrainingRuntimeConfig")
+        if not isinstance(self.data, TrainingDataConfig):
+            raise TypeError("data must be TrainingDataConfig")
+        if not isinstance(self.radius_config, InteractionRadiusConfig):
+            raise TypeError("radius_config must be InteractionRadiusConfig")
+        if type(self.training_executed) is not bool or self.training_executed:
+            raise ValueError("scratch config resolution cannot execute training")
+        if (
+            type(self.scratch_execution_implemented) is not bool
+            or self.scratch_execution_implemented
+        ):
+            raise ValueError("scratch execution must remain disabled in 10A-1")
+        for name in (
+            "configured_paths",
+            "runtime_paths",
+            "training_configuration",
+        ):
+            object.__setattr__(self, name, _freeze_plain(getattr(self, name)))
+
+    def to_dict(self) -> dict[str, Any]:
+        source = self.model_source
+        return {
+            "status": "scratch_config_ready",
+            "training_executed": False,
+            "schema_version": TRAINING_RUN_CONFIG_SCHEMA_VERSION_V2,
+            "config_fingerprint": self.config_fingerprint,
+            "execution": {
+                "implemented": False,
+                "reason_code": "SCRATCH_EXECUTION_NOT_IMPLEMENTED",
+            },
+            "model_source": source.to_dict(),
+            "data": {
+                "train_source_count": len(self.data.train),
+                "validation_source_count": len(self.data.validation),
+                "batch_size": self.data.batch_size,
+                "validation_batch_size": (
+                    self.data.effective_validation_batch_size
+                ),
+                "shuffle": False,
+            },
+            "runtime": {
+                "device": self.runtime.device,
+                "dtype": self.runtime.dtype,
+                "seed": self.runtime.seed,
+                "configured_paths": _plain(self.configured_paths),
+                "paths": _plain(self.runtime_paths),
+            },
+            "radii": {
+                "config": self.radius_config.to_dict(),
+                "derived": self.radius_config.derived.to_dict(),
+                "diagnostics": self.radius_config.derived.to_diagnostics_dict(),
+            },
+            "training_configuration": _plain(self.training_configuration),
+        }
+
+
 def _base_directory(
     config: TrainingRunConfig,
     base_directory: str | os.PathLike[str] | None,
@@ -1109,6 +1811,116 @@ def _base_directory(
             ) from error
         return config_path.parent, config_path
     return Path.cwd().resolve(strict=True), None
+
+
+def _training_configuration_metadata(
+    config: TrainingRunConfig,
+) -> dict[str, Any]:
+    result = {
+        "loss": config.loss.to_dict(),
+        "baseline": (
+            None if config.baseline is None else config.baseline.to_dict()
+        ),
+        "optimizer": config.optimizer.to_dict(),
+        "train_step": config.train_step.to_dict(),
+        "validation_step": config.validation_step.to_dict(),
+        "scheduler": config.scheduler.to_dict(),
+        "selection": config.selection.to_dict(),
+        "fit": config.fit.to_dict(),
+        "checkpointed_fit": config.checkpointed_fit.to_dict(),
+        "batch_size": config.data.batch_size,
+        "shuffle": False,
+    }
+    if config.schema_version == TRAINING_RUN_CONFIG_SCHEMA_VERSION_V2:
+        result["validation_batch_size"] = (
+            config.data.effective_validation_batch_size
+        )
+    return result
+
+
+def _resolve_path_without_loading(text: str, *, base: Path) -> Path:
+    candidate = Path(text)
+    unresolved = candidate if candidate.is_absolute() else base / candidate
+    try:
+        return unresolved.resolve(strict=False)
+    except (OSError, RuntimeError) as error:
+        raise _error(
+            "CONFIG_PATH_ERROR",
+            "configured path could not be resolved without loading its content",
+            stage="paths.scratch_config",
+            actual=text,
+            original_error=error,
+        ) from error
+
+
+def _resolve_scratch_training_run(
+    config: TrainingRunConfig,
+    *,
+    base_directory: str | os.PathLike[str] | None,
+) -> ResolvedScratchTrainingRun:
+    source = config.model_source
+    if not isinstance(source, ScratchModelSourceConfig):
+        raise TypeError("scratch resolution requires ScratchModelSourceConfig")
+    base, config_path = _base_directory(config, base_directory)
+    output_base = (
+        base
+        if config.output_directory_base is None
+        else Path(config.output_directory_base)
+    )
+    output_path = _resolve_path_without_loading(
+        config.output_directory, base=output_base
+    )
+    train_paths = tuple(
+        _resolve_path_without_loading(item.path, base=base)
+        for item in config.data.train
+    )
+    validation_paths = tuple(
+        _resolve_path_without_loading(item.path, base=base)
+        for item in config.data.validation
+    )
+    reference_paths = tuple(
+        _resolve_path_without_loading(item.poscar_path, base=base)
+        for item in source.reference_templates
+    )
+    configured_paths = {
+        "output_directory": config.output_directory,
+        "train_inputs": [item.path for item in config.data.train],
+        "validation_inputs": [item.path for item in config.data.validation],
+        "reference_poscars": [
+            {
+                "template_id": item.template_id,
+                "path": item.poscar_path,
+            }
+            for item in source.reference_templates
+        ],
+        "path_kind": "original_config_expression_in_semantic_fingerprint",
+    }
+    runtime_paths = {
+        "config": None if config_path is None else str(config_path),
+        "output_directory": str(output_path),
+        "train_inputs": [str(path) for path in train_paths],
+        "validation_inputs": [str(path) for path in validation_paths],
+        "reference_poscars": [
+            {
+                "template_id": item.template_id,
+                "path": str(path),
+            }
+            for item, path in zip(source.reference_templates, reference_paths)
+        ],
+        "path_kind": "runtime_location_not_semantic_fingerprint",
+    }
+    return ResolvedScratchTrainingRun(
+        config_fingerprint=config.config_fingerprint,
+        model_source=source,
+        runtime=config.runtime,
+        data=config.data,
+        radius_config=config.radii,
+        configured_paths=configured_paths,
+        runtime_paths=runtime_paths,
+        training_configuration=_training_configuration_metadata(config),
+        training_executed=False,
+        scratch_execution_implemented=False,
+    )
 
 
 def _resolve_existing_file(
@@ -1806,12 +2618,18 @@ def resolve_training_run(
     config: TrainingRunConfig,
     *,
     base_directory: str | os.PathLike[str] | None = None,
-) -> ResolvedTrainingRun:
-    """Perform complete read-only preflight without model execution or writes."""
+) -> ResolvedTrainingRun | ResolvedScratchTrainingRun:
+    """Resolve bundle preflight or config-only scratch metadata without writes."""
 
     validate_training_run_config(config)
+    if isinstance(config.model_source, ScratchModelSourceConfig):
+        return _resolve_scratch_training_run(
+            config,
+            base_directory=base_directory,
+        )
     base, config_path = _base_directory(config, base_directory)
     resolved_device = _preflight_device(config.runtime)
+    assert config.initial_bundle is not None
     bundle_path = _resolve_existing_file(
         config.initial_bundle,
         base=base,
@@ -1846,9 +2664,14 @@ def resolve_training_run(
     )
     if config_path is not None:
         protected.append(("config", config_path))
+    output_base = (
+        base
+        if config.output_directory_base is None
+        else Path(config.output_directory_base)
+    )
     output_path = _resolve_output_directory(
         config.output_directory,
-        base=base,
+        base=output_base,
         config_path=config_path,
         protected=tuple(protected),
     )
@@ -1948,6 +2771,7 @@ def resolve_training_run(
     )
 
     batch_size = config.data.batch_size
+    validation_batch_size = config.data.effective_validation_batch_size
     train_template_counts = dict(
         sorted(Counter(sample.template_id for sample in train_samples).items())
     )
@@ -2009,21 +2833,7 @@ def resolve_training_run(
             output_path / "checkpoints" / "epoch_XXXXXX.pt"
         ),
     }
-    training_configuration = {
-        "loss": config.loss.to_dict(),
-        "baseline": (
-            None if config.baseline is None else config.baseline.to_dict()
-        ),
-        "optimizer": config.optimizer.to_dict(),
-        "train_step": config.train_step.to_dict(),
-        "validation_step": config.validation_step.to_dict(),
-        "scheduler": config.scheduler.to_dict(),
-        "selection": config.selection.to_dict(),
-        "fit": config.fit.to_dict(),
-        "checkpointed_fit": config.checkpointed_fit.to_dict(),
-        "batch_size": batch_size,
-        "shuffle": False,
-    }
+    training_configuration = _training_configuration_metadata(config)
     return ResolvedTrainingRun(
         config_fingerprint=config.config_fingerprint,
         bundle_fingerprint=bundle.bundle_fingerprint,
@@ -2036,7 +2846,9 @@ def resolve_training_run(
         train_frame_count=len(train_samples),
         validation_frame_count=len(validation_samples),
         train_batch_count=math.ceil(len(train_samples) / batch_size),
-        validation_batch_count=math.ceil(len(validation_samples) / batch_size),
+        validation_batch_count=math.ceil(
+            len(validation_samples) / validation_batch_size
+        ),
         resolved_device=resolved_device,
         resolved_dtype=config.runtime.dtype,
         seed=config.runtime.seed,
@@ -2057,17 +2869,25 @@ def resolve_training_run(
         runtime_paths=runtime_paths,
         expected_paths=expected_paths,
         training_configuration=training_configuration,
+        config_schema_version=config.schema_version,
         training_executed=False,
     )
 
 
 __all__ = [
     "TRAINING_RUN_CONFIG_SCHEMA_VERSION",
+    "TRAINING_RUN_CONFIG_SCHEMA_VERSION_V1",
+    "TRAINING_RUN_CONFIG_SCHEMA_VERSION_V2",
+    "SUPPORTED_TRAINING_RUN_CONFIG_SCHEMA_VERSIONS",
+    "ResolvedScratchTrainingRun",
     "ResolvedTrainingRun",
     "TrainingDataConfig",
+    "TrainingRunConfigOverrides",
     "TrainingRuntimeConfig",
     "TrainingRunConfig",
     "TrainingRunConfigError",
+    "apply_training_run_overrides",
+    "load_effective_training_run_config",
     "load_training_run_config",
     "resolve_training_run",
     "validate_training_run_config",

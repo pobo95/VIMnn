@@ -17,10 +17,12 @@ import numpy as np
 import torch
 
 from refsite_mlip.config import (
+    ResolvedScratchTrainingRun,
     ResolvedTrainingRun,
     TrainingRunConfig,
+    TrainingRunConfigOverrides,
     TrainingRunConfigError,
-    load_training_run_config,
+    load_effective_training_run_config,
     resolve_training_run,
 )
 from refsite_mlip.config.training_run import _load_split, _split_digest
@@ -96,9 +98,17 @@ def _raise_cli_preflight(error: TrainingRunConfigError, path: Any) -> None:
 
 def _load_preflight(
     path: str | os.PathLike[str],
-) -> tuple[TrainingRunConfig, ResolvedTrainingRun]:
+    *,
+    overrides: TrainingRunConfigOverrides | None = None,
+    cli_cwd: str | os.PathLike[str] | None = None,
+) -> tuple[
+    TrainingRunConfig,
+    ResolvedTrainingRun | ResolvedScratchTrainingRun,
+]:
     try:
-        config = load_training_run_config(path)
+        config = load_effective_training_run_config(
+            path, overrides, cli_cwd=cli_cwd
+        )
         resolved = resolve_training_run(config)
     except TrainingRunConfigError as error:
         _raise_cli_preflight(error, path)
@@ -256,7 +266,7 @@ def _prepare_training_runtime(
     )
     validation_batches = _batch_samples(
         validation_samples,
-        batch_size=config.data.batch_size,
+        batch_size=config.data.effective_validation_batch_size,
         registry=loaded.registry,
         device=resolved.resolved_device,
         dtype=config.runtime.torch_dtype,
@@ -604,12 +614,46 @@ def _write_failure_status(
     return original_error
 
 
+def _reload_effective_config_for_toctou(
+    config: TrainingRunConfig,
+    *,
+    overrides: TrainingRunConfigOverrides | None,
+    cli_cwd: str | os.PathLike[str],
+) -> TrainingRunConfig:
+    """Rebuild exactly the effective config validated before lock acquisition."""
+
+    if config.source_path is None:
+        raise CLIError(
+            "CONFIG_SOURCE_MISSING",
+            "fresh training requires the original resolved config path",
+            stage="training.config.toctou",
+        )
+    try:
+        current = load_effective_training_run_config(
+            config.source_path,
+            overrides,
+            cli_cwd=cli_cwd,
+        )
+    except TrainingRunConfigError as error:
+        _raise_cli_preflight(error, config.source_path)
+    if current.config_fingerprint != config.config_fingerprint:
+        raise CLIError(
+            "TRAIN_CONFIG_TOCTOU_MISMATCH",
+            "training-run config changed between preflight and lock acquisition",
+            stage="training.config.toctou",
+            path=config.source_path,
+        )
+    return current
+
+
 def _execute_training(
     config: TrainingRunConfig,
     resolved: ResolvedTrainingRun,
     directory: TrainingRunDirectory,
     *,
     progress: Callable[[str], None] | None,
+    overrides: TrainingRunConfigOverrides | None,
+    cli_cwd: str | os.PathLike[str],
 ) -> dict[str, Any]:
     """Execute a fresh run while the caller owns the run-directory lock."""
 
@@ -619,23 +663,11 @@ def _execute_training(
     baseline: dict[str, Any] | None = None
     training_executed = False
     try:
-        if config.source_path is None:
-            raise CLIError(
-                "CONFIG_SOURCE_MISSING",
-                "fresh training requires the original resolved config path",
-                stage="training.config.toctou",
-            )
-        try:
-            current_config = load_training_run_config(config.source_path)
-        except TrainingRunConfigError as error:
-            _raise_cli_preflight(error, config.source_path)
-        if current_config.config_fingerprint != config.config_fingerprint:
-            raise CLIError(
-                "TRAIN_CONFIG_TOCTOU_MISMATCH",
-                "training-run config changed between preflight and lock acquisition",
-                stage="training.config.toctou",
-                path=config.source_path,
-            )
+        _reload_effective_config_for_toctou(
+            config,
+            overrides=overrides,
+            cli_cwd=cli_cwd,
+        )
         phase = "metadata.resolved_config"
         directory.write_resolved_config(config.to_dict())
         phase = "metadata.preflight"
@@ -767,14 +799,31 @@ def run_training(
     *,
     dry_run: bool = False,
     progress: Callable[[str], None] | None = None,
-) -> ResolvedTrainingRun | dict[str, Any]:
+    overrides: TrainingRunConfigOverrides | None = None,
+    cli_cwd: str | os.PathLike[str] | None = None,
+) -> ResolvedTrainingRun | ResolvedScratchTrainingRun | dict[str, Any]:
     """Preflight and optionally execute one fresh deterministic training run."""
 
     if type(dry_run) is not bool:
         raise TypeError("dry_run must be a bool")
-    config, resolved = _load_preflight(path)
+    effective_cli_cwd = Path.cwd() if cli_cwd is None else Path(cli_cwd)
+    config, resolved = _load_preflight(
+        path,
+        overrides=overrides,
+        cli_cwd=effective_cli_cwd,
+    )
     if dry_run:
         return resolved
+    if isinstance(resolved, ResolvedScratchTrainingRun):
+        raise CLIError(
+            "SCRATCH_EXECUTION_NOT_IMPLEMENTED",
+            "scratch model construction is deferred to Milestone 10A-2",
+            stage="model_source.execution",
+            path=config.source_path,
+            config_field="model_source.kind",
+            source_kind="scratch",
+            underlying_reason_code="SCRATCH_EXECUTION_NOT_IMPLEMENTED",
+        )
 
     seed_training_runtime(config.runtime.seed)
     output = Path(str(resolved.runtime_paths["output_directory"]))
@@ -803,6 +852,8 @@ def run_training(
                 resolved,
                 directory,
                 progress=progress,
+                overrides=overrides,
+                cli_cwd=effective_cli_cwd,
             )
     except (CLIError, CLIInterruptedError):
         raise
@@ -858,17 +909,17 @@ def render_training_human(report: Mapping[str, Any]) -> str:
 
 
 def render_train_result_json(
-    result: ResolvedTrainingRun | Mapping[str, Any],
+    result: ResolvedTrainingRun | ResolvedScratchTrainingRun | Mapping[str, Any],
 ) -> str:
-    if isinstance(result, ResolvedTrainingRun):
+    if isinstance(result, (ResolvedTrainingRun, ResolvedScratchTrainingRun)):
         return render_train_config_json(result)
     return render_training_json(result)
 
 
 def render_train_result_human(
-    result: ResolvedTrainingRun | Mapping[str, Any],
+    result: ResolvedTrainingRun | ResolvedScratchTrainingRun | Mapping[str, Any],
 ) -> str:
-    if isinstance(result, ResolvedTrainingRun):
+    if isinstance(result, (ResolvedTrainingRun, ResolvedScratchTrainingRun)):
         return render_train_config_human(result)
     return render_training_human(result)
 

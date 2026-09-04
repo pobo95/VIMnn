@@ -24,7 +24,7 @@ from refsite_mlip.config.radii import (
     validate_radius_model_compatibility,
 )
 from refsite_mlip.config.training_run import (
-    TRAINING_RUN_CONFIG_SCHEMA_VERSION,
+    TRAINING_RUN_CONFIG_SCHEMA_VERSION_V2,
     _phase_specification_fingerprint,
 )
 from refsite_mlip.models import (
@@ -339,7 +339,7 @@ def _validate_stored_run(directory: TrainingRunDirectory) -> _StoredRun:
     _require_equal(
         "preflight.schema_version",
         preflight["schema_version"],
-        TRAINING_RUN_CONFIG_SCHEMA_VERSION,
+        config.schema_version,
         path=directory.preflight_path,
     )
     config_fingerprint = _sha256(
@@ -498,6 +498,10 @@ def _validate_stored_run(directory: TrainingRunDirectory) -> _StoredRun:
         "batch_size": config.data.batch_size,
         "shuffle": False,
     }
+    if config.schema_version == TRAINING_RUN_CONFIG_SCHEMA_VERSION_V2:
+        expected_training["validation_batch_size"] = (
+            config.data.effective_validation_batch_size
+        )
     _require_equal(
         "training_configuration",
         preflight["training_configuration"],
