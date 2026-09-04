@@ -65,7 +65,8 @@ from .errors import CLIError
 
 
 EXPORT_BUNDLE_RESULT_SCHEMA_VERSION = "refsite_export_bundle_result_v1"
-EXPORT_BUNDLE_PROVENANCE_SCHEMA_VERSION = "refsite_checkpoint_export_v1"
+EXPORT_BUNDLE_PROVENANCE_SCHEMA_VERSION = "refsite_checkpoint_export_v2"
+_EXPORT_BUNDLE_PROVENANCE_SOURCE = "managed_epoch_checkpoint"
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _SOURCES = frozenset({"best", "latest"})
 _METRICS_STATUS_FIELDS = {
@@ -1675,7 +1676,12 @@ def _capture_export_bundle(
         "training_config_sha256": stored.config_fingerprint,
         "train_semantic_digest": stored.train_semantic_digest,
         "validation_semantic_digest": stored.validation_semantic_digest,
-        "source": source,
+        # ``best`` and ``latest`` are filesystem selection aliases, not
+        # properties of the selected managed epoch.  Keeping the alias out of
+        # semantic provenance makes two exports of the same checkpoint state
+        # produce the same portable-bundle fingerprint while the CLI report
+        # still records the alias requested by the caller.
+        "source": _EXPORT_BUNDLE_PROVENANCE_SOURCE,
         "checkpoint_epoch": checkpoint.progress.last_completed_epoch,
         "global_step": checkpoint.progress.global_step,
         "selection_monitor": stored.config.selection.monitor,

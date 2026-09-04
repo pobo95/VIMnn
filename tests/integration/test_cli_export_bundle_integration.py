@@ -151,7 +151,8 @@ def test_latest_export_exact_state_baseline_bindings_and_payload_exclusions(
     }
     assert forbidden.isdisjoint(payload)
     provenance = exported.provenance
-    assert provenance["source"] == "latest"
+    assert provenance["schema_version"] == "refsite_checkpoint_export_v2"
+    assert provenance["source"] == "managed_epoch_checkpoint"
     assert provenance["checkpoint_epoch"] == checkpoint.progress.last_completed_epoch
     assert provenance["global_step"] == checkpoint.progress.global_step
     assert provenance["parent_initial_bundle_sha256"] == parent.bundle_fingerprint
@@ -221,6 +222,81 @@ def test_repeated_exports_have_identical_semantic_sha_and_override_works(
     assert render_export_bundle_json(first_report) == render_export_bundle_json(
         dict(reversed(tuple(first_report.items())))
     )
+
+
+def test_best_and_latest_aliases_of_same_epoch_have_identical_bundle_fingerprint(
+    synthetic_run, tmp_path
+):
+    best_path = tmp_path / "same-epoch-best.pt"
+    latest_path = tmp_path / "same-epoch-latest.pt"
+    best_report = export_bundle(
+        synthetic_run["run"], source="best", output_path=best_path
+    )
+    latest_report = export_bundle(
+        synthetic_run["run"], source="latest", output_path=latest_path
+    )
+
+    # Selection aliases remain explicit in the user-facing report.
+    assert best_report["source"]["kind"] == "best"
+    assert latest_report["source"]["kind"] == "latest"
+    assert best_report["source"]["epoch"] == latest_report["source"]["epoch"] == 0
+
+    best = load_reference_site_model_bundle(best_path)
+    latest = load_reference_site_model_bundle(latest_path)
+    assert best.schema_version == latest.schema_version == (
+        "reference_site_model_bundle_v1"
+    )
+    assert best.bundle_fingerprint == latest.bundle_fingerprint
+    assert best_report["bundle_sha256"] == latest_report["bundle_sha256"]
+    assert best.provenance == latest.provenance
+    assert best.provenance["schema_version"] == "refsite_checkpoint_export_v2"
+    assert best.provenance["source"] == "managed_epoch_checkpoint"
+    assert tuple(best.model_state) == tuple(latest.model_state)
+    for key in best.model_state:
+        assert torch.equal(best.model_state[key], latest.model_state[key])
+
+
+def test_legacy_v1_export_provenance_bundle_still_loads(
+    synthetic_run, tmp_path
+):
+    parent = load_reference_site_model_bundle(synthetic_run["bundle"]["path"])
+    runtime = instantiate_reference_site_model_bundle(
+        parent, device="cpu", dtype=torch.float64
+    )
+    bindings = {item.template_id: item for item in parent.template_bindings}
+    legacy = capture_reference_site_model_bundle(
+        model=runtime.model,
+        structural_artifacts={
+            template_id: binding.structural_artifact
+            for template_id, binding in bindings.items()
+        },
+        phase_specifications={
+            template_id: binding.phase_specification
+            for template_id, binding in bindings.items()
+        },
+        evaluation_policies={
+            template_id: binding.evaluation_policy
+            for template_id, binding in bindings.items()
+            if binding.evaluation_policy is not None
+        },
+        default_template_id=parent.default_template_id,
+        provenance={
+            "schema_version": "refsite_checkpoint_export_v1",
+            "source": "latest",
+            "checkpoint_epoch": 0,
+        },
+    )
+    path = tmp_path / "legacy-export-v1.pt"
+    save_reference_site_model_bundle(path, legacy)
+    restored = load_reference_site_model_bundle(path)
+    assert restored.bundle_fingerprint == legacy.bundle_fingerprint
+    assert restored.provenance == {
+        "checkpoint_epoch": 0,
+        "schema_version": "refsite_checkpoint_export_v1",
+        "source": "latest",
+    }
+    for key in legacy.model_state:
+        assert torch.equal(restored.model_state[key], legacy.model_state[key])
 
 
 def test_cli_json_human_overwrite_and_output_collision(synthetic_run, tmp_path, capsys):
