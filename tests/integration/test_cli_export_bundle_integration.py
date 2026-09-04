@@ -673,6 +673,26 @@ def test_bundle_run_rejects_scratch_only_status_extensions(
         status_path.write_bytes(status_before)
 
 
+def test_export_requires_complete_metrics_status_group(synthetic_run, tmp_path):
+    status_path = synthetic_run["run"] / "run_status.json"
+    status_before = status_path.read_bytes()
+    try:
+        status = json.loads(status_before)
+        status.pop("metrics_semantic_sha256")
+        status_path.write_text(json.dumps(status, sort_keys=True), encoding="utf-8")
+        with pytest.raises(CLIError) as caught:
+            export_bundle(
+                synthetic_run["run"],
+                source="latest",
+                output_path=tmp_path / "partial-metrics-status.pt",
+                dry_run=True,
+            )
+        assert caught.value.reason_code == "INVALID_RUN_STATUS"
+        assert "complete group" in caught.value.message
+    finally:
+        status_path.write_bytes(status_before)
+
+
 def test_resumed_run_latest_and_preserved_best_are_exportable(
     training_bundle, tmp_path
 ):

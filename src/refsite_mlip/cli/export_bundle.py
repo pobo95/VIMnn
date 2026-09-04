@@ -68,6 +68,12 @@ EXPORT_BUNDLE_RESULT_SCHEMA_VERSION = "refsite_export_bundle_result_v1"
 EXPORT_BUNDLE_PROVENANCE_SCHEMA_VERSION = "refsite_checkpoint_export_v1"
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _SOURCES = frozenset({"best", "latest"})
+_METRICS_STATUS_FIELDS = {
+    "metrics_journal",
+    "metrics_event_count",
+    "metrics_last_epoch",
+    "metrics_semantic_sha256",
+}
 
 
 @dataclass(frozen=True)
@@ -588,7 +594,7 @@ def _validate_stored_run(directory: TrainingRunDirectory) -> _StoredRun:
         "exact_resume",
         "rollback_succeeded",
         "partial_update_retained",
-    } | scratch_status_fields
+    } | scratch_status_fields | _METRICS_STATUS_FIELDS
     if not required_status.issubset(status) or not set(status).issubset(allowed_status):
         raise CLIError(
             "INVALID_RUN_STATUS",
@@ -632,6 +638,61 @@ def _validate_stored_run(directory: TrainingRunDirectory) -> _StoredRun:
             path=directory.status_path,
             config_field="training_executed",
         )
+    present_metrics_fields = set(status).intersection(_METRICS_STATUS_FIELDS)
+    if present_metrics_fields and present_metrics_fields != _METRICS_STATUS_FIELDS:
+        raise CLIError(
+            "INVALID_RUN_STATUS",
+            "run_status metrics journal metadata must be present as one complete group",
+            stage="export.metadata.status",
+            path=directory.status_path,
+        )
+    if present_metrics_fields:
+        if status["metrics_journal"] != "metrics.jsonl":
+            raise CLIError(
+                "INVALID_RUN_STATUS",
+                "run_status.metrics_journal must be the managed relative path 'metrics.jsonl'",
+                stage="export.metadata.status",
+                path=directory.status_path,
+                config_field="metrics_journal",
+            )
+        event_count = status["metrics_event_count"]
+        if type(event_count) is not int or event_count < 0:
+            raise CLIError(
+                "INVALID_RUN_STATUS",
+                "run_status.metrics_event_count must be a nonnegative integer",
+                stage="export.metadata.status",
+                path=directory.status_path,
+                config_field="metrics_event_count",
+            )
+        last_epoch = status["metrics_last_epoch"]
+        if event_count == 0:
+            if last_epoch is not None:
+                raise CLIError(
+                    "INVALID_RUN_STATUS",
+                    "an empty metrics journal requires metrics_last_epoch=null",
+                    stage="export.metadata.status",
+                    path=directory.status_path,
+                    config_field="metrics_last_epoch",
+                )
+        elif type(last_epoch) is not int or last_epoch != event_count - 1:
+            raise CLIError(
+                "INVALID_RUN_STATUS",
+                "metrics_last_epoch must identify the contiguous terminal journal epoch",
+                stage="export.metadata.status",
+                path=directory.status_path,
+                config_field="metrics_last_epoch",
+            )
+        if (
+            type(status["metrics_semantic_sha256"]) is not str
+            or _SHA256.fullmatch(status["metrics_semantic_sha256"]) is None
+        ):
+            raise CLIError(
+                "INVALID_RUN_STATUS",
+                "run_status.metrics_semantic_sha256 must be a lowercase SHA-256",
+                stage="export.metadata.status",
+                path=directory.status_path,
+                config_field="metrics_semantic_sha256",
+            )
     for field in ("completed_epochs", "global_step"):
         value = status.get(field)
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:

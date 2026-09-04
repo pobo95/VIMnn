@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-import json
+import hashlib
 import importlib
+import json
 import os
 from pathlib import Path
 import random
@@ -23,6 +24,8 @@ from refsite_mlip.config import load_training_run_config
 from refsite_mlip.models import load_reference_site_model_bundle
 from refsite_mlip.training import (
     CheckpointManager,
+    MetricsJournal,
+    MetricsJournalError,
     ResumeRunLock,
     RunDirectoryError,
     ScratchCheckpointedTrainingError,
@@ -204,6 +207,19 @@ def test_one_epoch_mixed_loss_writes_safe_checkpoints_and_holds_common_lock(
     assert status["first_optimizer_update_executed"] is True
     assert status["recoverable_checkpoint"] == str(checkpoints / "latest.pt")
     assert status["rollback_performed"] is False
+    journal_bytes = (output / "metrics.jsonl").read_bytes()
+    journal_lines = journal_bytes.splitlines()
+    assert len(journal_lines) == 1
+    committed_event = json.loads(journal_lines[0])
+    assert committed_event["schema_version"] == "refsite_training_metrics_v1"
+    assert committed_event["event"] == "epoch_committed"
+    assert committed_event["epoch_index"] == 0
+    assert status["metrics_journal"] == "metrics.jsonl"
+    assert status["metrics_event_count"] == 1
+    assert status["metrics_last_epoch"] == 0
+    assert status["metrics_semantic_sha256"] == hashlib.sha256(
+        journal_bytes
+    ).hexdigest()
 
     # The generated initial bundle and bundle-compatible metadata are already
     # sufficient for resume/export; neither path rebuilds the scratch POSCAR.
@@ -352,6 +368,9 @@ def test_scratch_continuous_two_epochs_equals_one_plus_exact_resume(tmp_path):
     assert continuous_draws[1] == resumed_draws[1]
     assert torch.equal(continuous_draws[2], resumed_draws[2])
     assert first_epoch.read_bytes() == first_epoch_bytes
+    continuous_journal = Path(continuous.run_directory) / "metrics.jsonl"
+    resumed_journal = Path(first.run_directory) / "metrics.jsonl"
+    assert continuous_journal.read_bytes() == resumed_journal.read_bytes()
     assert sorted(
         path.name
         for path in Path(first.run_directory).joinpath("checkpoints").glob(
@@ -578,9 +597,27 @@ def test_reduce_on_plateau_early_stop_checkpoints_terminal_epoch(tmp_path):
     assert latest.progress.last_completed_epoch == 1
     assert latest.progress.stopped_early is True
     assert best.progress.last_completed_epoch == 0
-    assert json.loads(
+    status = json.loads(
         Path(result.run_directory, "run_status.json").read_text(encoding="utf-8")
-    )["status"] == "early_stopped"
+    )
+    assert status["status"] == "early_stopped"
+    journal = Path(result.run_directory, "metrics.jsonl")
+    journal_events = tuple(
+        json.loads(line)
+        for line in journal.read_text(encoding="utf-8").splitlines()
+    )
+    assert tuple(event["epoch_index"] for event in journal_events) == (0, 1)
+    assert journal_events[0]["is_best"] is True
+    assert journal_events[0]["should_stop"] is False
+    assert journal_events[1]["is_best"] is False
+    assert journal_events[1]["should_stop"] is True
+    assert journal_events[1]["best_epoch"] == 0
+    assert journal_events[1]["best_checkpoint_basename"] is None
+    assert status["metrics_event_count"] == 2
+    assert status["metrics_last_epoch"] == 1
+    assert status["metrics_semantic_sha256"] == hashlib.sha256(
+        journal.read_bytes()
+    ).hexdigest()
     exported = export_bundle(
         ExportBundleConfig(
             run_directory=result.run_directory,
@@ -591,6 +628,68 @@ def test_reduce_on_plateau_early_stop_checkpoints_terminal_epoch(tmp_path):
     )
     assert exported["source"]["kind"] == "best"
     assert exported["source"]["epoch"] == 0
+
+
+def test_metrics_journal_failure_preserves_committed_checkpoint_and_status(
+    tmp_path, monkeypatch
+):
+    config, preparation = _prepared(
+        tmp_path, max_epochs=2, baseline=False
+    )
+    output = Path(preparation.runtime_paths["output_directory"])
+    observed_epochs: list[int] = []
+
+    def fail_after_checkpoint(self, event):
+        observed_epochs.append(event.epoch_index)
+        assert output.joinpath("checkpoints", "epoch_000000.pt").is_file()
+        assert output.joinpath("checkpoints", "latest.pt").is_file()
+        raise MetricsJournalError(
+            "INJECTED_METRICS_JOURNAL_FAILURE",
+            "injected journal failure after checkpoint commit",
+            stage="metrics_journal.commit",
+            path=self.path,
+            epoch_index=event.epoch_index,
+            last_valid_epoch=None,
+            original_error=OSError("injected atomic rewrite failure"),
+        )
+
+    monkeypatch.setattr(MetricsJournal, "append", fail_after_checkpoint)
+    with pytest.raises(ScratchCheckpointedTrainingError) as caught:
+        run_scratch_checkpointed_training(config, preparation)
+
+    error = caught.value
+    assert observed_epochs == [0]
+    assert error.stage == "metrics_journal"
+    assert error.reason_code == "INJECTED_METRICS_JOURNAL_FAILURE"
+    assert error.completed_epochs == 1
+    assert error.global_step == 1
+    latest = output / "checkpoints" / "latest.pt"
+    assert error.recoverable_checkpoint == str(latest)
+    checkpoint = load_training_checkpoint(latest)
+    assert checkpoint.progress.completed_epochs == 1
+    assert checkpoint.progress.global_step == 1
+    assert sorted(
+        path.name for path in output.joinpath("checkpoints").glob("epoch_*.pt")
+    ) == ["epoch_000000.pt"]
+    assert not output.joinpath("metrics.jsonl").exists()
+
+    status = json.loads(
+        output.joinpath("run_status.json").read_text(encoding="utf-8")
+    )
+    assert status["status"] == "failed"
+    assert status["failure_phase"] == "metrics_journal"
+    assert status["completed_epochs"] == 1
+    assert status["global_step"] == 1
+    assert status["recoverable_checkpoint"] == str(latest)
+    assert status["rollback_performed"] is False
+    assert status["metrics_journal"] == "metrics.jsonl"
+    assert status["metrics_event_count"] == 0
+    assert status["metrics_last_epoch"] is None
+    assert status["metrics_semantic_sha256"] == hashlib.sha256(b"").hexdigest()
+    assert status["error"]["original_reason_code"] == (
+        "INJECTED_METRICS_JOURNAL_FAILURE"
+    )
+    assert not output.joinpath(".resume.lock").exists()
 
 
 def test_checkpoint_failure_records_retained_update_and_initial_recovery(
@@ -792,3 +891,6 @@ def test_scratch_and_equivalent_bundle_source_have_exact_trajectory(tmp_path):
     assert scratch_checkpoint.progress == bundle_checkpoint.progress
     assert scratch_checkpoint.fit_history == bundle_checkpoint.fit_history
     assert _tree_equal(scratch.fit_result.to_dict(), bundle_report["fit_result"])
+    assert Path(scratch.run_directory).joinpath("metrics.jsonl").read_bytes() == (
+        tmp_path / "bundle-output" / "metrics.jsonl"
+    ).read_bytes()

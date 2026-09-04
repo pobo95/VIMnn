@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+import hashlib
 import json
 import math
 from numbers import Integral
@@ -39,18 +40,22 @@ from refsite_mlip.training import (
     CheckpointedFitExecutionError,
     FitExecutionError,
     FitProgress,
+    MetricsJournal,
+    MetricsJournalError,
     ModelSelectionState,
     ScratchTrainingPreparation,
     apply_atomic_baseline_,
     build_optimizer,
     build_scheduler,
     capture_training_checkpoint,
+    committed_epoch_provenance_from_checkpoint_metadata,
     fit_atomic_baseline,
     prepare_scratch_training_run,
     run_checkpointed_fit,
 )
 from refsite_mlip.training.run_directory import (
     RUN_STATUS_SCHEMA_VERSION,
+    ResumeRunLock,
     RunDirectoryError,
     TrainingRunDirectory,
     canonical_runtime_json,
@@ -432,6 +437,7 @@ def _completed_status(
     resolved: ResolvedTrainingRun,
     result: Any,
     baseline: Mapping[str, Any],
+    journal: MetricsJournal,
 ) -> dict[str, Any]:
     status = _status_base(
         "completed", config, resolved, training_executed=True
@@ -450,6 +456,7 @@ def _completed_status(
             "baseline": dict(baseline),
         }
     )
+    status.update(journal.summary().to_dict())
     return json.loads(canonical_runtime_json(status))
 
 
@@ -461,6 +468,19 @@ def _nested_reason(error: BaseException) -> str | None:
         reason = getattr(current, "reason_code", None)
         if isinstance(reason, str) and reason:
             return reason
+        current = current.__cause__ or current.__context__
+    return None
+
+
+def _nested_exception(
+    error: BaseException, expected_type: type[BaseException]
+) -> BaseException | None:
+    current: BaseException | None = error
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, expected_type):
+            return current
         current = current.__cause__ or current.__context__
     return None
 
@@ -524,7 +544,14 @@ def _failure_details(
         completed_epochs = error.completed_epochs
         global_step = error.current_global_step
     elif isinstance(error, CheckpointedFitExecutionError):
-        error_phase = f"checkpoint.{error.failure_stage}"
+        if error.failure_stage == "epoch_observer":
+            error_phase = (
+                "metrics_journal"
+                if _nested_exception(error, MetricsJournalError) is not None
+                else "epoch_observer"
+            )
+        else:
+            error_phase = f"checkpoint.{error.failure_stage}"
         completed_epochs = error.epochs_checkpointed
         global_step = error.global_step
     batch_index, sample_id, template_id = _batch_context(
@@ -532,11 +559,15 @@ def _failure_details(
     )
     sample_id = _nested_text_attribute(error, "sample_id") or sample_id
     template_id = _nested_text_attribute(error, "template_id") or template_id
+    journal_error = _nested_exception(error, MetricsJournalError)
+    diagnostic_error = error if journal_error is None else journal_error
     original_type = (
-        getattr(error, "original_exception_type", None) or type(error).__name__
+        getattr(diagnostic_error, "original_exception_type", None)
+        or type(diagnostic_error).__name__
     )
     original_message = (
-        getattr(error, "original_exception_message", None) or str(error)
+        getattr(diagnostic_error, "original_exception_message", None)
+        or str(diagnostic_error)
     )
     return {
         "completed_epochs": completed_epochs,
@@ -570,6 +601,7 @@ def _failed_status(
     prepared: _PreparedTrainingRuntime | None,
     baseline: Mapping[str, Any] | None,
     training_executed: bool,
+    journal: MetricsJournal | None = None,
 ) -> dict[str, Any]:
     status = _status_base(
         status_name,
@@ -583,6 +615,35 @@ def _failed_status(
         )
     )
     status["baseline"] = None if baseline is None else dict(baseline)
+    if journal is not None:
+        try:
+            status.update(journal.summary().to_dict())
+        except MetricsJournalError as summary_error:
+            journal_error = _nested_exception(error, MetricsJournalError)
+            diagnostic = (
+                journal_error
+                if journal_error is not None
+                and getattr(
+                    journal_error, "last_valid_semantic_sha256", None
+                )
+                is not None
+                else summary_error
+            )
+            last_valid = getattr(diagnostic, "last_valid_epoch", None)
+            count = getattr(diagnostic, "last_valid_event_count", None)
+            if count is None:
+                count = 0 if last_valid is None else last_valid + 1
+            semantic_sha = getattr(
+                diagnostic, "last_valid_semantic_sha256", None
+            ) or hashlib.sha256(b"").hexdigest()
+            status.update(
+                {
+                    "metrics_journal": journal.config.filename,
+                    "metrics_event_count": count,
+                    "metrics_last_epoch": last_valid,
+                    "metrics_semantic_sha256": semantic_sha,
+                }
+            )
     return json.loads(canonical_runtime_json(status))
 
 
@@ -793,6 +854,7 @@ def _execute_training(
     config: TrainingRunConfig,
     resolved: ResolvedTrainingRun,
     directory: TrainingRunDirectory,
+    lock: ResumeRunLock,
     *,
     progress: Callable[[str], None] | None,
     overrides: TrainingRunConfigOverrides | None,
@@ -804,6 +866,7 @@ def _execute_training(
     manager: CheckpointManager | None = None
     prepared: _PreparedTrainingRuntime | None = None
     baseline: dict[str, Any] | None = None
+    journal: MetricsJournal | None = None
     training_executed = False
     try:
         _reload_effective_config_for_toctou(
@@ -852,6 +915,12 @@ def _execute_training(
             fit_history=(),
             baseline_fit_metadata=baseline,
         ).metadata
+        phase = "metrics_journal.initialize"
+        provenance = committed_epoch_provenance_from_checkpoint_metadata(
+            checkpoint_metadata,
+            initial_bundle_fingerprint=resolved.bundle_fingerprint,
+        )
+        journal = MetricsJournal(directory, lock, provenance)
         if progress is not None:
             progress(
                 "training started: "
@@ -878,8 +947,12 @@ def _execute_training(
             manager,
             checkpoint_metadata,
             config.checkpointed_fit,
+            epoch_metrics_provenance=provenance,
+            epoch_metrics_observer=journal,
         )
-        status = _completed_status(config, resolved, result, baseline)
+        status = _completed_status(
+            config, resolved, result, baseline, journal
+        )
         phase = "metadata.completed_status"
         directory.write_status(status)
         if progress is not None:
@@ -900,6 +973,7 @@ def _execute_training(
             prepared=prepared,
             baseline=baseline,
             training_executed=training_executed,
+            journal=journal,
         )
         stored_error = _write_failure_status(directory, status, error)
         details = status
@@ -930,6 +1004,7 @@ def _execute_training(
             prepared=prepared,
             baseline=baseline,
             training_executed=training_executed,
+            journal=journal,
         )
         stored_error = _write_failure_status(directory, status, error)
         raise _execution_cli_error(
@@ -1032,6 +1107,7 @@ def run_training(
                 config,
                 resolved,
                 directory,
+                lock,
                 progress=progress,
                 overrides=overrides,
                 cli_cwd=effective_cli_cwd,

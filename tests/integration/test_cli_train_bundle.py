@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import importlib
 import json
 from pathlib import Path
@@ -9,7 +10,7 @@ import torch
 
 pytest.importorskip("ase")
 
-from refsite_mlip.cli.errors import CLIInterruptedError
+from refsite_mlip.cli.errors import CLIError, CLIInterruptedError
 from refsite_mlip.cli.main import main
 from refsite_mlip.cli.train import (
     render_train_result_human,
@@ -28,6 +29,8 @@ from refsite_mlip.training import (
     CheckpointManagerConfig,
     FitExecutionError,
     FitProgress,
+    MetricsJournal,
+    MetricsJournalError,
     ModelSelectionState,
     TrainingRunDirectory,
     build_optimizer,
@@ -120,6 +123,7 @@ def test_synthetic_cpu_float64_one_epoch_writes_recoverable_state(
     output = tmp_path / "run-output"
     assert sorted(path.name for path in output.iterdir()) == [
         "checkpoints",
+        "metrics.jsonl",
         "preflight.json",
         "resolved_config.json",
         "run_status.json",
@@ -140,6 +144,17 @@ def test_synthetic_cpu_float64_one_epoch_writes_recoverable_state(
     assert baseline["parameter_update_applied"] is True
     assert checkpoint.progress.completed_epochs == 1
     assert checkpoint.progress.global_step == 1
+    assert report["metrics_journal"] == "metrics.jsonl"
+    assert report["metrics_event_count"] == 1
+    assert report["metrics_last_epoch"] == 0
+    assert len(report["metrics_semantic_sha256"]) == 64
+    metric_lines = (output / "metrics.jsonl").read_text(
+        encoding="utf-8"
+    ).splitlines()
+    assert len(metric_lines) == 1
+    metric = json.loads(metric_lines[0])
+    assert metric["event"] == "epoch_committed"
+    assert metric["epoch_index"] == 0
     assert render_train_result_json(report) == render_train_result_json(
         dict(reversed(tuple(report.items())))
     )
@@ -552,6 +567,87 @@ def test_middle_epoch_checkpoint_failure_preserves_previous_epoch(
     assert sorted(
         path.name for path in (tmp_path / "run-output" / "checkpoints").iterdir()
     ) == ["best.pt", "epoch_000000.pt", "latest.pt"]
+
+
+def test_metrics_journal_failure_preserves_committed_checkpoint_and_status(
+    training_bundle, tmp_path, monkeypatch
+):
+    config_path, _ = _simple_case(tmp_path, training_bundle)
+    _set_epochs(config_path, 2)
+
+    def fail_observer(self, event):
+        raise MetricsJournalError(
+            "INJECTED_METRICS_JOURNAL_FAILURE",
+            "injected metrics journal failure",
+            stage="metrics_journal.commit",
+            path=self.path,
+            epoch_index=event.epoch_index,
+            original_error=OSError("injected journal write failure"),
+        )
+
+    monkeypatch.setattr(MetricsJournal, "__call__", fail_observer)
+    with pytest.raises(CLIError) as caught:
+        run_training(config_path)
+    assert getattr(caught.value, "failure_phase", None) == "metrics_journal"
+
+    output = tmp_path / "run-output"
+    latest_path = output / "checkpoints" / "latest.pt"
+    checkpoint = load_training_checkpoint(latest_path)
+    assert checkpoint.progress.completed_epochs == 1
+    assert not (output / "checkpoints" / "epoch_000001.pt").exists()
+    assert not (output / "metrics.jsonl").exists()
+    status = json.loads((output / "run_status.json").read_text())
+    assert status["status"] == "failed"
+    assert status["failure_phase"] == "metrics_journal"
+    assert status["completed_epochs"] == 1
+    assert status["recoverable_checkpoint"] == str(latest_path)
+    assert status["metrics_event_count"] == 0
+    assert status["metrics_last_epoch"] is None
+    assert status["error"] == {
+        "message": "injected journal write failure",
+        "reason_code": "INJECTED_METRICS_JOURNAL_FAILURE",
+        "type": "OSError",
+    }
+
+
+def test_metrics_journal_corrupt_suffix_status_reports_last_valid_prefix(
+    training_bundle, tmp_path, monkeypatch
+):
+    config_path, _ = _simple_case(tmp_path, training_bundle)
+    _set_epochs(config_path, 2)
+    real_observer = MetricsJournal.__call__
+
+    def corrupt_second_event(self, event):
+        if event.epoch_index == 0:
+            return real_observer(self, event)
+        valid_prefix = self.path.read_bytes()
+        self.path.write_bytes(valid_prefix + b'{"truncated":')
+        raise MetricsJournalError(
+            "INJECTED_METRICS_JOURNAL_FAILURE",
+            "injected corrupt suffix",
+            stage="metrics_journal.commit",
+            path=self.path,
+            epoch_index=event.epoch_index,
+            original_error=OSError("injected corrupt suffix"),
+        )
+
+    monkeypatch.setattr(MetricsJournal, "__call__", corrupt_second_event)
+    with pytest.raises(CLIError):
+        run_training(config_path)
+
+    output = tmp_path / "run-output"
+    latest = load_training_checkpoint(output / "checkpoints" / "latest.pt")
+    assert latest.progress.completed_epochs == 2
+    journal_bytes = (output / "metrics.jsonl").read_bytes()
+    valid_prefix = journal_bytes.splitlines(keepends=True)[0]
+    status = json.loads((output / "run_status.json").read_text())
+    assert status["failure_phase"] == "metrics_journal"
+    assert status["completed_epochs"] == 2
+    assert status["metrics_event_count"] == 1
+    assert status["metrics_last_epoch"] == 0
+    assert status["metrics_semantic_sha256"] == hashlib.sha256(
+        valid_prefix
+    ).hexdigest()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="9D CUDA gate: unavailable")

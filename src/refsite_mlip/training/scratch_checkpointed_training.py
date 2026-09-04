@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -22,6 +23,11 @@ from .checkpoint import FitProgress, capture_training_checkpoint
 from ._scratch_run_metadata import scratch_runtime_template_fingerprints
 from .checkpoint_manager import CheckpointManager, CheckpointManagerConfig
 from .checkpointed_fit import CheckpointedFitResult, run_checkpointed_fit
+from .metrics_journal import (
+    MetricsJournal,
+    MetricsJournalError,
+    committed_epoch_provenance_from_checkpoint_metadata,
+)
 from .run_directory import (
     RUN_STATUS_SCHEMA_VERSION,
     ResumeRunLock,
@@ -118,6 +124,21 @@ def _nested_exception(
             return current
         current = current.__cause__ or current.__context__
     return None
+
+
+def _effective_failure_phase(stage: str, error: BaseException) -> str:
+    """Name observer failures without obscuring their durable checkpoint."""
+
+    if _nested_exception(error, MetricsJournalError) is not None:
+        return "metrics_journal"
+    current: BaseException | None = error
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if getattr(current, "failure_stage", None) == "epoch_observer":
+            return "epoch_observer"
+        current = current.__cause__ or current.__context__
+    return stage
 
 
 def _default_reason(stage: str) -> str:
@@ -599,6 +620,7 @@ def _status(
     training_executed: bool,
     failure_phase: str | None = None,
     error: ScratchCheckpointedTrainingError | None = None,
+    journal: MetricsJournal | None = None,
 ) -> dict[str, Any]:
     recovery = _recovery_state(directory, manager, startup)
     if fit_result is not None:
@@ -646,8 +668,7 @@ def _status(
         if recoverable is not None
         else ("initial_bundle" if recovery_path is not None else None)
     )
-    return _canonical_mapping(
-        {
+    payload = {
             "baseline": baseline,
             "best_checkpoint": best,
             "bundle_fingerprint": bundle_fingerprint,
@@ -697,7 +718,30 @@ def _status(
                 preparation.validation_semantic_digest
             ),
         }
-    )
+    if journal is not None:
+        try:
+            payload.update(_plain(journal.summary().to_dict()))
+        except MetricsJournalError as journal_error:
+            # A malformed/divergent journal is itself the primary failure.  Do
+            # not rewrite it merely to make status generation succeed; retain
+            # the last strictly parsed epoch supplied by the structured error.
+            last_valid = journal_error.last_valid_epoch
+            count = journal_error.last_valid_event_count
+            if count is None:
+                count = 0 if last_valid is None else last_valid + 1
+            semantic_sha = (
+                journal_error.last_valid_semantic_sha256
+                or hashlib.sha256(b"").hexdigest()
+            )
+            payload.update(
+                {
+                    "metrics_journal": journal.config.filename,
+                    "metrics_event_count": count,
+                    "metrics_last_epoch": last_valid,
+                    "metrics_semantic_sha256": semantic_sha,
+                }
+            )
+    return _canonical_mapping(payload)
 
 
 def _validate_inputs(
@@ -780,6 +824,7 @@ def _write_failure_status(
     training_executed: bool,
     stage: str,
     structured: ScratchCheckpointedTrainingError,
+    journal: MetricsJournal | None = None,
 ) -> BaseException | None:
     try:
         lock.validate_owned(directory.resume_lock_path)
@@ -795,6 +840,7 @@ def _write_failure_status(
                 training_executed=training_executed,
                 failure_phase=stage,
                 error=structured,
+                journal=journal,
             )
         )
     except BaseException as error:
@@ -855,6 +901,7 @@ def run_scratch_checkpointed_training(
 
     startup: ScratchTrainingStartup | None = None
     manager: CheckpointManager | None = None
+    journal: MetricsJournal | None = None
     fit_result: CheckpointedFitResult | None = None
     training_executed = False
     phase = "event.lock_acquired"
@@ -934,6 +981,12 @@ def run_scratch_checkpointed_training(
             fit_history=startup.fit_history,
             baseline_fit_metadata=startup.baseline_metadata,
         ).metadata
+        phase = "metrics_journal.initialize"
+        provenance = committed_epoch_provenance_from_checkpoint_metadata(
+            checkpoint_metadata,
+            initial_bundle_fingerprint=startup.initial_bundle_fingerprint,
+        )
+        journal = MetricsJournal(directory, lock, provenance)
 
         if progress is not None:
             progress(
@@ -964,6 +1017,8 @@ def run_scratch_checkpointed_training(
             manager,
             checkpoint_metadata,
             config.checkpointed_fit,
+            epoch_metrics_provenance=provenance,
+            epoch_metrics_observer=journal,
         )
         phase = "event.after_fit"
         _emit(event_callback, "after_fit")
@@ -983,6 +1038,7 @@ def run_scratch_checkpointed_training(
             startup=startup,
             fit_result=fit_result,
             training_executed=True,
+            journal=journal,
         )
         phase = "status.terminal"
         directory.write_status(terminal_status)
@@ -1001,8 +1057,9 @@ def run_scratch_checkpointed_training(
             terminal_status=terminal_status,
         )
     except KeyboardInterrupt as error:
+        failure_phase = _effective_failure_phase(phase, error)
         interrupted = _error_from(
-            phase,
+            failure_phase,
             error,
             config=config,
             preparation=preparation,
@@ -1020,8 +1077,9 @@ def run_scratch_checkpointed_training(
             manager=manager,
             startup=startup,
             training_executed=training_executed,
-            stage=phase,
+            stage=failure_phase,
             structured=interrupted,
+            journal=journal,
         )
         if status_error is not None:
             interrupted.status_write_error = status_error
@@ -1037,8 +1095,9 @@ def run_scratch_checkpointed_training(
         nested_interrupt = _nested_exception(error, KeyboardInterrupt)
         if nested_interrupt is not None:
             assert isinstance(nested_interrupt, KeyboardInterrupt)
+            failure_phase = _effective_failure_phase(phase, error)
             interrupted = _error_from(
-                phase,
+                failure_phase,
                 error,
                 config=config,
                 preparation=preparation,
@@ -1056,8 +1115,9 @@ def run_scratch_checkpointed_training(
                 manager=manager,
                 startup=startup,
                 training_executed=training_executed,
-                stage=phase,
+                stage=failure_phase,
                 structured=interrupted,
+                journal=journal,
             )
             if status_error is not None:
                 interrupted.status_write_error = status_error
@@ -1068,8 +1128,9 @@ def run_scratch_checkpointed_training(
             primary = nested_interrupt
             primary_traceback = nested_interrupt.__traceback__
         else:
+            failure_phase = _effective_failure_phase(phase, error)
             structured = _error_from(
-                phase,
+                failure_phase,
                 error,
                 config=config,
                 preparation=preparation,
@@ -1087,8 +1148,9 @@ def run_scratch_checkpointed_training(
                 manager=manager,
                 startup=startup,
                 training_executed=training_executed,
-                stage=phase,
+                stage=failure_phase,
                 structured=structured,
+                journal=journal,
             )
             if status_error is not None:
                 structured.status_write_error = status_error
@@ -1138,6 +1200,7 @@ def run_scratch_checkpointed_training(
                 training_executed=training_executed,
                 stage="lock.release",
                 structured=structured,
+                journal=journal,
             )
             if status_error is not None:
                 structured.status_write_error = status_error

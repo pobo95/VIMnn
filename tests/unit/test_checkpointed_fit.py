@@ -23,11 +23,13 @@ from refsite_mlip.training import (
     FitExecutionError,
     FitProgress,
     LossConfig,
+    MetricsJournal,
     ModelSelectionConfig,
     ModelSelectionState,
     OptimizerConfig,
     SchedulerConfig,
     TrainStepConfig,
+    TrainingRunDirectory,
     ValidationStepConfig,
     build_scheduler,
     capture_training_checkpoint,
@@ -408,6 +410,7 @@ def test_selection_failure_creates_no_checkpoint(monkeypatch, tmp_path):
     batch = _batch()
     metadata = _metadata(model, optimizer, scheduler, batch, configs)
     manager = CheckpointManager(CheckpointManagerConfig(tmp_path / "managed"))
+    observed = []
     _install(monkeypatch, (1.0,))
     monkeypatch.setattr(
         module, "process_primary_validation",
@@ -419,10 +422,13 @@ def test_selection_failure_creates_no_checkpoint(monkeypatch, tmp_path):
             configs["train_step"], configs["validation_step"], configs["scheduler"],
             configs["model_selection"], ModelSelectionState(), configs["fit"],
             manager, metadata,
+            epoch_metrics_provenance=_epoch_metrics_provenance(metadata),
+            epoch_metrics_observer=observed.append,
         )
     assert caught.value.phase == "selection"
     assert manager.list_epochs() == ()
     assert scheduler.state_dict() == {"validation_steps": 0}
+    assert observed == []
 
 
 @pytest.mark.parametrize("phase", ["train", "validation"])
@@ -434,6 +440,7 @@ def test_train_or_validation_failure_creates_no_current_checkpoint(
     batch = _batch()
     metadata = _metadata(model, optimizer, scheduler, batch, configs)
     manager = CheckpointManager(CheckpointManagerConfig(tmp_path / "managed"))
+    observed = []
     _install(monkeypatch, (1.0, 2.0), fail=(phase, 0))
     with pytest.raises(FitExecutionError) as caught:
         run_checkpointed_fit(
@@ -441,10 +448,13 @@ def test_train_or_validation_failure_creates_no_current_checkpoint(
             configs["train_step"], configs["validation_step"], configs["scheduler"],
             configs["model_selection"], ModelSelectionState(), configs["fit"],
             manager, metadata,
+            epoch_metrics_provenance=_epoch_metrics_provenance(metadata),
+            epoch_metrics_observer=observed.append,
         )
     assert caught.value.phase == phase
     assert manager.list_epochs() == ()
     assert not (manager.root / "latest.pt").exists()
+    assert observed == []
 
 
 def test_capture_failure_stops_before_manager_and_reports_retained_update(
@@ -455,6 +465,7 @@ def test_capture_failure_stops_before_manager_and_reports_retained_update(
     batch = _batch()
     metadata = _metadata(model, optimizer, scheduler, batch, configs)
     manager = CheckpointManager(CheckpointManagerConfig(tmp_path / "managed"))
+    observed = []
     _install(monkeypatch, (1.0, 2.0))
     monkeypatch.setattr(
         module,
@@ -467,12 +478,15 @@ def test_capture_failure_stops_before_manager_and_reports_retained_update(
             configs["train_step"], configs["validation_step"], configs["scheduler"],
             configs["model_selection"], ModelSelectionState(), configs["fit"],
             manager, metadata,
+            epoch_metrics_provenance=_epoch_metrics_provenance(metadata),
+            epoch_metrics_observer=observed.append,
         )
     error = caught.value
     assert error.failure_stage == "capture" and error.global_step == 1
     assert error.epochs_checkpointed == 0 and not error.rollback_performed
     assert manager.list_epochs() == ()
     assert float(next(iter(optimizer.state.values()))["step"]) == 1.0
+    assert observed == []
 
 
 def test_manager_partial_failure_metadata_and_previous_checkpoint_recovery(
@@ -555,3 +569,367 @@ def test_run_fit_and_checkpointed_fit_exact_trajectory_and_rng(
     assert numpy_b[2:] == states_a[4][2:]
     assert torch.equal(torch.get_rng_state(), states_a[5])
 
+
+def _epoch_metrics_provenance(metadata):
+    from refsite_mlip.training.metrics_journal import (
+        committed_epoch_provenance_from_checkpoint_metadata,
+    )
+
+    return committed_epoch_provenance_from_checkpoint_metadata(
+        metadata,
+        initial_bundle_fingerprint="a" * 64,
+    )
+
+
+def test_committed_epoch_observer_runs_after_full_checkpoint_and_before_stop(
+    monkeypatch, tmp_path
+):
+    selection = ModelSelectionConfig(early_stopping_patience=1)
+    configs = _configs(3, selection=selection)
+    model, optimizer, scheduler = _live(configs)
+    batch = _batch()
+    metadata = _metadata(model, optimizer, scheduler, batch, configs)
+    manager = CheckpointManager(CheckpointManagerConfig(tmp_path / "managed"))
+    _install(monkeypatch, (1.0, 2.0, 3.0))
+
+    committed_epochs = []
+    original_save = manager.save_epoch
+
+    def save(checkpoint, record):
+        managed = original_save(checkpoint, record)
+        committed_epochs.append(record.epoch_index)
+        assert manager.load_latest().progress.last_completed_epoch == record.epoch_index
+        if record.decision.is_best:
+            assert manager.load_best().progress.last_completed_epoch == record.epoch_index
+        return managed
+
+    observed = []
+
+    def observe(event):
+        assert committed_epochs[-1] == event.epoch_index
+        observed.append(event)
+
+    monkeypatch.setattr(manager, "save_epoch", save)
+    result = run_checkpointed_fit(
+        model,
+        optimizer,
+        scheduler,
+        (batch,),
+        (batch,),
+        {},
+        configs["loss"],
+        configs["train_step"],
+        configs["validation_step"],
+        configs["scheduler"],
+        configs["model_selection"],
+        ModelSelectionState(),
+        configs["fit"],
+        manager,
+        metadata,
+        epoch_metrics_provenance=_epoch_metrics_provenance(metadata),
+        epoch_metrics_observer=observe,
+    )
+
+    assert result.fit_result.stopped_early
+    assert committed_epochs == [0, 1]
+    assert [event.epoch_index for event in observed] == [0, 1]
+    assert observed[-1].should_stop is True
+
+
+def test_committed_epoch_observer_failure_retains_current_checkpoint_and_stops(
+    monkeypatch, tmp_path
+):
+    configs = _configs(2)
+    model, optimizer, scheduler = _live(configs)
+    batch = _batch()
+    metadata = _metadata(model, optimizer, scheduler, batch, configs)
+    manager = CheckpointManager(CheckpointManagerConfig(tmp_path / "managed"))
+    training_epochs = []
+    _install(monkeypatch, (1.0, 2.0), snapshots=training_epochs)
+
+    class ObserverFailure(RuntimeError):
+        pass
+
+    def observe(event):
+        assert event.epoch_index == 0
+        raise ObserverFailure("observer broke")
+
+    with pytest.raises(CheckpointedFitExecutionError) as caught:
+        run_checkpointed_fit(
+            model,
+            optimizer,
+            scheduler,
+            (batch,),
+            (batch,),
+            {},
+            configs["loss"],
+            configs["train_step"],
+            configs["validation_step"],
+            configs["scheduler"],
+            configs["model_selection"],
+            ModelSelectionState(),
+            configs["fit"],
+            manager,
+            metadata,
+            epoch_metrics_provenance=_epoch_metrics_provenance(metadata),
+            epoch_metrics_observer=observe,
+        )
+
+    error = caught.value
+    assert error.failure_stage == "epoch_observer"
+    assert error.epoch_index == 0 and error.global_step == 1
+    assert error.epochs_checkpointed == 1
+    assert len(error.completed_checkpoint_results) == 1
+    assert error.original_exception_type == "ObserverFailure"
+    assert error.original_exception_message == "observer broke"
+    assert error.rollback_performed is False
+    assert manager.list_epochs() == (0,)
+    assert manager.load_latest().progress.next_epoch == 1
+    assert len(training_epochs) == 1
+
+
+def test_epoch_observer_pair_is_validated_before_any_update_or_checkpoint(
+    monkeypatch, tmp_path
+):
+    configs = _configs(1)
+    model, optimizer, scheduler = _live(configs)
+    batch = _batch()
+    metadata = _metadata(model, optimizer, scheduler, batch, configs)
+    manager = CheckpointManager(CheckpointManagerConfig(tmp_path / "managed"))
+    _install(monkeypatch, (1.0,))
+    before = copy.deepcopy(model.state_dict())
+
+    with pytest.raises(ValueError, match="requires epoch_metrics_provenance"):
+        run_checkpointed_fit(
+            model,
+            optimizer,
+            scheduler,
+            (batch,),
+            (batch,),
+            {},
+            configs["loss"],
+            configs["train_step"],
+            configs["validation_step"],
+            configs["scheduler"],
+            configs["model_selection"],
+            ModelSelectionState(),
+            configs["fit"],
+            manager,
+            metadata,
+            epoch_metrics_observer=lambda event: None,
+        )
+
+    assert _tree_equal(model.state_dict(), before)
+    assert optimizer.state == {}
+    assert not manager.root.exists()
+
+    wrong_provenance = replace(
+        _epoch_metrics_provenance(metadata),
+        training_configuration_fingerprint="c" * 64,
+    )
+    with pytest.raises(ValueError, match="training_configuration_fingerprint"):
+        run_checkpointed_fit(
+            model,
+            optimizer,
+            scheduler,
+            (batch,),
+            (batch,),
+            {},
+            configs["loss"],
+            configs["train_step"],
+            configs["validation_step"],
+            configs["scheduler"],
+            configs["model_selection"],
+            ModelSelectionState(),
+            configs["fit"],
+            manager,
+            metadata,
+            epoch_metrics_provenance=wrong_provenance,
+            epoch_metrics_observer=lambda event: None,
+        )
+    assert _tree_equal(model.state_dict(), before)
+    assert optimizer.state == {}
+    assert not manager.root.exists()
+
+
+def test_epoch_observer_requires_immutable_epoch_snapshots_before_updates(
+    monkeypatch, tmp_path
+):
+    configs = _configs(1)
+    model, optimizer, scheduler = _live(configs)
+    batch = _batch()
+    metadata = _metadata(model, optimizer, scheduler, batch, configs)
+    manager = CheckpointManager(
+        CheckpointManagerConfig(
+            tmp_path / "managed", save_epoch_snapshots=False
+        )
+    )
+    updated_states = []
+    _install(monkeypatch, (1.0,), snapshots=updated_states)
+    before = copy.deepcopy(model.state_dict())
+
+    with pytest.raises(
+        ValueError, match="requires immutable epoch snapshots"
+    ):
+        run_checkpointed_fit(
+            model,
+            optimizer,
+            scheduler,
+            (batch,),
+            (batch,),
+            {},
+            configs["loss"],
+            configs["train_step"],
+            configs["validation_step"],
+            configs["scheduler"],
+            configs["model_selection"],
+            ModelSelectionState(),
+            configs["fit"],
+            manager,
+            metadata,
+            epoch_metrics_provenance=_epoch_metrics_provenance(metadata),
+            epoch_metrics_observer=lambda event: None,
+        )
+
+    assert updated_states == []
+    assert _tree_equal(model.state_dict(), before)
+    assert optimizer.state == {}
+    assert not manager.root.exists()
+
+
+def test_epoch_observer_is_not_called_when_checkpoint_manager_does_not_return(
+    monkeypatch, tmp_path
+):
+    configs = _configs(1)
+    model, optimizer, scheduler = _live(configs)
+    batch = _batch()
+    metadata = _metadata(model, optimizer, scheduler, batch, configs)
+    manager = CheckpointManager(CheckpointManagerConfig(tmp_path / "managed"))
+    _install(monkeypatch, (1.0,))
+    observed = []
+
+    def fail_save(checkpoint, record):
+        del checkpoint, record
+        raise RuntimeError("checkpoint did not commit")
+
+    monkeypatch.setattr(manager, "save_epoch", fail_save)
+    with pytest.raises(CheckpointedFitExecutionError) as caught:
+        run_checkpointed_fit(
+            model,
+            optimizer,
+            scheduler,
+            (batch,),
+            (batch,),
+            {},
+            configs["loss"],
+            configs["train_step"],
+            configs["validation_step"],
+            configs["scheduler"],
+            configs["model_selection"],
+            ModelSelectionState(),
+            configs["fit"],
+            manager,
+            metadata,
+            epoch_metrics_provenance=_epoch_metrics_provenance(metadata),
+            epoch_metrics_observer=observed.append,
+        )
+
+    assert caught.value.failure_stage == "manager"
+    assert caught.value.epochs_checkpointed == 0
+    assert observed == []
+
+
+def test_metrics_journal_preserves_trajectory_checkpoint_and_rng(
+    monkeypatch, tmp_path
+):
+    configs = _configs(2)
+    batch = _batch()
+
+    random.seed(81)
+    np.random.seed(81)
+    torch.manual_seed(81)
+    model_a, optimizer_a, scheduler_a = _live(configs)
+    metadata_a = _metadata(model_a, optimizer_a, scheduler_a, batch, configs)
+    manager_a = CheckpointManager(CheckpointManagerConfig(tmp_path / "without"))
+    _install(monkeypatch, (1.0, 2.0))
+    result_a = run_checkpointed_fit(
+        model_a,
+        optimizer_a,
+        scheduler_a,
+        (batch,),
+        (batch,),
+        {},
+        configs["loss"],
+        configs["train_step"],
+        configs["validation_step"],
+        configs["scheduler"],
+        configs["model_selection"],
+        ModelSelectionState(),
+        configs["fit"],
+        manager_a,
+        metadata_a,
+    )
+    state_a = (
+        copy.deepcopy(model_a.state_dict()),
+        copy.deepcopy(optimizer_a.state_dict()),
+        copy.deepcopy(scheduler_a.state_dict()),
+        manager_a.load_latest().to_dict(),
+        random.random(),
+        float(np.random.random()),
+        torch.rand(4),
+    )
+
+    random.seed(81)
+    np.random.seed(81)
+    torch.manual_seed(81)
+    model_b, optimizer_b, scheduler_b = _live(configs)
+    metadata_b = _metadata(model_b, optimizer_b, scheduler_b, batch, configs)
+    directory_b = TrainingRunDirectory.create(tmp_path / "with-run")
+    lock_b = directory_b.acquire_resume_lock()
+    manager_b = CheckpointManager(
+        CheckpointManagerConfig(directory_b.checkpoints)
+    )
+    _install(monkeypatch, (1.0, 2.0))
+    provenance_b = _epoch_metrics_provenance(metadata_b)
+    journal_b = MetricsJournal(directory_b, lock_b, provenance_b)
+    try:
+        result_b = run_checkpointed_fit(
+            model_b,
+            optimizer_b,
+            scheduler_b,
+            (batch,),
+            (batch,),
+            {},
+            configs["loss"],
+            configs["train_step"],
+            configs["validation_step"],
+            configs["scheduler"],
+            configs["model_selection"],
+            ModelSelectionState(),
+            configs["fit"],
+            manager_b,
+            metadata_b,
+            epoch_metrics_provenance=provenance_b,
+            epoch_metrics_observer=journal_b,
+        )
+    finally:
+        lock_b.release()
+    state_b = (
+        copy.deepcopy(model_b.state_dict()),
+        copy.deepcopy(optimizer_b.state_dict()),
+        copy.deepcopy(scheduler_b.state_dict()),
+        manager_b.load_latest().to_dict(),
+        random.random(),
+        float(np.random.random()),
+        torch.rand(4),
+    )
+
+    assert result_b.fit_result == result_a.fit_result
+    assert journal_b.summary().metrics_event_count == 2
+    assert _tree_equal(state_b[0], state_a[0])
+    assert _tree_equal(state_b[1], state_a[1])
+    assert _tree_equal(state_b[2], state_a[2])
+    assert _tree_equal(state_b[3], state_a[3])
+    assert state_b[4] == state_a[4]
+    assert state_b[5] == state_a[5]
+    assert torch.equal(state_b[6], state_a[6])

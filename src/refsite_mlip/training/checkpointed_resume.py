@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from numbers import Integral
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -18,6 +18,8 @@ from .checkpointed_fit import (
     CheckpointedFitConfig,
     CheckpointedFitResult,
     _run_checkpointed_epochs,
+    _validate_epoch_observer,
+    _validate_epoch_provenance_metadata,
     _validate_manager_preflight,
     _validate_static_metadata,
 )
@@ -34,6 +36,13 @@ from .scheduler import SchedulerConfig
 from .selection import ModelSelectionConfig
 from .step import TrainStepConfig
 from .validation import ValidationStepConfig
+
+
+if TYPE_CHECKING:
+    from .metrics_journal import (
+        CommittedEpochProvenance,
+        EpochMetricsObserver,
+    )
 
 
 def _tree_equal(first: Any, second: Any) -> bool:
@@ -203,9 +212,12 @@ def run_checkpointed_resumed_fit(
     resumed_max_epochs: int,
     policy: ResumePolicy | None = None,
     current_source_git_commit: str | None = None,
+    epoch_metrics_provenance: "CommittedEpochProvenance | None" = None,
+    epoch_metrics_observer: "EpochMetricsObserver | None" = None,
 ) -> CheckpointedResumeResult:
     """Transactionally restore latest and continue the shared checkpoint loop."""
 
+    _validate_epoch_observer(epoch_metrics_provenance, epoch_metrics_observer)
     policy = ResumePolicy() if policy is None else policy
     if not isinstance(policy, ResumePolicy):
         raise TypeError("policy must be a ResumePolicy")
@@ -226,6 +238,9 @@ def run_checkpointed_resumed_fit(
         global_step_start=saved_fit.global_step_start,
     )
     metadata = _resumed_metadata(checkpoint, full_fit_config)
+    _validate_epoch_provenance_metadata(
+        epoch_metrics_provenance, metadata
+    )
     optimizer_config = _validate_static_metadata(
         model,
         optimizer,
@@ -287,6 +302,8 @@ def run_checkpointed_resumed_fit(
         history_prefix=history,
         checkpoint_fit_config=full_fit_config,
         existing_best_path=str(checkpoint_manager.root / "best.pt"),
+        epoch_metrics_provenance=epoch_metrics_provenance,
+        epoch_metrics_observer=epoch_metrics_observer,
     )
     combined = compose_resumed_fit_result(
         checkpoint,

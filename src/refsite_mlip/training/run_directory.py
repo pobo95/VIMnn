@@ -329,6 +329,10 @@ class TrainingRunDirectory:
     def status_path(self) -> Path:
         return self.root / "run_status.json"
 
+    @property
+    def metrics_path(self) -> Path:
+        return self.root / "metrics.jsonl"
+
     def write_resolved_config(self, value: Mapping[str, Any]) -> None:
         _atomic_write_text(
             self.resolved_config_path,

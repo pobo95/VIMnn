@@ -48,13 +48,17 @@ from refsite_mlip.training import (
     CheckpointedFitExecutionError,
     FitConfig,
     FitExecutionError,
+    MetricsJournal,
+    MetricsJournalError,
     ResumePolicy,
+    ResumeRunLock,
     RunDirectoryError,
     TrainingCheckpoint,
     TrainingRunDirectory,
     build_optimizer,
     build_scheduler,
     canonical_runtime_json,
+    committed_epoch_provenance_from_checkpoint_metadata,
     load_runtime_json,
     run_checkpointed_resumed_fit,
     validate_checkpoint_history,
@@ -78,6 +82,7 @@ from .train import (
     _PreparedTrainingRuntime,
     _batch_context,
     _batch_samples,
+    _nested_exception,
     _nested_reason,
     _nested_text_attribute,
     _prepare_training_runtime,
@@ -89,6 +94,12 @@ from .validate_train_config import _cli_error as _training_config_cli_error
 RESUME_PREFLIGHT_SCHEMA_VERSION = "refsite_training_resume_preflight_v1"
 RESUME_RESULT_SCHEMA_VERSION = "refsite_training_resume_result_v1"
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_METRICS_STATUS_FIELDS = {
+    "metrics_journal",
+    "metrics_event_count",
+    "metrics_last_epoch",
+    "metrics_semantic_sha256",
+}
 
 
 @dataclass(frozen=True)
@@ -117,6 +128,8 @@ class _ResumePreflight:
     stored_preflight: Mapping[str, Any]
     stored_status: Mapping[str, Any]
     stored_data_manifest: Mapping[str, Any] | None
+    journal_summary: Mapping[str, Any]
+    journal_missing_events: tuple[Any, ...]
 
 
 def _canonical_equal(first: Any, second: Any) -> bool:
@@ -889,6 +902,7 @@ def _validate_status(
     config: TrainingRunConfig,
     preflight: Mapping[str, Any],
     data_manifest: Mapping[str, Any] | None,
+    journal_summary: Mapping[str, Any],
 ) -> None:
     if status.get("schema_version") != "refsite_training_run_status_v1":
         raise CLIError(
@@ -927,6 +941,29 @@ def _validate_status(
             status.get(field),
             expected,
             reason="RUN_STATUS_IDENTITY_MISMATCH",
+        )
+    present_metrics_fields = set(status).intersection(_METRICS_STATUS_FIELDS)
+    if present_metrics_fields and present_metrics_fields != _METRICS_STATUS_FIELDS:
+        raise CLIError(
+            "INVALID_RUN_STATUS",
+            "run_status metrics journal metadata must be present as one complete group",
+            stage="resume.metadata.status",
+            path=directory.status_path,
+        )
+    if present_metrics_fields:
+        for field in sorted(_METRICS_STATUS_FIELDS):
+            _require_equal(
+                f"run_status.{field}",
+                status[field],
+                journal_summary[field],
+                reason="RUN_STATUS_METRICS_MISMATCH",
+            )
+    elif journal_summary["metrics_event_count"] != 0:
+        raise CLIError(
+            "RUN_STATUS_METRICS_MISMATCH",
+            "a nonempty metrics journal requires run_status journal metadata",
+            stage="resume.metadata.status",
+            path=directory.status_path,
         )
     scratch_config = isinstance(config.model_source, ScratchModelSourceConfig)
     if scratch_config:
@@ -1288,6 +1325,25 @@ def _prepare_resume(
                 global_step=checkpoint.progress.global_step,
                 original_error=error,
             ) from error
+        provenance = committed_epoch_provenance_from_checkpoint_metadata(
+            checkpoint.metadata,
+            initial_bundle_fingerprint=stored.bundle_fingerprint,
+        )
+        journal = MetricsJournal(directory, None, provenance)
+        try:
+            journal_missing_events = journal.inspect_checkpoint(checkpoint)
+            journal_summary = journal.summary().to_dict()
+        except MetricsJournalError as error:
+            raise CLIError(
+                error.reason_code,
+                "metrics journal does not match the committed checkpoint history",
+                stage=f"resume.{error.stage}",
+                path=error.path,
+                epoch_index=error.epoch_index,
+                failure_phase="metrics_journal",
+                underlying_reason_code=error.reason_code,
+                original_error=error,
+            ) from error
         saved_fit = FitConfig.from_dict(
             checkpoint.metadata.resolved_configuration["fit"]
         )
@@ -1308,6 +1364,7 @@ def _prepare_resume(
             config,
             preflight,
             data_manifest,
+            journal_summary,
         )
         _, registry, templates = _validate_bundle_and_checkpoint(
             config, stored, preflight, checkpoint, bundle_path
@@ -1341,6 +1398,8 @@ def _prepare_resume(
             stored_preflight=preflight,
             stored_status=status,
             stored_data_manifest=data_manifest,
+            journal_summary=journal_summary,
+            journal_missing_events=journal_missing_events,
         )
     except CLIError:
         raise
@@ -1369,6 +1428,8 @@ def _resume_status_base(
     status: str,
     *,
     training_executed: bool,
+    journal: MetricsJournal,
+    journal_summary_fallback: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     checkpoint = preflight.checkpoint
     result = {
@@ -1447,12 +1508,40 @@ def _resume_status_base(
                 ],
             }
         )
+    try:
+        journal_status = journal.summary().to_dict()
+    except MetricsJournalError as summary_error:
+        semantic_sha = summary_error.last_valid_semantic_sha256
+        count = summary_error.last_valid_event_count
+        if semantic_sha is not None and count is not None:
+            journal_status = {
+                "metrics_journal": journal.config.filename,
+                "metrics_event_count": count,
+                "metrics_last_epoch": summary_error.last_valid_epoch,
+                "metrics_semantic_sha256": semantic_sha,
+            }
+        elif journal_summary_fallback is not None:
+            # Preserve the primary execution/journal failure.  The supplied
+            # snapshot is a previously validated complete prefix and remains
+            # conservative if the path itself became unreadable.
+            journal_status = dict(journal_summary_fallback)
+        else:
+            raise
+    result.update(journal_status)
     return result
 
 
-def _completed_status(preflight: _ResumePreflight, result: Any) -> dict[str, Any]:
+def _completed_status(
+    preflight: _ResumePreflight,
+    result: Any,
+    *,
+    journal: MetricsJournal,
+) -> dict[str, Any]:
     status = _resume_status_base(
-        preflight, "completed", training_executed=True
+        preflight,
+        "completed",
+        training_executed=True,
+        journal=journal,
     )
     fit = result.fit_result
     checkpointed = result.checkpointed_fit_result
@@ -1496,20 +1585,32 @@ def _failure_status(
     prepared: _PreparedTrainingRuntime | None,
     interrupted: bool,
     training_executed: bool,
+    journal: MetricsJournal,
 ) -> dict[str, Any]:
     recoverable = _recoverable(preflight)
     status = _resume_status_base(
         preflight,
         "interrupted" if interrupted else "failed",
         training_executed=training_executed,
+        journal=journal,
+        journal_summary_fallback=preflight.journal_summary,
     )
     failure_phase = phase
     if isinstance(error, FitExecutionError):
         failure_phase = error.phase
     elif isinstance(error, CheckpointedFitExecutionError):
-        failure_phase = f"checkpoint.{error.failure_stage}"
+        if error.failure_stage == "epoch_observer":
+            failure_phase = (
+                "metrics_journal"
+                if _nested_exception(error, MetricsJournalError) is not None
+                else "epoch_observer"
+            )
+        else:
+            failure_phase = f"checkpoint.{error.failure_stage}"
     elif isinstance(error, CheckpointRestoreError):
         failure_phase = f"restore.{error.stage}"
+    elif isinstance(error, MetricsJournalError):
+        failure_phase = "metrics_journal"
     elif isinstance(error, CLIError):
         failure_phase = error.failure_phase or error.stage.removeprefix("resume.")
     epoch = getattr(error, "epoch_index", None)
@@ -1533,8 +1634,16 @@ def _failure_status(
         if epoch_value not in set(preflight.previous_epochs)
     )
     reason = _nested_reason(error)
-    original_type = getattr(error, "original_exception_type", None) or type(error).__name__
-    original_message = getattr(error, "original_exception_message", None) or str(error)
+    journal_error = _nested_exception(error, MetricsJournalError)
+    diagnostic_error = error if journal_error is None else journal_error
+    original_type = (
+        getattr(diagnostic_error, "original_exception_type", None)
+        or type(diagnostic_error).__name__
+    )
+    original_message = (
+        getattr(diagnostic_error, "original_exception_message", None)
+        or str(diagnostic_error)
+    )
     restore_rollback = isinstance(error, CheckpointRestoreError)
     status.update(
         {
@@ -1701,7 +1810,10 @@ def _resolved_checkpoint_configs(
     }
 
 
-def _recheck_resume_sources(preflight: _ResumePreflight) -> None:
+def _recheck_resume_sources(
+    preflight: _ResumePreflight,
+    lock: ResumeRunLock,
+) -> tuple[MetricsJournal, Any]:
     """Revalidate immutable run metadata after acquiring exclusive ownership."""
 
     current_config = _load_config(preflight.directory)
@@ -1765,24 +1877,61 @@ def _recheck_resume_sources(preflight: _ResumePreflight) -> None:
             stage="resume.checkpoint.toctou",
             path=preflight.directory.checkpoints / "latest.pt",
         )
+    provenance = committed_epoch_provenance_from_checkpoint_metadata(
+        current.metadata,
+        initial_bundle_fingerprint=preflight.resolved.bundle_fingerprint,
+    )
+    journal = MetricsJournal(preflight.directory, lock, provenance)
+    try:
+        current_missing = journal.inspect_checkpoint(current)
+        current_summary = journal.summary().to_dict()
+    except MetricsJournalError as error:
+        raise CLIError(
+            error.reason_code,
+            "metrics journal changed or became invalid before resume ownership",
+            stage=f"resume.{error.stage}",
+            path=error.path,
+            epoch_index=error.epoch_index,
+            failure_phase="metrics_journal",
+            underlying_reason_code=error.reason_code,
+            original_error=error,
+        ) from error
+    if (
+        not _canonical_equal(current_summary, preflight.journal_summary)
+        or current_missing != preflight.journal_missing_events
+    ):
+        raise CLIError(
+            "METRICS_JOURNAL_TOCTOU_MISMATCH",
+            "metrics.jsonl changed between resume preflight and lock acquisition",
+            stage="resume.metrics_journal.toctou",
+            path=preflight.directory.root / "metrics.jsonl",
+            failure_phase="metrics_journal",
+        )
+    return journal, provenance
 
 
 def _execute_resume(
     preflight: _ResumePreflight,
+    lock: ResumeRunLock,
     *,
     progress: Callable[[str], None] | None,
 ) -> dict[str, Any]:
     max_epochs = int(preflight.report["requested_max_epochs"])
-    _recheck_resume_sources(preflight)
-    phase = "runtime.seed"
+    journal, provenance = _recheck_resume_sources(preflight, lock)
+    phase = "metrics_journal.reconcile"
     prepared: _PreparedTrainingRuntime | None = None
     training_executed = False
     try:
+        journal.reconcile_checkpoint(preflight.checkpoint)
+        phase = "runtime.seed"
         seed_training_runtime(preflight.config.runtime.seed)
         phase = "metadata.running_status"
         preflight.directory.write_status(
             _resume_status_base(
-                preflight, "running", training_executed=False
+                preflight,
+                "running",
+                training_executed=False,
+                journal=journal,
             )
         )
         phase = "runtime.instantiate"
@@ -1829,8 +1978,10 @@ def _execute_resume(
             preflight.config.checkpointed_fit,
             resumed_max_epochs=max_epochs,
             policy=ResumePolicy(),
+            epoch_metrics_provenance=provenance,
+            epoch_metrics_observer=journal,
         )
-        status = _completed_status(preflight, result)
+        status = _completed_status(preflight, result, journal=journal)
         phase = "metadata.completed_status"
         preflight.directory.write_status(status)
         if progress is not None:
@@ -1848,6 +1999,7 @@ def _execute_resume(
             prepared=prepared,
             interrupted=True,
             training_executed=training_executed,
+            journal=journal,
         )
         stored_error = _write_failure_status(preflight, status, error)
         raise CLIInterruptedError(
@@ -1874,6 +2026,7 @@ def _execute_resume(
             prepared=prepared,
             interrupted=False,
             training_executed=training_executed,
+            journal=journal,
         )
         stored_error = _write_failure_status(preflight, status, error)
         raise _execution_error(preflight, stored_error, status) from error
@@ -1906,7 +2059,7 @@ def resume_training(
         ) from error
     try:
         with lock:
-            return _execute_resume(preflight, progress=progress)
+            return _execute_resume(preflight, lock, progress=progress)
     except (CLIError, CLIInterruptedError):
         raise
     except RunDirectoryError as error:

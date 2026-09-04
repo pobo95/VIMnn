@@ -6,7 +6,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 import os
 from pathlib import Path
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import torch
 
@@ -50,7 +50,14 @@ from .validation import ValidationStepConfig
 from .epoch import run_training_epoch, run_validation_epoch
 
 
-CheckpointFailureStage = Literal["capture", "manager"]
+if TYPE_CHECKING:
+    from .metrics_journal import (
+        CommittedEpochProvenance,
+        EpochMetricsObserver,
+    )
+
+
+CheckpointFailureStage = Literal["capture", "manager", "epoch_observer"]
 
 
 @dataclass(frozen=True)
@@ -143,7 +150,7 @@ class CheckpointedFitResult:
 
 
 class CheckpointedFitExecutionError(RuntimeError):
-    """Post-update checkpoint failure with explicit recoverable progress."""
+    """Post-update checkpoint/observer failure with recoverable progress."""
 
     def __init__(
         self,
@@ -172,6 +179,7 @@ class CheckpointedFitExecutionError(RuntimeError):
             if isinstance(cause, CheckpointManagerError)
             else False
         )
+        self.original_error = cause
         self.original_exception_type = type(cause).__name__
         self.original_exception_message = str(cause)
         self.rollback_performed = False
@@ -186,6 +194,100 @@ class CheckpointedFitExecutionError(RuntimeError):
             f"{self.original_exception_message}; current epoch updates are retained "
             "and are not rolled back"
         )
+
+
+def _validate_epoch_observer(
+    epoch_metrics_provenance: "CommittedEpochProvenance | None",
+    epoch_metrics_observer: "EpochMetricsObserver | None",
+) -> None:
+    """Validate the optional committed-epoch observation pair before updates."""
+
+    if epoch_metrics_observer is None:
+        if epoch_metrics_provenance is not None:
+            raise ValueError(
+                "epoch_metrics_provenance requires epoch_metrics_observer"
+            )
+        return
+    if not callable(epoch_metrics_observer):
+        raise TypeError("epoch_metrics_observer must be callable or None")
+    if epoch_metrics_provenance is None:
+        raise ValueError(
+            "epoch_metrics_observer requires epoch_metrics_provenance"
+        )
+    # Import lazily so the observer-free checkpointed engine retains its
+    # existing import and execution boundary.
+    from .metrics_journal import CommittedEpochProvenance
+
+    if not isinstance(epoch_metrics_provenance, CommittedEpochProvenance):
+        raise TypeError(
+            "epoch_metrics_provenance must be a CommittedEpochProvenance"
+        )
+
+
+def _validate_epoch_provenance_metadata(
+    provenance: "CommittedEpochProvenance | None",
+    checkpoint_metadata: CheckpointMetadata,
+) -> None:
+    """Bind observable data/template provenance to checkpoint source-of-truth."""
+
+    if provenance is None:
+        return
+    if not isinstance(checkpoint_metadata, CheckpointMetadata):
+        raise TypeError("checkpoint_metadata must be a CheckpointMetadata")
+    from .metrics_journal import committed_epoch_provenance_from_checkpoint_metadata
+
+    expected_provenance = committed_epoch_provenance_from_checkpoint_metadata(
+        checkpoint_metadata,
+        initial_bundle_fingerprint=provenance.initial_bundle_fingerprint,
+    )
+    comparisons = (
+        (
+            "training_configuration_fingerprint",
+            provenance.training_configuration_fingerprint,
+            expected_provenance.training_configuration_fingerprint,
+        ),
+        (
+            "train_data_fingerprint",
+            provenance.train_data_fingerprint,
+            expected_provenance.train_data_fingerprint,
+        ),
+        (
+            "validation_data_fingerprint",
+            provenance.validation_data_fingerprint,
+            expected_provenance.validation_data_fingerprint,
+        ),
+        (
+            "template_fingerprints",
+            provenance.template_fingerprints,
+            expected_provenance.template_fingerprints,
+        ),
+    )
+    for name, actual, expected in comparisons:
+        if actual != expected:
+            raise ValueError(
+                f"epoch metrics provenance {name} differs from checkpoint metadata"
+            )
+
+
+def _observe_committed_epoch(
+    epoch_record: FitEpochRecord,
+    managed_result: ManagedCheckpointResult,
+    *,
+    selection_mode: str,
+    provenance: "CommittedEpochProvenance",
+    observer: "EpochMetricsObserver",
+) -> None:
+    """Project and publish one event containing no live runtime references."""
+
+    from .metrics_journal import committed_epoch_metrics_from_record
+
+    event = committed_epoch_metrics_from_record(
+        epoch_record,
+        managed_result,
+        selection_mode=selection_mode,
+        provenance=provenance,
+    )
+    observer(event)
 
 
 def _validate_optimizer_config(
@@ -449,9 +551,15 @@ def _run_checkpointed_epochs(
     history_prefix: Sequence[FitEpochRecord] = (),
     checkpoint_fit_config: FitConfig | None = None,
     existing_best_path: str | None = None,
+    epoch_metrics_provenance: "CommittedEpochProvenance | None" = None,
+    epoch_metrics_observer: "EpochMetricsObserver | None" = None,
 ) -> CheckpointedFitResult:
     """Execute the shared epoch/checkpoint loop for fresh and resumed fits."""
 
+    _validate_epoch_observer(epoch_metrics_provenance, epoch_metrics_observer)
+    _validate_epoch_provenance_metadata(
+        epoch_metrics_provenance, checkpoint_metadata
+    )
     prefix = tuple(history_prefix)
     if any(not isinstance(record, FitEpochRecord) for record in prefix):
         raise TypeError("history_prefix entries must be FitEpochRecord objects")
@@ -599,6 +707,23 @@ def _run_checkpointed_epochs(
                 cause=error,
             ) from error
         managed_results.append(managed)
+        if epoch_metrics_observer is not None:
+            assert epoch_metrics_provenance is not None
+            try:
+                _observe_committed_epoch(
+                    record,
+                    managed,
+                    selection_mode=selection_config.mode,
+                    provenance=epoch_metrics_provenance,
+                    observer=epoch_metrics_observer,
+                )
+            except Exception as error:
+                raise CheckpointedFitExecutionError(
+                    failure_stage="epoch_observer",
+                    epoch_record=record,
+                    completed_checkpoint_results=tuple(managed_results),
+                    cause=error,
+                ) from error
         if decision.should_stop:
             break
 
@@ -646,6 +771,9 @@ def run_checkpointed_fit(
     checkpoint_manager: CheckpointManager,
     checkpoint_metadata: CheckpointMetadata,
     checkpoint_config: CheckpointedFitConfig = CheckpointedFitConfig(),
+    *,
+    epoch_metrics_provenance: "CommittedEpochProvenance | None" = None,
+    epoch_metrics_observer: "EpochMetricsObserver | None" = None,
 ) -> CheckpointedFitResult:
     """Run a fresh deterministic fit and atomically checkpoint every epoch.
 
@@ -654,6 +782,7 @@ def run_checkpointed_fit(
     precedes both early-stop termination and the next training epoch.
     """
 
+    _validate_epoch_observer(epoch_metrics_provenance, epoch_metrics_observer)
     train_batches, validation_batches, optimizer_config = _validate_checkpoint_preflight(
         model,
         optimizer,
@@ -672,6 +801,9 @@ def run_checkpointed_fit(
         checkpoint_metadata,
         checkpoint_config,
     )
+    _validate_epoch_provenance_metadata(
+        epoch_metrics_provenance, checkpoint_metadata
+    )
     return _run_checkpointed_epochs(
         model,
         optimizer,
@@ -689,6 +821,8 @@ def run_checkpointed_fit(
         checkpoint_manager,
         checkpoint_metadata,
         optimizer_config,
+        epoch_metrics_provenance=epoch_metrics_provenance,
+        epoch_metrics_observer=epoch_metrics_observer,
     )
 
 

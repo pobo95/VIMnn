@@ -205,6 +205,17 @@ def test_mixed_template_pristine_vacancy_one_epoch_checkpoint_contract(
         template_id: startup.registry.resolve(template_id).fingerprint
         for template_id in ("alpha-111", "zeta-211")
     }
+    journal_event = json.loads(
+        Path(result.run_directory, "metrics.jsonl")
+        .read_text(encoding="utf-8")
+        .strip()
+    )
+    assert journal_event["provenance"]["template_fingerprints"] == {
+        template_id: startup.registry.resolve(template_id).fingerprint
+        for template_id in ("alpha-111", "zeta-211")
+    }
+    assert journal_event["epoch_index"] == 0
+    assert journal_event["global_step_end"] == 1
     assert result.fit_result.records[0].training.ordered_batch_sample_ids == (
         expected_train_ids,
     )

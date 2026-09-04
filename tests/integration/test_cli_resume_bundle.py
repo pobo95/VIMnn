@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import hashlib
 import json
 from pathlib import Path
 import random
@@ -13,12 +14,14 @@ pytest.importorskip("ase")
 from ase.io import read, write
 
 from refsite_mlip.cli.main import main
-from refsite_mlip.cli.errors import CLIInterruptedError
+from refsite_mlip.cli.errors import CLIError, CLIInterruptedError
 from refsite_mlip.cli.resume import resume_training
 from refsite_mlip.cli.train import run_training
 from refsite_mlip.training import (
     CheckpointManager,
     FitExecutionError,
+    MetricsJournal,
+    MetricsJournalError,
     RunDirectoryError,
     TrainingRunDirectory,
     load_training_checkpoint,
@@ -207,7 +210,95 @@ def test_cpu_float64_continuous_three_epoch_equals_train_one_resume_two(
         path.name
         for path in (tmp_path / "split-output" / "checkpoints").glob("epoch_*.pt")
     ) == ["epoch_000000.pt", "epoch_000001.pt", "epoch_000002.pt"]
+    assert (tmp_path / "continuous-output" / "metrics.jsonl").read_bytes() == (
+        tmp_path / "split-output" / "metrics.jsonl"
+    ).read_bytes()
     assert not (tmp_path / "split-output" / ".resume.lock").exists()
+
+
+def test_resume_recovers_a_missing_committed_journal_suffix_before_continuing(
+    training_bundle, tmp_path
+):
+    _, run_directory, _ = _fresh_one_epoch(tmp_path, training_bundle)
+    journal_path = run_directory / "metrics.jsonl"
+    journal_path.unlink()
+    status_path = run_directory / "run_status.json"
+    status = json.loads(status_path.read_text(encoding="utf-8"))
+    status.update(
+        {
+            "metrics_journal": "metrics.jsonl",
+            "metrics_event_count": 0,
+            "metrics_last_epoch": None,
+            "metrics_semantic_sha256": hashlib.sha256(b"").hexdigest(),
+        }
+    )
+    status_path.write_text(json.dumps(status, sort_keys=True), encoding="utf-8")
+    status_before_dry_run = status_path.read_bytes()
+
+    dry_run = resume_training(run_directory, max_epochs=2, dry_run=True)
+    assert dry_run["message"] == "no training was executed"
+    assert not journal_path.exists()
+    assert status_path.read_bytes() == status_before_dry_run
+
+    resumed = resume_training(run_directory, max_epochs=2)
+
+    events = [
+        json.loads(line)
+        for line in journal_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert [event["epoch_index"] for event in events] == [0, 1]
+    assert resumed["metrics_event_count"] == 2
+    assert resumed["metrics_last_epoch"] == 1
+    assert resumed["metrics_semantic_sha256"] == hashlib.sha256(
+        journal_path.read_bytes()
+    ).hexdigest()
+
+
+def test_resume_journal_failure_preserves_checkpoint_and_next_resume_recovers(
+    training_bundle, tmp_path, monkeypatch
+):
+    _, run_directory, _ = _fresh_one_epoch(tmp_path, training_bundle)
+    real_observer = MetricsJournal.__call__
+
+    def fail_resumed_epoch(self, event):
+        if event.epoch_index == 1:
+            raise MetricsJournalError(
+                "INJECTED_RESUME_JOURNAL_FAILURE",
+                "injected resumed journal failure",
+                stage="metrics_journal.commit",
+                path=self.path,
+                epoch_index=event.epoch_index,
+                last_valid_epoch=0,
+                original_error=OSError("injected resumed journal failure"),
+            )
+        return real_observer(self, event)
+
+    monkeypatch.setattr(MetricsJournal, "__call__", fail_resumed_epoch)
+    with pytest.raises(CLIError) as caught:
+        resume_training(run_directory, max_epochs=2)
+    assert caught.value.failure_phase == "metrics_journal"
+
+    latest = load_training_checkpoint(run_directory / "checkpoints" / "latest.pt")
+    assert latest.progress.completed_epochs == 2
+    assert latest.progress.last_completed_epoch == 1
+    status = json.loads((run_directory / "run_status.json").read_text())
+    assert status["status"] == "failed"
+    assert status["failure_phase"] == "metrics_journal"
+    assert status["completed_epochs"] == 2
+    assert status["metrics_event_count"] == 1
+    assert status["metrics_last_epoch"] == 0
+
+    monkeypatch.setattr(MetricsJournal, "__call__", real_observer)
+    resumed = resume_training(run_directory, max_epochs=3)
+    events = [
+        json.loads(line)
+        for line in (run_directory / "metrics.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert [event["epoch_index"] for event in events] == [0, 1, 2]
+    assert resumed["completed_epochs"] == 3
+    assert resumed["metrics_event_count"] == 3
 
 
 def test_resume_rejects_nonincrease_lock_and_data_change(
@@ -287,6 +378,32 @@ def test_resume_rechecks_status_after_lock_without_clobbering_foreign_change(
         "RUN_STATUS_TOCTOU_MISMATCH"
     )
     assert status_path.read_bytes() == changed["bytes"]
+    assert not (run_directory / ".resume.lock").exists()
+
+
+def test_resume_rechecks_metrics_journal_after_lock_without_repairing_race(
+    training_bundle, tmp_path, monkeypatch
+):
+    _, run_directory, _ = _fresh_one_epoch(tmp_path, training_bundle)
+    journal_path = run_directory / "metrics.jsonl"
+    original_acquire = TrainingRunDirectory.acquire_resume_lock
+
+    def acquire_then_remove_prefix(directory):
+        lock = original_acquire(directory)
+        journal_path.unlink()
+        return lock
+
+    monkeypatch.setattr(
+        TrainingRunDirectory,
+        "acquire_resume_lock",
+        acquire_then_remove_prefix,
+    )
+    with pytest.raises(CLIError) as caught:
+        resume_training(run_directory, max_epochs=2)
+    assert getattr(caught.value, "reason_code", None) == (
+        "METRICS_JOURNAL_TOCTOU_MISMATCH"
+    )
+    assert not journal_path.exists()
     assert not (run_directory / ".resume.lock").exists()
 
 
