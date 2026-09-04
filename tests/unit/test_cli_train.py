@@ -172,7 +172,7 @@ def test_training_config_positional_alias_ambiguity_is_usage_error():
     assert conflicting.value.code == 2
 
 
-def test_scratch_train_dry_run_stops_before_seed_model_optimizer_or_output(
+def test_scratch_cli_requires_full_inputs_before_seed_model_optimizer_or_output(
     tmp_path, monkeypatch, capsys
 ):
     from test_training_run_config import _v2_payload
@@ -192,25 +192,22 @@ def test_scratch_train_dry_run_stops_before_seed_model_optimizer_or_output(
     monkeypatch.setattr(module, "_prepare_training_runtime", forbidden)
     rng = torch.get_rng_state().clone()
 
-    assert main(["validate-train-config", str(path), "--json"]) == 0
+    assert main(["validate-train-config", str(path), "--json"]) == 1
     captured = capsys.readouterr()
-    validation_report = json.loads(captured.out)
-    assert validation_report["status"] == "scratch_config_ready"
-    assert validation_report["training_executed"] is False
-    assert captured.err == ""
+    assert captured.out == ""
+    assert "INPUT_NOT_FOUND" in captured.err
 
-    assert main(["train", str(path), "--dry-run"]) == 0
+    assert main(["train", str(path), "--dry-run"]) == 1
     captured = capsys.readouterr()
-    assert "Status: config ready" in captured.out
-    assert "Scratch execution: not implemented" in captured.out
-    assert captured.err == ""
+    assert captured.out == ""
+    assert "INPUT_NOT_FOUND" in captured.err
     assert not output.exists()
     assert torch.equal(torch.get_rng_state(), rng)
 
     assert main(["train", str(path)]) == 1
     captured = capsys.readouterr()
     assert captured.out == ""
-    assert "SCRATCH_EXECUTION_NOT_IMPLEMENTED" in captured.err
+    assert "INPUT_NOT_FOUND" in captured.err
     assert not output.exists()
     assert torch.equal(torch.get_rng_state(), rng)
 

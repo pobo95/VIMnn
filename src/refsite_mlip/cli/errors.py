@@ -17,6 +17,7 @@ class CLIError(RuntimeError):
         stage: str,
         bundle_path: str | PathLike[str] | None = None,
         path: str | PathLike[str] | None = None,
+        source_path: str | PathLike[str] | None = None,
         frame_index: int | None = None,
         sample_id: str | None = None,
         template_id: str | None = None,
@@ -54,6 +55,7 @@ class CLIError(RuntimeError):
             if path is not None
             else self.bundle_path
         )
+        self.source_path = None if source_path is None else str(source_path)
         self.frame_index = frame_index
         self.sample_id = sample_id
         self.template_id = template_id
@@ -88,6 +90,7 @@ class CLIError(RuntimeError):
         context = []
         for name in (
             "path",
+            "source_path",
             "frame_index",
             "sample_id",
             "template_id",
@@ -132,6 +135,7 @@ class CLIError(RuntimeError):
             "message": self.message,
             "original_exception_type": self.original_exception_type,
             "path": self.path,
+            "source_path": self.source_path,
             "prediction_stage": self.prediction_stage,
             "predictor_reason_code": self.predictor_reason_code,
             "reason_code": self.reason_code,
@@ -162,6 +166,7 @@ def format_cli_error(error: CLIError) -> str:
     context = []
     for name in (
         "path",
+        "source_path",
         "frame_index",
         "sample_id",
         "template_id",

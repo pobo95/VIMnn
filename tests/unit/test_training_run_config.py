@@ -33,7 +33,7 @@ from refsite_mlip.data import (
 )
 from refsite_mlip.features import ProbabilityMultipoleConfig
 from refsite_mlip.interactions import HigherBodyConfig
-from refsite_mlip.models import PotentialConfig
+from refsite_mlip.models import EvaluationPolicy, PotentialConfig
 from refsite_mlip.training import (
     AtomicBaselineConfig,
     CheckpointedFitConfig,
@@ -267,6 +267,59 @@ def test_public_data_and_runtime_configs_are_frozen_and_strict():
             train=({"path": "a.xyz", "template_id": "a", "template_key": "k"},),
             validation=data.validation,
         )
+
+
+def test_automatic_template_assignment_is_strict_and_scratch_v2_only():
+    automatic = TrainingDataConfig(
+        train=({"path": "train.xyz", "automatic_template_assignment": True},),
+        validation=(
+            {"path": "validation.xyz", "automatic_template_assignment": True},
+        ),
+        batch_size=1,
+        validation_batch_size=1,
+        shuffle=False,
+    )
+    assert automatic.to_dict()["train"] == [
+        {"path": "train.xyz", "automatic_template_assignment": True}
+    ]
+    for value in (False, 0, 1, "true"):
+        with pytest.raises(TrainingRunConfigError):
+            TrainingDataConfig(
+                train=(
+                    {
+                        "path": "train.xyz",
+                        "automatic_template_assignment": value,
+                    },
+                ),
+                validation=automatic.validation,
+            )
+
+    v1 = _payload()
+    v1["data"] = automatic.to_dict()
+    v1["data"].pop("validation_batch_size")
+    with pytest.raises(TrainingRunConfigError) as caught:
+        TrainingRunConfig.from_dict(v1)
+    assert caught.value.reason_code == "UNKNOWN_CONFIG_KEY"
+
+    v1 = _payload()
+    v1["data"]["train"][0]["automatic_template_assignment"] = False
+    with pytest.raises(TrainingRunConfigError) as caught:
+        TrainingRunConfig.from_dict(v1)
+    assert caught.value.reason_code == "UNKNOWN_CONFIG_KEY"
+    assert caught.value.field == (
+        "data.train[0].automatic_template_assignment"
+    )
+
+    v2_bundle = _v2_payload(kind="bundle")
+    v2_bundle["data"] = automatic.to_dict()
+    with pytest.raises(TrainingRunConfigError) as caught:
+        TrainingRunConfig.from_dict(v2_bundle)
+    assert caught.value.reason_code == "AUTOMATIC_TEMPLATE_ASSIGNMENT_UNSUPPORTED"
+
+    v2_scratch = _v2_payload()
+    v2_scratch["data"] = automatic.to_dict()
+    parsed = TrainingRunConfig.from_dict(v2_scratch)
+    assert parsed.to_dict()["data"] == automatic.to_dict()
 
 
 @pytest.mark.parametrize(
@@ -738,3 +791,38 @@ def test_scratch_template_order_identity_and_default_are_strict():
     with pytest.raises(TrainingRunConfigError) as caught:
         TrainingRunConfig.from_dict(payload)
     assert caught.value.reason_code == "INVALID_MODEL_SOURCE_CONFIG"
+
+
+def test_scratch_site_type_phase_and_policy_bindings_fail_during_config_parse():
+    payload = _v2_payload()
+    payload["model_source"]["reference_templates"][0]["phase_specification"][
+        "site_type_alignment_weights"
+    ] = [[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]]
+    with pytest.raises(TrainingRunConfigError) as caught:
+        TrainingRunConfig.from_dict(payload)
+    assert caught.value.reason_code == "MODEL_SOURCE_SITE_TYPE_MISMATCH"
+
+    payload = _v2_payload()
+    policy = EvaluationPolicy(
+        template_id="another-template",
+        template_fingerprint="0" * 64,
+        candidate_offsets=torch.tensor(
+            [[0.0, 0.0, 0.0], [0.25, 0.25, 0.25]], dtype=torch.float64
+        ),
+        phase_step_schedule=(0.1,),
+        phase_damping_schedule=(1.0,),
+        minimum_objective_gap_absolute=1.0e-8,
+        minimum_cross_amplitude_absolute=1.0e-8,
+        minimum_atomic_amplitude_absolute=1.0e-8,
+        minimum_reference_amplitude_absolute=1.0e-8,
+        minimum_curvature=1.0e-8,
+        maximum_condition=10.0,
+        maximum_gradient_norm=1.0e-8,
+        equivalence_tolerance=1.0e-10,
+    ).to_dict()
+    payload["model_source"]["reference_templates"][0][
+        "evaluation_policy"
+    ] = policy
+    with pytest.raises(TrainingRunConfigError) as caught:
+        TrainingRunConfig.from_dict(payload)
+    assert caught.value.reason_code == "MODEL_SOURCE_TEMPLATE_MISMATCH"

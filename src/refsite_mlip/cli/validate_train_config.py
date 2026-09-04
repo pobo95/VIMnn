@@ -9,10 +9,15 @@ from typing import Any
 from refsite_mlip.config import (
     ResolvedScratchTrainingRun,
     ResolvedTrainingRun,
+    ScratchModelSourceConfig,
     TrainingRunConfigOverrides,
     TrainingRunConfigError,
     load_effective_training_run_config,
     resolve_training_run,
+)
+from refsite_mlip.training import (
+    ScratchTrainingPreparation,
+    prepare_scratch_training_run,
 )
 
 from .errors import CLIError
@@ -29,6 +34,7 @@ def _cli_error(
         error.message,
         stage=error.stage,
         path=error.config_path or requested_path,
+        source_path=error.source_path,
         frame_index=error.frame_index,
         sample_id=error.sample_id,
         template_id=error.template_id,
@@ -46,24 +52,29 @@ def validate_train_config(
     *,
     overrides: TrainingRunConfigOverrides | None = None,
     cli_cwd: str | PathLike[str] | None = None,
-) -> ResolvedTrainingRun | ResolvedScratchTrainingRun:
-    """Resolve bundle preflight or scratch config without creating a runtime."""
+) -> ResolvedTrainingRun | ScratchTrainingPreparation:
+    """Run the shared bundle or scratch preflight without creating a runtime."""
 
     try:
         config = load_effective_training_run_config(
             path, overrides, cli_cwd=cli_cwd
         )
+        if isinstance(config.model_source, ScratchModelSourceConfig):
+            return prepare_scratch_training_run(config)
         return resolve_training_run(config)
     except TrainingRunConfigError as error:
         raise _cli_error(error, requested_path=path) from error
 
 
 def render_train_config_json(
-    resolved: ResolvedTrainingRun | ResolvedScratchTrainingRun,
+    resolved: ResolvedTrainingRun | ResolvedScratchTrainingRun | ScratchTrainingPreparation,
 ) -> str:
     """Render strict deterministic JSON preflight metadata."""
 
-    if not isinstance(resolved, (ResolvedTrainingRun, ResolvedScratchTrainingRun)):
+    if not isinstance(
+        resolved,
+        (ResolvedTrainingRun, ResolvedScratchTrainingRun, ScratchTrainingPreparation),
+    ):
         raise TypeError("resolved must be resolved training-run metadata")
     return _render_json(resolved.to_dict())
 
@@ -93,13 +104,78 @@ def _label_lines(
 
 
 def render_train_config_human(
-    resolved: ResolvedTrainingRun | ResolvedScratchTrainingRun,
+    resolved: ResolvedTrainingRun | ResolvedScratchTrainingRun | ScratchTrainingPreparation,
 ) -> str:
     """Render a deterministic, concise human-readable preflight report."""
 
-    if not isinstance(resolved, (ResolvedTrainingRun, ResolvedScratchTrainingRun)):
+    if not isinstance(
+        resolved,
+        (ResolvedTrainingRun, ResolvedScratchTrainingRun, ScratchTrainingPreparation),
+    ):
         raise TypeError("resolved must be resolved training-run metadata")
     report = resolved.to_dict()
+    if isinstance(resolved, ScratchTrainingPreparation):
+        train = report["data"]["train"]
+        validation = report["data"]["validation"]
+        paths = report["runtime"]["paths"]
+        lines = [
+            "Reference-site MLIP scratch preflight",
+            "Status: ready",
+            f"Config schema: {report['schema_version']}",
+            f"Config SHA-256: {report['config_fingerprint']}",
+            f"Preparation SHA-256: {report['preparation_fingerprint']}",
+            f"Registry SHA-256: {report['registry_fingerprint']}",
+            f"Train semantic SHA-256: {train['semantic_digest']}",
+            f"Validation semantic SHA-256: {validation['semantic_digest']}",
+            "",
+            "Data",
+            f"  Train: {train['frame_count']} frames, {train['batch_count']} batches",
+            "  Validation: "
+            f"{validation['frame_count']} frames, {validation['batch_count']} batches",
+            f"  Model species vocabulary: {_display(report['species_vocabulary'])}",
+            "  Observed species vocabulary: "
+            f"{_display(report['observed_species_vocabulary'])}",
+            "",
+            "Templates",
+        ]
+        for template_id in sorted(report["template_fingerprints"]):
+            values = report["template_fingerprints"][template_id]
+            lines.extend(
+                [
+                    f"  {template_id}: M={values['num_sites']}, "
+                    f"phase={values['phase_approval_status']}, "
+                    "evaluation_policy="
+                    f"{'yes' if values['evaluation_policy_present'] else 'no'}",
+                    "    Structural artifact: "
+                    f"{values['structural_artifact_fingerprint']}",
+                    f"    Full template: {values['full_template_fingerprint']}",
+                    "    Phase specification: "
+                    f"{values['phase_specification_fingerprint']}",
+                    f"    Binding: {values['binding_fingerprint']}",
+                ]
+            )
+        lines.extend(["", "Labels"])
+        _label_lines(lines, split="train", statistics=train["label_statistics"])
+        _label_lines(
+            lines,
+            split="validation",
+            statistics=validation["label_statistics"],
+        )
+        lines.extend(
+            [
+                "",
+                "Runtime",
+                f"  Device: {report['runtime']['device']}",
+                f"  Dtype: {report['runtime']['dtype']}",
+                f"  Output directory: {paths['output_directory']}",
+                "",
+                "Full POSCAR/data/domain preflight completed.",
+                "No model parameters, optimizer, initial bundle, output directory, "
+                "or training run were created.",
+                "Scratch execution remains deferred to Milestone 10A-2B.",
+            ]
+        )
+        return "\n".join(lines)
     if isinstance(resolved, ResolvedScratchTrainingRun):
         source = report["model_source"]
         paths = report["runtime"]["paths"]

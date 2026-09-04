@@ -19,6 +19,7 @@ import torch
 from refsite_mlip.config import (
     ResolvedScratchTrainingRun,
     ResolvedTrainingRun,
+    ScratchModelSourceConfig,
     TrainingRunConfig,
     TrainingRunConfigOverrides,
     TrainingRunConfigError,
@@ -39,11 +40,13 @@ from refsite_mlip.training import (
     FitExecutionError,
     FitProgress,
     ModelSelectionState,
+    ScratchTrainingPreparation,
     apply_atomic_baseline_,
     build_optimizer,
     build_scheduler,
     capture_training_checkpoint,
     fit_atomic_baseline,
+    prepare_scratch_training_run,
     run_checkpointed_fit,
 )
 from refsite_mlip.training.run_directory import (
@@ -103,13 +106,16 @@ def _load_preflight(
     cli_cwd: str | os.PathLike[str] | None = None,
 ) -> tuple[
     TrainingRunConfig,
-    ResolvedTrainingRun | ResolvedScratchTrainingRun,
+    ResolvedTrainingRun | ResolvedScratchTrainingRun | ScratchTrainingPreparation,
 ]:
     try:
         config = load_effective_training_run_config(
             path, overrides, cli_cwd=cli_cwd
         )
-        resolved = resolve_training_run(config)
+        if isinstance(config.model_source, ScratchModelSourceConfig):
+            resolved = prepare_scratch_training_run(config)
+        else:
+            resolved = resolve_training_run(config)
     except TrainingRunConfigError as error:
         _raise_cli_preflight(error, path)
     return config, resolved
@@ -801,7 +807,12 @@ def run_training(
     progress: Callable[[str], None] | None = None,
     overrides: TrainingRunConfigOverrides | None = None,
     cli_cwd: str | os.PathLike[str] | None = None,
-) -> ResolvedTrainingRun | ResolvedScratchTrainingRun | dict[str, Any]:
+) -> (
+    ResolvedTrainingRun
+    | ResolvedScratchTrainingRun
+    | ScratchTrainingPreparation
+    | dict[str, Any]
+):
     """Preflight and optionally execute one fresh deterministic training run."""
 
     if type(dry_run) is not bool:
@@ -814,10 +825,12 @@ def run_training(
     )
     if dry_run:
         return resolved
-    if isinstance(resolved, ResolvedScratchTrainingRun):
+    if isinstance(
+        resolved, (ResolvedScratchTrainingRun, ScratchTrainingPreparation)
+    ):
         raise CLIError(
             "SCRATCH_EXECUTION_NOT_IMPLEMENTED",
-            "scratch model construction is deferred to Milestone 10A-2",
+            "scratch model construction is deferred to Milestone 10A-2B",
             stage="model_source.execution",
             path=config.source_path,
             config_field="model_source.kind",
@@ -909,17 +922,33 @@ def render_training_human(report: Mapping[str, Any]) -> str:
 
 
 def render_train_result_json(
-    result: ResolvedTrainingRun | ResolvedScratchTrainingRun | Mapping[str, Any],
+    result: (
+        ResolvedTrainingRun
+        | ResolvedScratchTrainingRun
+        | ScratchTrainingPreparation
+        | Mapping[str, Any]
+    ),
 ) -> str:
-    if isinstance(result, (ResolvedTrainingRun, ResolvedScratchTrainingRun)):
+    if isinstance(
+        result,
+        (ResolvedTrainingRun, ResolvedScratchTrainingRun, ScratchTrainingPreparation),
+    ):
         return render_train_config_json(result)
     return render_training_json(result)
 
 
 def render_train_result_human(
-    result: ResolvedTrainingRun | ResolvedScratchTrainingRun | Mapping[str, Any],
+    result: (
+        ResolvedTrainingRun
+        | ResolvedScratchTrainingRun
+        | ScratchTrainingPreparation
+        | Mapping[str, Any]
+    ),
 ) -> str:
-    if isinstance(result, (ResolvedTrainingRun, ResolvedScratchTrainingRun)):
+    if isinstance(
+        result,
+        (ResolvedTrainingRun, ResolvedScratchTrainingRun, ScratchTrainingPreparation),
+    ):
         return render_train_config_human(result)
     return render_training_human(result)
 

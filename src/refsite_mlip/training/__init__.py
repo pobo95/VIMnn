@@ -77,6 +77,12 @@ from .resume_fit import (
     validate_checkpoint_history,
 )
 from .scheduler import SchedulerConfig, build_scheduler
+from .scratch_preparation import (
+    SCRATCH_DATA_MANIFEST_CONVENTION_VERSION,
+    SCRATCH_PREPARATION_CONVENTION_VERSION,
+    ScratchTrainingPreparation,
+    prepare_scratch_training_run,
+)
 from .selection import (
     ModelSelectionConfig,
     ModelSelectionState,
@@ -142,6 +148,9 @@ __all__ = [
     "ResumedFitExecutionError",
     "ResumedFitResult",
     "SchedulerConfig",
+    "SCRATCH_DATA_MANIFEST_CONVENTION_VERSION",
+    "SCRATCH_PREPARATION_CONVENTION_VERSION",
+    "ScratchTrainingPreparation",
     "RunDirectoryError",
     "TrainStepConfig",
     "TrainStepResult",
@@ -164,6 +173,7 @@ __all__ = [
     "load_training_checkpoint",
     "load_runtime_json",
     "process_primary_validation",
+    "prepare_scratch_training_run",
     "run_fit",
     "run_checkpointed_fit",
     "run_checkpointed_resumed_fit",

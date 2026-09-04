@@ -1,0 +1,897 @@
+"""Read-only scratch reference and training-data preparation.
+
+This module deliberately owns no model-construction or optimization logic.  It
+materializes only immutable reference metadata and validated CPU data needed by
+the later scratch execution milestone.
+"""
+
+from __future__ import annotations
+
+from collections import Counter
+from collections.abc import Mapping
+from dataclasses import dataclass, replace
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Any
+
+import torch
+
+from refsite_mlip.data import (
+    InMemoryStructureDataset,
+    ReferenceStructureArtifact,
+    StructureSample,
+    TemplateRegistry,
+    assemble_reference_template_from_artifact,
+    build_reference_template_from_poscar,
+    capture_reference_structure_artifact,
+    collate_structure_samples,
+)
+from refsite_mlip.models import (
+    EvaluationPolicy,
+    ModelBundleTemplateBinding,
+    TemplateExecutionContext,
+)
+
+if TYPE_CHECKING:
+    from refsite_mlip.config import (
+        InteractionRadiusConfig,
+        ScratchModelSourceConfig,
+        TrainingDataConfig,
+        TrainingRunConfig,
+        TrainingRuntimeConfig,
+    )
+
+
+SCRATCH_PREPARATION_CONVENTION_VERSION = "scratch_training_preparation_v1"
+SCRATCH_DATA_MANIFEST_CONVENTION_VERSION = "scratch_training_data_manifest_v1"
+
+
+def _freeze_plain(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return MappingProxyType(
+            {
+                str(key): _freeze_plain(item)
+                for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+            }
+        )
+    if isinstance(value, (tuple, list)):
+        return tuple(_freeze_plain(item) for item in value)
+    if type(value) is float and not math.isfinite(value):
+        raise ValueError("scratch preparation metadata contains NaN or Infinity")
+    if value is None or type(value) in (str, bool, int, float):
+        return value
+    raise TypeError(
+        "scratch preparation metadata contains non-plain "
+        f"{type(value).__name__}"
+    )
+
+
+def _plain(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {str(key): _plain(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [_plain(item) for item in value]
+    if type(value) is float and not math.isfinite(value):
+        raise ValueError("scratch preparation metadata contains NaN or Infinity")
+    if value is None or type(value) in (str, bool, int, float):
+        return value
+    raise TypeError(
+        "scratch preparation metadata contains non-plain "
+        f"{type(value).__name__}"
+    )
+
+
+def _canonical_json(value: Mapping[str, Any]) -> str:
+    return json.dumps(
+        _plain(value),
+        allow_nan=False,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def _fingerprint(scope: str, value: Mapping[str, Any]) -> str:
+    payload = {"scope": scope, "value": _plain(value)}
+    return hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
+
+
+def _immutable_mapping(value: Mapping[str, Any]) -> Mapping[str, Any]:
+    return MappingProxyType(dict(sorted(value.items())))
+
+
+class _ReadOnlyTemplateRegistry(TemplateRegistry):
+    """A TemplateRegistry snapshot whose public mutation hook is sealed."""
+
+    def __init__(self, templates: Mapping[str, Any]) -> None:
+        super().__init__()
+        self._sealed = False
+        for template_id in sorted(templates):
+            super().add(templates[template_id])
+        self._sealed = True
+
+    def add(self, template: Any) -> None:
+        if self._sealed:
+            raise TypeError("prepared TemplateRegistry is read-only")
+        super().add(template)
+
+
+def _batch_plan(
+    samples: tuple[StructureSample, ...], batch_size: int
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "batch_index": batch_index,
+            "start": start,
+            "stop": min(start + batch_size, len(samples)),
+            "sample_ids": [sample.sample_id for sample in samples[start : start + batch_size]],
+            "template_ids": [
+                sample.template_id for sample in samples[start : start + batch_size]
+            ],
+        }
+        for batch_index, start in enumerate(range(0, len(samples), batch_size))
+    ]
+
+
+def _validate_batch_plan(
+    samples: tuple[StructureSample, ...],
+    *,
+    batch_size: int,
+    registry: TemplateRegistry,
+) -> None:
+    """Exercise the existing deterministic collation contract without a model."""
+
+    for start in range(0, len(samples), batch_size):
+        chunk = samples[start : start + batch_size]
+        batch = collate_structure_samples(chunk, registry)
+        if batch.sample_ids != tuple(sample.sample_id for sample in chunk):
+            raise ValueError("scratch batch collation changed sample ordering")
+
+
+def _assignment_kind(selection_rule: str) -> str:
+    return {
+        "configured_exact_template_id": "exact_template_id",
+        "frame_exact_template_key": "exact_template_key",
+        "unique_full_domain_match": "unique_automatic",
+    }[selection_rule]
+
+
+def _split_manifest(
+    samples: tuple[StructureSample, ...],
+    assignments: tuple[Any, ...],
+    templates: Mapping[str, Any],
+    *,
+    split: str,
+    batch_size: int,
+) -> dict[str, Any]:
+    by_sample = {assignment.sample_id: assignment for assignment in assignments}
+    entries: list[dict[str, Any]] = []
+    for index, sample in enumerate(samples):
+        template = templates[sample.template_id]
+        validation = template.validate_structure(
+            sample.atomic_numbers,
+            cell=sample.cell,
+            pbc=sample.pbc,
+            sample_id=sample.sample_id,
+        )
+        assignment = by_sample[sample.sample_id]
+        entries.append(
+            {
+                "frame_index": index,
+                "source_index": assignment.source_index,
+                "source_frame_index": assignment.frame_index,
+                "sample_id": sample.sample_id,
+                "template_id": sample.template_id,
+                "template_fingerprint": template.fingerprint,
+                "num_atoms": validation.num_atoms,
+                "num_sites": template.topology.num_sites,
+                "vacancy_mass": validation.vacancy_mass,
+                "composition": list(validation.composition),
+                "maximum_strain_seen": validation.maximum_strain_seen,
+                "template_assignment": {
+                    "kind": _assignment_kind(assignment.selection_rule),
+                    "selection_rule": assignment.selection_rule,
+                    "compatible_template_ids": list(
+                        assignment.compatible_template_ids
+                    ),
+                    "rejected_templates": [
+                        {"template_id": template_id, "reason": reason}
+                        for template_id, reason in assignment.rejected_templates
+                    ],
+                },
+            }
+        )
+    return {
+        "split": split,
+        "frame_count": len(samples),
+        "batch_count": math.ceil(len(samples) / batch_size),
+        "samples": entries,
+        "batches": _batch_plan(samples, batch_size),
+    }
+
+
+def _observed_species(samples: tuple[StructureSample, ...]) -> tuple[int, ...]:
+    return tuple(
+        sorted(
+            {
+                int(value)
+                for sample in samples
+                for value in sample.atomic_numbers.detach().cpu().tolist()
+            }
+        )
+    )
+
+
+@dataclass(frozen=True)
+class ScratchTrainingPreparation:
+    """Immutable ownership of read-only scratch references and input data."""
+
+    config_fingerprint: str
+    preparation_fingerprint: str
+    config: TrainingRunConfig
+    model_source: ScratchModelSourceConfig
+    runtime: TrainingRuntimeConfig
+    data: TrainingDataConfig
+    radius_config: InteractionRadiusConfig
+    resolved_device: str
+    resolved_dtype: str
+    train_samples: tuple[StructureSample, ...]
+    validation_samples: tuple[StructureSample, ...]
+    registry: TemplateRegistry
+    structural_artifacts: Mapping[str, ReferenceStructureArtifact]
+    template_contexts: Mapping[str, TemplateExecutionContext]
+    evaluation_policies: Mapping[str, EvaluationPolicy | None]
+    template_fingerprints: Mapping[str, Any]
+    train_semantic_digest: str
+    validation_semantic_digest: str
+    data_manifest: Mapping[str, Any]
+    species_vocabulary: tuple[int, ...]
+    observed_species_vocabulary: tuple[int, ...]
+    train_label_statistics: Mapping[str, Any]
+    validation_label_statistics: Mapping[str, Any]
+    train_composition_statistics: Any
+    validation_composition_statistics: Any
+    baseline_preflight: Mapping[str, Any]
+    configured_paths: Mapping[str, Any]
+    runtime_paths: Mapping[str, Any]
+    training_configuration: Mapping[str, Any]
+    training_executed: bool = False
+    scratch_execution_implemented: bool = False
+
+    def __post_init__(self) -> None:
+        if type(self.training_executed) is not bool or self.training_executed:
+            raise ValueError("scratch preparation cannot execute training")
+        if (
+            type(self.scratch_execution_implemented) is not bool
+            or self.scratch_execution_implemented
+        ):
+            raise ValueError("scratch model execution is not implemented")
+        for name in ("config_fingerprint", "preparation_fingerprint"):
+            value = getattr(self, name)
+            if type(value) is not str or len(value) != 64 or any(
+                character not in "0123456789abcdef" for character in value
+            ):
+                raise ValueError(f"{name} must be a lowercase SHA-256 string")
+        if getattr(self.config, "config_fingerprint", None) != self.config_fingerprint:
+            raise ValueError("prepared config fingerprint differs from its metadata")
+        if not isinstance(self.registry, TemplateRegistry):
+            raise TypeError("registry must be a TemplateRegistry")
+        object.__setattr__(self, "train_samples", tuple(self.train_samples))
+        object.__setattr__(self, "validation_samples", tuple(self.validation_samples))
+        object.__setattr__(
+            self, "structural_artifacts", _immutable_mapping(self.structural_artifacts)
+        )
+        object.__setattr__(
+            self, "template_contexts", _immutable_mapping(self.template_contexts)
+        )
+        object.__setattr__(
+            self, "evaluation_policies", _immutable_mapping(self.evaluation_policies)
+        )
+        for name in (
+            "template_fingerprints",
+            "data_manifest",
+            "train_label_statistics",
+            "validation_label_statistics",
+            "baseline_preflight",
+            "configured_paths",
+            "runtime_paths",
+            "training_configuration",
+        ):
+            object.__setattr__(self, name, _freeze_plain(getattr(self, name)))
+        object.__setattr__(
+            self,
+            "train_composition_statistics",
+            _freeze_plain(self.train_composition_statistics),
+        )
+        object.__setattr__(
+            self,
+            "validation_composition_statistics",
+            _freeze_plain(self.validation_composition_statistics),
+        )
+        object.__setattr__(
+            self, "species_vocabulary", tuple(int(value) for value in self.species_vocabulary)
+        )
+        object.__setattr__(
+            self,
+            "observed_species_vocabulary",
+            tuple(int(value) for value in self.observed_species_vocabulary),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        train_manifest = self.data_manifest["train"]
+        validation_manifest = self.data_manifest["validation"]
+        train_counts = dict(
+            sorted(Counter(sample.template_id for sample in self.train_samples).items())
+        )
+        validation_counts = dict(
+            sorted(
+                Counter(sample.template_id for sample in self.validation_samples).items()
+            )
+        )
+        return {
+            "status": "scratch_preflight_ready",
+            "training_executed": False,
+            "schema_version": "refsite_training_run_config_v2",
+            "config_fingerprint": self.config_fingerprint,
+            "preparation_fingerprint": self.preparation_fingerprint,
+            "execution": {
+                "implemented": False,
+                "reason_code": "SCRATCH_EXECUTION_NOT_IMPLEMENTED",
+            },
+            "model_source": self.model_source.to_dict(),
+            "registry_fingerprint": self.registry.fingerprint,
+            "data": {
+                "train": {
+                    "semantic_digest": self.train_semantic_digest,
+                    "frame_count": len(self.train_samples),
+                    "batch_count": train_manifest["batch_count"],
+                    "template_frame_counts": train_counts,
+                    "composition_statistics": _plain(
+                        self.train_composition_statistics
+                    ),
+                    "label_statistics": _plain(self.train_label_statistics),
+                },
+                "validation": {
+                    "semantic_digest": self.validation_semantic_digest,
+                    "frame_count": len(self.validation_samples),
+                    "batch_count": validation_manifest["batch_count"],
+                    "template_frame_counts": validation_counts,
+                    "composition_statistics": _plain(
+                        self.validation_composition_statistics
+                    ),
+                    "label_statistics": _plain(
+                        self.validation_label_statistics
+                    ),
+                },
+            },
+            "data_manifest": _plain(self.data_manifest),
+            "runtime": {
+                "device": self.resolved_device,
+                "dtype": self.resolved_dtype,
+                "seed": self.runtime.seed,
+                "configured_paths": _plain(self.configured_paths),
+                "paths": _plain(self.runtime_paths),
+            },
+            "radii": {
+                "config": self.radius_config.to_dict(),
+                "derived": self.radius_config.derived.to_dict(),
+                "diagnostics": self.radius_config.derived.to_diagnostics_dict(),
+            },
+            "species_vocabulary": list(self.species_vocabulary),
+            "observed_species_vocabulary": list(
+                self.observed_species_vocabulary
+            ),
+            "template_fingerprints": _plain(self.template_fingerprints),
+            "baseline_preflight": _plain(self.baseline_preflight),
+            "training_configuration": _plain(self.training_configuration),
+            "side_effects": {
+                "initial_bundle_created": False,
+                "model_parameters_created": False,
+                "optimizer_created": False,
+                "output_directory_created": False,
+            },
+        }
+
+
+def prepare_scratch_training_run(
+    config: Any,
+    *,
+    base_directory: str | os.PathLike[str] | None = None,
+) -> ScratchTrainingPreparation:
+    """Perform complete scratch reference/data preflight without side effects."""
+
+    # Delayed imports avoid a package cycle: training_run imports the public
+    # training config classes before this module is exported by training.
+    from refsite_mlip.config.model_source import ScratchModelSourceConfig
+    from refsite_mlip.config.radii import (
+        RadiusConfigError,
+        validate_radius_artifact_compatibility,
+        validate_radius_model_compatibility,
+    )
+    from refsite_mlip.config import training_run as run_config
+
+    if not isinstance(config, run_config.TrainingRunConfig):
+        raise TypeError("config must be a TrainingRunConfig")
+    run_config.validate_training_run_config(config)
+    # Own a canonical snapshot instead of retaining the caller's config.
+    # Several established config objects contain tensors; their constructors
+    # snapshot those tensors, but merely storing ``config`` here would still
+    # let a later caller-side tensor mutation invalidate prepared metadata.
+    # Runtime path anchors are intentionally outside canonical serialization,
+    # so restore them only after the semantic round trip.
+    config = replace(
+        run_config.TrainingRunConfig.from_dict(config.to_dict()),
+        source_path=config.source_path,
+        output_directory_base=config.output_directory_base,
+    )
+    source = config.model_source
+    if not isinstance(source, ScratchModelSourceConfig):
+        raise run_config._error(
+            "INVALID_MODEL_SOURCE_KIND",
+            "scratch preparation requires a schema-v2 scratch model source",
+            stage="scratch.config",
+            field="model_source.kind",
+            actual=getattr(source, "kind", None),
+        )
+
+    base, config_path = run_config._base_directory(config, base_directory)
+    resolved_device = run_config._preflight_device(config.runtime)
+    reference_paths = tuple(
+        run_config._resolve_existing_file(
+            item.poscar_path,
+            base=base,
+            field_name=(
+                f"model_source.reference_templates[{index}].poscar_path"
+            ),
+            config_path=config_path,
+        )
+        for index, item in enumerate(source.reference_templates)
+    )
+    train_paths = tuple(
+        run_config._resolve_existing_file(
+            item.path,
+            base=base,
+            field_name=f"data.train[{index}].path",
+            config_path=config_path,
+        )
+        for index, item in enumerate(config.data.train)
+    )
+    validation_paths = tuple(
+        run_config._resolve_existing_file(
+            item.path,
+            base=base,
+            field_name=f"data.validation[{index}].path",
+            config_path=config_path,
+        )
+        for index, item in enumerate(config.data.validation)
+    )
+    protected: list[tuple[str, Path]] = []
+    protected.extend(
+        (f"reference[{index}]", path) for index, path in enumerate(reference_paths)
+    )
+    protected.extend(
+        (f"data.train[{index}]", path) for index, path in enumerate(train_paths)
+    )
+    protected.extend(
+        (f"data.validation[{index}]", path)
+        for index, path in enumerate(validation_paths)
+    )
+    if config_path is not None:
+        protected.append(("config", config_path))
+    output_base = (
+        base
+        if config.output_directory_base is None
+        else Path(config.output_directory_base)
+    )
+    output_path = run_config._resolve_output_directory(
+        config.output_directory,
+        base=output_base,
+        config_path=config_path,
+        protected=tuple(protected),
+    )
+
+    try:
+        validate_radius_model_compatibility(config.radii, source.potential)
+    except RadiusConfigError as error:
+        mismatch = error.mismatches[0] if error.mismatches else (None, None, None)
+        raise run_config._error(
+            error.reason_code,
+            "scratch PotentialConfig is incompatible with interaction radii",
+            stage="scratch.radii.model",
+            config_path=None if config_path is None else str(config_path),
+            field=mismatch[0],
+            expected=mismatch[1],
+            actual=mismatch[2],
+            original_reason_code=error.reason_code,
+            original_error=error,
+        ) from error
+
+    registry = TemplateRegistry()
+    templates: dict[str, Any] = {}
+    artifacts: dict[str, ReferenceStructureArtifact] = {}
+    contexts: dict[str, TemplateExecutionContext] = {}
+    policies: dict[str, EvaluationPolicy | None] = {}
+    template_fingerprints: dict[str, Any] = {}
+    for index, (template_source, poscar_path) in enumerate(
+        zip(source.reference_templates, reference_paths)
+    ):
+        template_id = template_source.template_id
+        try:
+            built = build_reference_template_from_poscar(
+                poscar_path,
+                config=template_source.builder,
+                phase_specification=template_source.phase_specification,
+            )
+        except Exception as error:
+            raise run_config._error(
+                getattr(error, "reason_code", "REFERENCE_BUILD_FAILED"),
+                "scratch POSCAR reference construction failed: "
+                f"{type(error).__name__}: {error}",
+                stage="scratch.reference.build",
+                config_path=None if config_path is None else str(config_path),
+                source_path=str(poscar_path),
+                field=f"model_source.reference_templates[{index}]",
+                template_id=template_id,
+                original_reason_code=getattr(error, "reason_code", None),
+                original_error=error,
+            ) from error
+        try:
+            artifact = capture_reference_structure_artifact(built)
+            validate_radius_artifact_compatibility(config.radii, artifact)
+        except Exception as error:
+            mismatch = getattr(error, "mismatches", ())
+            first = mismatch[0] if mismatch else (None, None, None)
+            raise run_config._error(
+                getattr(error, "reason_code", "REFERENCE_ARTIFACT_FAILED"),
+                "scratch structural artifact validation failed: "
+                f"{type(error).__name__}: {error}",
+                stage="scratch.reference.artifact",
+                config_path=None if config_path is None else str(config_path),
+                source_path=str(poscar_path),
+                field=first[0] or f"model_source.reference_templates[{index}]",
+                template_id=template_id,
+                expected=first[1],
+                actual=first[2],
+                original_reason_code=getattr(error, "reason_code", None),
+                original_error=error,
+            ) from error
+        try:
+            assembled = assemble_reference_template_from_artifact(
+                artifact,
+                phase_specification=template_source.phase_specification,
+            )
+        except Exception as error:
+            raise run_config._error(
+                getattr(error, "reason_code", "PHASE_ASSEMBLY_FAILED"),
+                "scratch phase specification could not be combined with the "
+                f"structural artifact: {type(error).__name__}: {error}",
+                stage="scratch.reference.phase",
+                config_path=None if config_path is None else str(config_path),
+                source_path=str(poscar_path),
+                field=(
+                    f"model_source.reference_templates[{index}].phase_specification"
+                ),
+                template_id=template_id,
+                original_reason_code=getattr(error, "reason_code", None),
+                original_error=error,
+            ) from error
+        if assembled.fingerprint != built.template.fingerprint:
+            raise run_config._error(
+                "TEMPLATE_REASSEMBLY_MISMATCH",
+                "artifact plus phase did not reproduce the direct builder template",
+                stage="scratch.reference.phase",
+                config_path=None if config_path is None else str(config_path),
+                source_path=str(poscar_path),
+                template_id=template_id,
+                expected=built.template.fingerprint,
+                actual=assembled.fingerprint,
+            )
+
+        policy = template_source.evaluation_policy
+        if policy is not None:
+            try:
+                policy = EvaluationPolicy.from_dict(policy.to_dict())
+                policy.validate_fingerprint()
+            except Exception as error:
+                raise run_config._error(
+                    getattr(error, "reason_code", "POLICY_CONTENT_MISMATCH"),
+                    "scratch evaluation policy content is invalid",
+                    stage="scratch.reference.policy",
+                    config_path=None if config_path is None else str(config_path),
+                    source_path=str(poscar_path),
+                    field=(
+                        f"model_source.reference_templates[{index}].evaluation_policy"
+                    ),
+                    template_id=template_id,
+                    original_reason_code=getattr(error, "reason_code", None),
+                    original_error=error,
+                ) from error
+            if policy.template_id != template_id:
+                raise run_config._error(
+                    "POLICY_TEMPLATE_ID_MISMATCH",
+                    "evaluation policy template_id differs from the built template",
+                    stage="scratch.reference.policy",
+                    config_path=None if config_path is None else str(config_path),
+                    source_path=str(poscar_path),
+                    template_id=template_id,
+                    expected=template_id,
+                    actual=policy.template_id,
+                )
+            if policy.template_fingerprint != assembled.fingerprint:
+                raise run_config._error(
+                    "POLICY_TEMPLATE_FINGERPRINT_MISMATCH",
+                    "evaluation policy fingerprint does not bind the built template",
+                    stage="scratch.reference.policy",
+                    config_path=None if config_path is None else str(config_path),
+                    source_path=str(poscar_path),
+                    template_id=template_id,
+                    expected=assembled.fingerprint,
+                    actual=policy.template_fingerprint,
+                )
+
+        try:
+            binding = ModelBundleTemplateBinding(
+                template_id=template_id,
+                structural_artifact=artifact,
+                phase_specification=template_source.phase_specification,
+                full_template_fingerprint=assembled.fingerprint,
+                evaluation_policy=policy,
+                approval_status=template_source.phase_specification.approval_status,
+                provenance={"source_kind": "scratch_preflight"},
+            )
+            binding.validate()
+            registry.add(assembled)
+            context = TemplateExecutionContext.from_reference_template(
+                assembled, avg_num_neighbors=artifact.avg_num_neighbors
+            )
+        except Exception as error:
+            raise run_config._error(
+                getattr(error, "reason_code", "TEMPLATE_CONTEXT_FAILED"),
+                "scratch template execution context validation failed: "
+                f"{type(error).__name__}: {error}",
+                stage="scratch.reference.context",
+                config_path=None if config_path is None else str(config_path),
+                source_path=str(poscar_path),
+                template_id=template_id,
+                original_reason_code=getattr(error, "reason_code", None),
+                original_error=error,
+            ) from error
+
+        templates[template_id] = assembled
+        artifacts[template_id] = artifact
+        contexts[template_id] = context
+        policies[template_id] = policy
+        artifact_diagnostics = artifact.diagnostics.to_dict()
+        template_fingerprints[template_id] = {
+            "structural_artifact_fingerprint": artifact.structural_fingerprint,
+            "full_template_fingerprint": assembled.fingerprint,
+            "phase_specification_fingerprint": (
+                run_config._phase_specification_fingerprint(
+                    template_source.phase_specification
+                )
+            ),
+            "binding_fingerprint": binding.binding_fingerprint,
+            "evaluation_policy_fingerprint": (
+                None if policy is None else policy.content_fingerprint
+            ),
+            "evaluation_policy_present": policy is not None,
+            "phase_approval_status": template_source.phase_specification.approval_status,
+            "phase_rank": int(
+                torch.linalg.matrix_rank(
+                    template_source.phase_specification.modes[:3].to(torch.float64)
+                )
+            ),
+            "num_sites": artifact.diagnostics.num_sites,
+            "artifact_diagnostics": artifact_diagnostics,
+        }
+
+    candidate_ids = tuple(sorted(templates))
+    train_samples, train_assignments = run_config._load_split_with_assignments(
+        config.data.train,
+        train_paths,
+        split="train",
+        registry=registry,
+        dtype=torch.float64,
+        config_path=config_path,
+        automatic_template_ids=candidate_ids,
+    )
+    validation_samples, validation_assignments = (
+        run_config._load_split_with_assignments(
+            config.data.validation,
+            validation_paths,
+            split="validation",
+            registry=registry,
+            dtype=torch.float64,
+            config_path=config_path,
+            automatic_template_ids=candidate_ids,
+        )
+    )
+    if set(sample.sample_id for sample in train_samples) & set(
+        sample.sample_id for sample in validation_samples
+    ):
+        raise run_config._error(
+            "CROSS_SPLIT_SAMPLE_ID_COLLISION",
+            "train and validation sample ID namespaces overlap",
+            stage="data.identity",
+            config_path=None if config_path is None else str(config_path),
+        )
+    # The dataset constructor is a final parameter-free registry/domain check.
+    try:
+        InMemoryStructureDataset(train_samples, registry)
+        InMemoryStructureDataset(validation_samples, registry)
+    except Exception as error:
+        raise run_config._error(
+            getattr(error, "reason_code", "DATASET_PREFLIGHT_FAILED"),
+            "scratch in-memory dataset validation failed: "
+            f"{type(error).__name__}: {error}",
+            stage="data.dataset",
+            config_path=None if config_path is None else str(config_path),
+            original_reason_code=getattr(error, "reason_code", None),
+            original_error=error,
+        ) from error
+
+    train_species = _observed_species(train_samples)
+    validation_species = _observed_species(validation_samples)
+    validation_only_species = tuple(
+        sorted(set(validation_species) - set(train_species))
+    )
+    if validation_only_species:
+        raise run_config._error(
+            "VALIDATION_SPECIES_NOT_IN_TRAIN",
+            "validation contains species that are absent from training data",
+            stage="data.species",
+            config_path=None if config_path is None else str(config_path),
+            expected=train_species,
+            actual=validation_only_species,
+        )
+    observed_species = tuple(sorted(set(train_species) | set(validation_species)))
+    configured_species = tuple(source.potential.species_vocabulary)
+    if not set(observed_species).issubset(set(configured_species)):
+        raise run_config._error(
+            "DATA_SPECIES_VOCABULARY_MISMATCH",
+            "dataset species are not included in the scratch PotentialConfig",
+            stage="data.species",
+            config_path=None if config_path is None else str(config_path),
+            expected=configured_species,
+            actual=observed_species,
+        )
+
+    run_config._validate_supervision(train_samples, validation_samples, config)
+    try:
+        _validate_batch_plan(
+            train_samples, batch_size=config.data.batch_size, registry=registry
+        )
+        _validate_batch_plan(
+            validation_samples,
+            batch_size=config.data.effective_validation_batch_size,
+            registry=registry,
+        )
+    except Exception as error:
+        raise run_config._error(
+            getattr(error, "reason_code", "BATCH_PREFLIGHT_FAILED"),
+            "deterministic scratch batch collation failed: "
+            f"{type(error).__name__}: {error}",
+            stage="data.batch_plan",
+            config_path=None if config_path is None else str(config_path),
+            original_reason_code=getattr(error, "reason_code", None),
+            original_error=error,
+        ) from error
+    baseline = run_config._baseline_preflight(
+        train_samples, configured_species, config.baseline
+    )
+    train_digest = run_config._split_digest(train_samples, templates, split="train")
+    validation_digest = run_config._split_digest(
+        validation_samples, templates, split="validation"
+    )
+    train_manifest = _split_manifest(
+        train_samples,
+        train_assignments,
+        templates,
+        split="train",
+        batch_size=config.data.batch_size,
+    )
+    validation_manifest = _split_manifest(
+        validation_samples,
+        validation_assignments,
+        templates,
+        split="validation",
+        batch_size=config.data.effective_validation_batch_size,
+    )
+    manifest_payload = {
+        "convention_version": SCRATCH_DATA_MANIFEST_CONVENTION_VERSION,
+        "train_semantic_digest": train_digest,
+        "validation_semantic_digest": validation_digest,
+        "observed_species": {
+            "train": list(train_species),
+            "validation": list(validation_species),
+            "union": list(observed_species),
+            "configured": list(configured_species),
+        },
+        "train": train_manifest,
+        "validation": validation_manifest,
+    }
+    manifest_payload["fingerprint"] = _fingerprint(
+        SCRATCH_DATA_MANIFEST_CONVENTION_VERSION, manifest_payload
+    )
+
+    configured_paths = {
+        "output_directory": config.output_directory,
+        "train_inputs": [item.path for item in config.data.train],
+        "validation_inputs": [item.path for item in config.data.validation],
+        "reference_poscars": [
+            {"template_id": item.template_id, "path": item.poscar_path}
+            for item in source.reference_templates
+        ],
+        "path_kind": "original_config_expression_in_semantic_fingerprint",
+    }
+    runtime_paths = {
+        "config": None if config_path is None else str(config_path),
+        "output_directory": str(output_path),
+        "train_inputs": [str(path) for path in train_paths],
+        "validation_inputs": [str(path) for path in validation_paths],
+        "reference_poscars": [
+            {"template_id": item.template_id, "path": str(path)}
+            for item, path in zip(source.reference_templates, reference_paths)
+        ],
+        "path_kind": "runtime_location_not_semantic_fingerprint",
+    }
+    preparation_semantics = {
+        "convention_version": SCRATCH_PREPARATION_CONVENTION_VERSION,
+        "config_fingerprint": config.config_fingerprint,
+        "registry_fingerprint": registry.fingerprint,
+        "template_fingerprints": template_fingerprints,
+        "train_semantic_digest": train_digest,
+        "validation_semantic_digest": validation_digest,
+        "data_manifest_fingerprint": manifest_payload["fingerprint"],
+    }
+    preparation_fingerprint = _fingerprint(
+        SCRATCH_PREPARATION_CONVENTION_VERSION, preparation_semantics
+    )
+    prepared_registry = _ReadOnlyTemplateRegistry(templates)
+    return ScratchTrainingPreparation(
+        config_fingerprint=config.config_fingerprint,
+        preparation_fingerprint=preparation_fingerprint,
+        config=config,
+        model_source=source,
+        runtime=config.runtime,
+        data=config.data,
+        radius_config=config.radii,
+        resolved_device=resolved_device,
+        resolved_dtype=config.runtime.dtype,
+        train_samples=train_samples,
+        validation_samples=validation_samples,
+        registry=prepared_registry,
+        structural_artifacts=artifacts,
+        template_contexts=contexts,
+        evaluation_policies=policies,
+        template_fingerprints=template_fingerprints,
+        train_semantic_digest=train_digest,
+        validation_semantic_digest=validation_digest,
+        data_manifest=manifest_payload,
+        species_vocabulary=configured_species,
+        observed_species_vocabulary=observed_species,
+        train_label_statistics=run_config._label_statistics(train_samples),
+        validation_label_statistics=run_config._label_statistics(validation_samples),
+        train_composition_statistics=run_config._composition_statistics(train_samples),
+        validation_composition_statistics=run_config._composition_statistics(
+            validation_samples
+        ),
+        baseline_preflight=baseline,
+        configured_paths=configured_paths,
+        runtime_paths=runtime_paths,
+        training_configuration=run_config._training_configuration_metadata(config),
+        training_executed=False,
+        scratch_execution_implemented=False,
+    )
+
+
+__all__ = [
+    "SCRATCH_DATA_MANIFEST_CONVENTION_VERSION",
+    "SCRATCH_PREPARATION_CONVENTION_VERSION",
+    "ScratchTrainingPreparation",
+    "prepare_scratch_training_run",
+]

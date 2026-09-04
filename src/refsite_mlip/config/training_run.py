@@ -115,6 +115,7 @@ class TrainingRunConfigError(ValueError):
         *,
         stage: str,
         config_path: str | None = None,
+        source_path: str | None = None,
         field: str | None = None,
         split: str | None = None,
         frame_index: int | None = None,
@@ -134,6 +135,7 @@ class TrainingRunConfigError(ValueError):
         self.reason_code = reason_code
         self.stage = stage
         self.config_path = config_path
+        self.source_path = source_path
         self.field = field
         self.split = split
         self.frame_index = frame_index
@@ -147,6 +149,7 @@ class TrainingRunConfigError(ValueError):
         context = []
         for name in (
             "config_path",
+            "source_path",
             "field",
             "split",
             "frame_index",
@@ -169,6 +172,7 @@ def _error(
     *,
     stage: str,
     config_path: str | None = None,
+    source_path: str | None = None,
     field: str | None = None,
     split: str | None = None,
     frame_index: int | None = None,
@@ -184,6 +188,7 @@ def _error(
         message,
         stage=stage,
         config_path=config_path,
+        source_path=source_path,
         field=field,
         split=split,
         frame_index=frame_index,
@@ -249,6 +254,7 @@ class TrainingDataSourceConfig:
     path: str
     template_id: str | None = None
     template_key: str | None = None
+    automatic_template_assignment: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "path", _path_text(self.path, field_name="path"))
@@ -262,20 +268,40 @@ class TrainingDataSourceConfig:
                     field=name,
                     actual=value,
                 )
-        if (self.template_id is None) == (self.template_key is None):
+        if type(self.automatic_template_assignment) is not bool:
+            raise _error(
+                "INVALID_TEMPLATE_SELECTOR",
+                "automatic_template_assignment must be a bool",
+                stage="config.validation",
+                field="automatic_template_assignment",
+                actual=self.automatic_template_assignment,
+            )
+        active = sum(
+            (
+                self.template_id is not None,
+                self.template_key is not None,
+                self.automatic_template_assignment,
+            )
+        )
+        if active != 1:
             raise _error(
                 "CONFLICTING_TEMPLATE_SELECTOR",
-                "exactly one of template_id or template_key is required",
+                "exactly one of template_id, template_key, or "
+                "automatic_template_assignment=true is required",
                 stage="config.validation",
-                field="template_id,template_key",
+                field=(
+                    "template_id,template_key,automatic_template_assignment"
+                ),
             )
 
     def to_dict(self) -> dict[str, Any]:
         result = {"path": self.path}
         if self.template_id is not None:
             result["template_id"] = self.template_id
-        else:
+        elif self.template_key is not None:
             result["template_key"] = self.template_key
+        else:
+            result["automatic_template_assignment"] = True
         return result
 
     @classmethod
@@ -288,7 +314,14 @@ class TrainingDataSourceConfig:
                 actual=type(value).__name__,
             )
         keys = frozenset(value)
-        allowed = frozenset({"path", "template_id", "template_key"})
+        allowed = frozenset(
+            {
+                "path",
+                "template_id",
+                "template_key",
+                "automatic_template_assignment",
+            }
+        )
         unknown = keys - allowed
         if unknown:
             raise _error(
@@ -304,18 +337,36 @@ class TrainingDataSourceConfig:
                 stage="config.schema",
                 field="path",
             )
-        selectors = keys & {"template_id", "template_key"}
-        if len(selectors) != 1:
+        automatic = value.get("automatic_template_assignment", False)
+        if type(automatic) is not bool:
+            raise _error(
+                "INVALID_TEMPLATE_SELECTOR",
+                "automatic_template_assignment must be a bool",
+                stage="config.schema",
+                field="automatic_template_assignment",
+                actual=automatic,
+            )
+        active = sum(
+            (
+                "template_id" in keys,
+                "template_key" in keys,
+                automatic,
+            )
+        )
+        if active != 1:
             raise _error(
                 "CONFLICTING_TEMPLATE_SELECTOR",
-                "data source requires exactly one template selector",
+                "data source requires exactly one active template selector",
                 stage="config.schema",
-                field="template_id,template_key",
+                field=(
+                    "template_id,template_key,automatic_template_assignment"
+                ),
             )
         return cls(
             path=value["path"],
             template_id=value.get("template_id"),
             template_key=value.get("template_key"),
+            automatic_template_assignment=automatic,
         )
 
 
@@ -738,6 +789,30 @@ class TrainingRunConfig:
             self.baseline, AtomicBaselineConfig
         ):
             raise TypeError("baseline must be an AtomicBaselineConfig or None")
+        automatic_sources = tuple(
+            (split, index)
+            for split, sources in (
+                ("train", self.data.train),
+                ("validation", self.data.validation),
+            )
+            for index, data_source in enumerate(sources)
+            if data_source.automatic_template_assignment
+        )
+        if automatic_sources and not (
+            self.schema_version == TRAINING_RUN_CONFIG_SCHEMA_VERSION_V2
+            and isinstance(self.model_source, ScratchModelSourceConfig)
+        ):
+            split, index = automatic_sources[0]
+            raise _error(
+                "AUTOMATIC_TEMPLATE_ASSIGNMENT_UNSUPPORTED",
+                "automatic template assignment is supported only for "
+                "schema-v2 scratch model sources",
+                stage="config.schema",
+                field=(
+                    f"data.{split}[{index}].automatic_template_assignment"
+                ),
+                split=split,
+            )
         if (
             self.schema_version == TRAINING_RUN_CONFIG_SCHEMA_VERSION_V1
             and self.data.validation_batch_size is not None
@@ -839,6 +914,29 @@ class TrainingRunConfig:
                     stage="config.schema",
                     field="data.validation_batch_size",
                 )
+            if isinstance(data_value, Mapping):
+                for split in ("train", "validation"):
+                    entries = data_value.get(split)
+                    if not isinstance(entries, Sequence) or isinstance(
+                        entries, (str, bytes, bytearray)
+                    ):
+                        continue
+                    for index, entry in enumerate(entries):
+                        if (
+                            isinstance(entry, Mapping)
+                            and "automatic_template_assignment" in entry
+                        ):
+                            raise _error(
+                                "UNKNOWN_CONFIG_KEY",
+                                "schema v1 does not define automatic template "
+                                "assignment",
+                                stage="config.schema",
+                                field=(
+                                    f"data.{split}[{index}]."
+                                    "automatic_template_assignment"
+                                ),
+                                split=split,
+                            )
         else:
             if "initial_bundle" in value:
                 raise _error(
@@ -1212,6 +1310,28 @@ def validate_training_run_config(config: TrainingRunConfig) -> TrainingRunConfig
 
     if not isinstance(config, TrainingRunConfig):
         raise TypeError("config must be a TrainingRunConfig")
+    automatic_sources = tuple(
+        (split, index)
+        for split, sources in (
+            ("train", config.data.train),
+            ("validation", config.data.validation),
+        )
+        for index, source in enumerate(sources)
+        if source.automatic_template_assignment
+    )
+    if automatic_sources and not (
+        config.schema_version == TRAINING_RUN_CONFIG_SCHEMA_VERSION_V2
+        and isinstance(config.model_source, ScratchModelSourceConfig)
+    ):
+        split, index = automatic_sources[0]
+        raise _error(
+            "AUTOMATIC_TEMPLATE_ASSIGNMENT_UNSUPPORTED",
+            "automatic template assignment is supported only for schema-v2 "
+            "scratch model sources",
+            stage="config.cross_validation",
+            field=f"data.{split}[{index}].automatic_template_assignment",
+            split=split,
+        )
     if isinstance(config.model_source, ScratchModelSourceConfig):
         try:
             validate_radius_model_compatibility(
@@ -1940,6 +2060,7 @@ def _resolve_existing_file(
             "configured input file does not exist; paths are not shell-expanded",
             stage="paths.input",
             config_path=None if config_path is None else str(config_path),
+            source_path=str(unresolved),
             field=field_name,
             actual=text,
             original_error=error,
@@ -1950,6 +2071,7 @@ def _resolve_existing_file(
             "configured input path could not be resolved",
             stage="paths.input",
             config_path=None if config_path is None else str(config_path),
+            source_path=str(unresolved),
             field=field_name,
             actual=text,
             original_error=error,
@@ -1960,6 +2082,7 @@ def _resolve_existing_file(
             "configured input must be a regular file",
             stage="paths.input",
             config_path=None if config_path is None else str(config_path),
+            source_path=str(resolved),
             field=field_name,
             actual=str(resolved),
         )
@@ -2086,15 +2209,14 @@ def _registry_from_bundle(bundle, *, bundle_path: Path) -> tuple[TemplateRegistr
     return registry, templates
 
 
-def _geometry_sample_from_atoms(
+def _geometry_from_atoms(
     atoms: Any,
     *,
-    template_id: str,
-    registry: TemplateRegistry,
-    dtype: torch.dtype,
     frame_index: int,
     sample_id: str,
-) -> StructureSample:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Canonicalize universal extxyz geometry before template selection."""
+
     positions = torch.tensor(atoms.get_positions().copy(), dtype=torch.float64)
     atomic_numbers = torch.tensor(
         atoms.get_atomic_numbers().copy(), dtype=torch.long
@@ -2105,6 +2227,13 @@ def _geometry_sample_from_atoms(
         raise ExtXYZLoadError(
             "MALFORMED_GEOMETRY",
             "positions/numbers have invalid shape",
+            frame_index=frame_index,
+            sample_id=sample_id,
+        )
+    if atomic_numbers.numel() and bool(torch.any(atomic_numbers <= 0)):
+        raise ExtXYZLoadError(
+            "MALFORMED_GEOMETRY",
+            "atomic numbers must be positive",
             frame_index=frame_index,
             sample_id=sample_id,
         )
@@ -2133,6 +2262,30 @@ def _geometry_sample_from_atoms(
             frame_index=frame_index,
             sample_id=sample_id,
         )
+    return positions, atomic_numbers, cell, pbc
+
+
+def _geometry_sample_from_atoms(
+    atoms: Any,
+    *,
+    template_id: str,
+    registry: TemplateRegistry,
+    dtype: torch.dtype,
+    frame_index: int,
+    sample_id: str,
+    geometry: tuple[
+        torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+    ] | None = None,
+) -> StructureSample:
+    positions, atomic_numbers, cell, pbc = (
+        _geometry_from_atoms(
+            atoms,
+            frame_index=frame_index,
+            sample_id=sample_id,
+        )
+        if geometry is None
+        else geometry
+    )
     try:
         template = registry.resolve(template_id)
     except KeyError as error:
@@ -2273,7 +2426,220 @@ def _load_template_key_source(
     return tuple(samples)
 
 
-def _load_split(
+@dataclass(frozen=True)
+class _TemplateAssignmentDiagnostics:
+    split: str
+    source_index: int
+    frame_index: int
+    sample_id: str
+    selection_rule: str
+    selected_template_id: str
+    selected_template_fingerprint: str
+    compatible_template_ids: tuple[str, ...]
+    rejected_templates: tuple[tuple[str, str], ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "split": self.split,
+            "source_index": self.source_index,
+            "frame_index": self.frame_index,
+            "sample_id": self.sample_id,
+            "selection_rule": self.selection_rule,
+            "selected_template_id": self.selected_template_id,
+            "selected_template_fingerprint": (
+                self.selected_template_fingerprint
+            ),
+            "compatible_template_ids": list(self.compatible_template_ids),
+            "rejected_templates": [
+                {"template_id": template_id, "reason": reason}
+                for template_id, reason in self.rejected_templates
+            ],
+        }
+
+
+def _load_automatic_template_source(
+    path: Path,
+    *,
+    split: str,
+    source_index: int,
+    registry: TemplateRegistry,
+    dtype: torch.dtype,
+    candidate_template_ids: tuple[str, ...],
+) -> tuple[
+    tuple[StructureSample, ...], tuple[_TemplateAssignmentDiagnostics, ...]
+]:
+    """Load one source once and select only a unique full-domain match."""
+
+    try:
+        from ase.io import iread
+    except ImportError as error:  # pragma: no cover - optional dependency
+        raise _error(
+            "ASE_UNAVAILABLE",
+            "ASE is required for extxyz training preflight",
+            stage="data.parse",
+            split=split,
+            field=f"data.{split}[{source_index}].path",
+            actual=str(path),
+            original_error=error,
+        ) from error
+
+    samples: list[StructureSample] = []
+    assignments: list[_TemplateAssignmentDiagnostics] = []
+    templates = {
+        template_id: registry.resolve(template_id)
+        for template_id in candidate_template_ids
+    }
+    try:
+        for frame_index, atoms in enumerate(
+            iread(str(path), index=":", format="extxyz")
+        ):
+            sample_id = f"{split}.{source_index:04d}:{frame_index:06d}"
+            geometry = _geometry_from_atoms(
+                atoms,
+                frame_index=frame_index,
+                sample_id=sample_id,
+            )
+            _, atomic_numbers, cell, pbc = geometry
+            supported_species = set().union(
+                *(set(template.supported_species) for template in templates.values())
+            )
+            actual_species = set(int(value) for value in atomic_numbers.tolist())
+            unsupported = tuple(sorted(actual_species - supported_species))
+            if unsupported:
+                error = ExtXYZLoadError(
+                    "UNSUPPORTED_SPECIES",
+                    "structure contains species unsupported by every configured "
+                    f"scratch template: {list(unsupported)!r}",
+                    frame_index=frame_index,
+                    sample_id=sample_id,
+                )
+                error.candidate_template_ids = candidate_template_ids
+                raise error
+            compatible: list[str] = []
+            rejected: list[tuple[str, str]] = []
+            for template_id in candidate_template_ids:
+                template = templates[template_id]
+                try:
+                    if template.strict_domain is None:
+                        raise ValueError(
+                            "automatic assignment requires a strict template domain"
+                        )
+                    template.validate_structure(
+                        atomic_numbers,
+                        cell=cell,
+                        pbc=pbc,
+                        sample_id=sample_id,
+                    )
+                except (TypeError, ValueError) as error:
+                    rejected.append((template_id, str(error)))
+                else:
+                    compatible.append(template_id)
+            if not compatible:
+                details = "; ".join(
+                    f"{template_id}: {reason}"
+                    for template_id, reason in rejected
+                )
+                error = ExtXYZLoadError(
+                    "NO_COMPATIBLE_TEMPLATE",
+                    "no configured template passed the complete structure "
+                    f"domain; candidates=[{details}]",
+                    frame_index=frame_index,
+                    sample_id=sample_id,
+                )
+                error.candidate_template_ids = candidate_template_ids
+                raise error
+            if len(compatible) != 1:
+                error = ExtXYZLoadError(
+                    "AMBIGUOUS_TEMPLATE_ASSIGNMENT",
+                    "multiple configured templates passed the complete "
+                    f"structure domain: {compatible!r}",
+                    frame_index=frame_index,
+                    sample_id=sample_id,
+                )
+                error.candidate_template_ids = candidate_template_ids
+                error.compatible_template_ids = tuple(compatible)
+                raise error
+            selected = compatible[0]
+            sample = _geometry_sample_from_atoms(
+                atoms,
+                template_id=selected,
+                registry=registry,
+                dtype=dtype,
+                frame_index=frame_index,
+                sample_id=sample_id,
+                geometry=geometry,
+            )
+            samples.append(sample)
+            assignments.append(
+                _TemplateAssignmentDiagnostics(
+                    split=split,
+                    source_index=source_index,
+                    frame_index=frame_index,
+                    sample_id=sample_id,
+                    selection_rule="unique_full_domain_match",
+                    selected_template_id=selected,
+                    selected_template_fingerprint=templates[selected].fingerprint,
+                    compatible_template_ids=tuple(compatible),
+                    rejected_templates=tuple(rejected),
+                )
+            )
+    except ExtXYZLoadError:
+        raise
+    except Exception as error:
+        raise ExtXYZLoadError(
+            "ASE_PARSE_FAILURE",
+            f"ASE extxyz parse failed: {error}",
+        ) from error
+    if not samples:
+        raise ExtXYZLoadError("EMPTY_SOURCE", "extxyz source contains no frames")
+    return tuple(samples), tuple(assignments)
+
+
+def _automatic_candidate_template_ids(
+    values: Sequence[str] | None,
+    *,
+    registry: TemplateRegistry,
+    split: str,
+    source_index: int,
+) -> tuple[str, ...]:
+    if values is None or isinstance(values, (str, bytes, bytearray)):
+        raise _error(
+            "AUTOMATIC_TEMPLATE_SET_REQUIRED",
+            "automatic assignment requires an explicit candidate template sequence",
+            stage="data.template_selection",
+            field=f"data.{split}[{source_index}]",
+            split=split,
+        )
+    candidates = tuple(values)
+    if (
+        not candidates
+        or any(type(value) is not str or not value for value in candidates)
+        or len(set(candidates)) != len(candidates)
+    ):
+        raise _error(
+            "INVALID_AUTOMATIC_TEMPLATE_SET",
+            "automatic candidate template IDs must be unique nonempty strings",
+            stage="data.template_selection",
+            field=f"data.{split}[{source_index}]",
+            split=split,
+            actual=candidates,
+        )
+    ordered = tuple(sorted(candidates))
+    unknown = tuple(value for value in ordered if value not in registry)
+    if unknown:
+        raise _error(
+            "UNKNOWN_TEMPLATE",
+            "automatic candidate set contains an unknown template ID",
+            stage="data.template_selection",
+            field=f"data.{split}[{source_index}]",
+            split=split,
+            template_id=unknown[0],
+            actual=unknown,
+        )
+    return ordered
+
+
+def _load_split_with_assignments(
     sources: tuple[TrainingDataSourceConfig, ...],
     paths: tuple[Path, ...],
     *,
@@ -2281,15 +2647,22 @@ def _load_split(
     registry: TemplateRegistry,
     dtype: torch.dtype,
     config_path: Path | None,
-) -> tuple[StructureSample, ...]:
+    automatic_template_ids: Sequence[str] | None = None,
+) -> tuple[
+    tuple[StructureSample, ...], tuple[_TemplateAssignmentDiagnostics, ...]
+]:
+    if len(sources) != len(paths):
+        raise ValueError("source configuration/path count mismatch")
     samples = []
+    assignments: list[_TemplateAssignmentDiagnostics] = []
     for source_index, (source, path) in enumerate(zip(sources, paths)):
         if source.template_id is not None and source.template_id not in registry:
             raise _error(
                 "UNKNOWN_TEMPLATE",
-                "configured exact template_id is absent from the initial bundle",
+                "configured exact template_id is absent from the template registry",
                 stage="data.template_selection",
                 config_path=None if config_path is None else str(config_path),
+                source_path=str(path),
                 field=f"data.{split}[{source_index}].template_id",
                 split=split,
                 template_id=source.template_id,
@@ -2323,7 +2696,22 @@ def _load_split(
                     ),
                     registry,
                 ).samples
-            else:
+                source_assignments = tuple(
+                    _TemplateAssignmentDiagnostics(
+                        split=split,
+                        source_index=source_index,
+                        frame_index=frame_index,
+                        sample_id=sample.sample_id,
+                        selection_rule="configured_exact_template_id",
+                        selected_template_id=sample.template_id,
+                        selected_template_fingerprint=(
+                            registry.resolve(sample.template_id).fingerprint
+                        ),
+                        compatible_template_ids=(sample.template_id,),
+                    )
+                    for frame_index, sample in enumerate(loaded)
+                )
+            elif source.template_key is not None:
                 loaded = _load_template_key_source(
                     path,
                     source,
@@ -2332,17 +2720,58 @@ def _load_split(
                     registry=registry,
                     dtype=dtype,
                 )
+                source_assignments = tuple(
+                    _TemplateAssignmentDiagnostics(
+                        split=split,
+                        source_index=source_index,
+                        frame_index=frame_index,
+                        sample_id=sample.sample_id,
+                        selection_rule="frame_exact_template_key",
+                        selected_template_id=sample.template_id,
+                        selected_template_fingerprint=(
+                            registry.resolve(sample.template_id).fingerprint
+                        ),
+                        compatible_template_ids=(sample.template_id,),
+                    )
+                    for frame_index, sample in enumerate(loaded)
+                )
+            else:
+                candidates = _automatic_candidate_template_ids(
+                    automatic_template_ids,
+                    registry=registry,
+                    split=split,
+                    source_index=source_index,
+                )
+                loaded, source_assignments = _load_automatic_template_source(
+                    path,
+                    split=split,
+                    source_index=source_index,
+                    registry=registry,
+                    dtype=dtype,
+                    candidate_template_ids=candidates,
+                )
         except ExtXYZLoadError as error:
+            stage = (
+                "data.template_assignment"
+                if error.reason_code
+                in {
+                    "NO_COMPATIBLE_TEMPLATE",
+                    "AMBIGUOUS_TEMPLATE_ASSIGNMENT",
+                }
+                else "data.load"
+            )
             raise _error(
                 error.reason_code,
                 f"extxyz data preflight failed: {error}",
-                stage="data.load",
+                stage=stage,
                 config_path=None if config_path is None else str(config_path),
+                source_path=str(path),
                 field=f"data.{split}[{source_index}]",
                 split=split,
                 frame_index=error.frame_index,
                 sample_id=error.sample_id,
                 template_id=getattr(error, "template_id", source.template_id),
+                actual=str(path),
                 original_reason_code=error.reason_code,
                 original_error=error,
             ) from error
@@ -2352,13 +2781,16 @@ def _load_split(
                 f"extxyz data preflight failed: {error}",
                 stage="data.load",
                 config_path=None if config_path is None else str(config_path),
+                source_path=str(path),
                 field=f"data.{split}[{source_index}]",
                 split=split,
                 template_id=source.template_id,
+                actual=str(path),
                 original_reason_code=getattr(error, "reason_code", None),
                 original_error=error,
             ) from error
         samples.extend(loaded)
+        assignments.extend(source_assignments)
     result = tuple(samples)
     ids = tuple(sample.sample_id for sample in result)
     if len(set(ids)) != len(ids):
@@ -2368,7 +2800,31 @@ def _load_split(
             stage="data.identity",
             split=split,
         )
-    return result
+    return result, tuple(assignments)
+
+
+def _load_split(
+    sources: tuple[TrainingDataSourceConfig, ...],
+    paths: tuple[Path, ...],
+    *,
+    split: str,
+    registry: TemplateRegistry,
+    dtype: torch.dtype,
+    config_path: Path | None,
+    automatic_template_ids: Sequence[str] | None = None,
+) -> tuple[StructureSample, ...]:
+    """Compatibility wrapper retaining the pre-10A split-loader return type."""
+
+    samples, _ = _load_split_with_assignments(
+        sources,
+        paths,
+        split=split,
+        registry=registry,
+        dtype=dtype,
+        config_path=config_path,
+        automatic_template_ids=automatic_template_ids,
+    )
+    return samples
 
 
 def _hash_text(digest: Any, value: str) -> None:
@@ -2882,6 +3338,7 @@ __all__ = [
     "ResolvedScratchTrainingRun",
     "ResolvedTrainingRun",
     "TrainingDataConfig",
+    "TrainingDataSourceConfig",
     "TrainingRunConfigOverrides",
     "TrainingRuntimeConfig",
     "TrainingRunConfig",

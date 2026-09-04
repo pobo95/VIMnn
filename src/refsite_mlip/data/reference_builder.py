@@ -789,7 +789,11 @@ def build_reference_template_from_poscar(
         from ase.io import read
     except ImportError as error:  # pragma: no cover - environment contract
         raise ImportError("ASE is required to read POSCAR templates") from error
-    atoms = read(str(source), index=0)
+    # A scratch reference source is explicitly a POSCAR, not a generic ASE
+    # trajectory whose format should be inferred from its filename.  VASP
+    # files contain one structure; ``index=0`` makes that single-image
+    # contract explicit as well.
+    atoms = read(str(source), index=0, format="vasp")
     return build_reference_template_from_atoms(
         atoms,
         config=config,
