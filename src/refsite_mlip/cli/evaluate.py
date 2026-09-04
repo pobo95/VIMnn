@@ -17,6 +17,7 @@ from typing import Any
 
 import torch
 
+from refsite_mlip._atomic import commit_temporary_file
 from refsite_mlip.data import (
     ENERGY_UNIT,
     FORCE_UNIT,
@@ -697,11 +698,24 @@ def _write_atomic_json(
             ) from error
         _validate_report_target(target, source=source, config=config)
         try:
-            os.replace(temporary, target)
+            commit_temporary_file(
+                temporary,
+                target,
+                overwrite=config.overwrite,
+            )
+        except FileExistsError as error:
+            raise _evaluation_error(
+                "OUTPUT_EXISTS",
+                "report was created concurrently; it was not replaced",
+                config=config,
+                source=target,
+                stage="output_commit",
+                original_error=error,
+            ) from error
         except OSError as error:
             raise _evaluation_error(
                 "OUTPUT_COMMIT_FAILED",
-                "atomic evaluation report replacement failed",
+                "atomic evaluation report commit failed",
                 config=config,
                 source=target,
                 stage="output_commit",

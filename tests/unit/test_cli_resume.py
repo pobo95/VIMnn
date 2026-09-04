@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import json
+from pathlib import Path
 
 import pytest
 
@@ -110,6 +111,53 @@ def test_resume_lock_symlink_is_rejected_without_removing_target(tmp_path):
     linked_run.symlink_to(real_run, target_is_directory=True)
     with pytest.raises(RunDirectoryError, match="RUN_DIRECTORY_SYMLINK_REJECTED"):
         TrainingRunDirectory.open_existing(linked_run)
+
+
+def test_resume_lock_context_preserves_body_and_release_failures(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / "run"
+    root.mkdir()
+    directory = TrainingRunDirectory.open_existing(root)
+
+    with directory.acquire_resume_lock() as lock:
+        assert lock.owned
+    assert not directory.resume_lock_path.exists()
+
+    body_error = RuntimeError("body failure")
+    with pytest.raises(RuntimeError) as caught:
+        with directory.acquire_resume_lock():
+            raise body_error
+    assert caught.value is body_error
+    assert caught.value.__cause__ is None
+    assert not directory.resume_lock_path.exists()
+
+    original_unlink = Path.unlink
+
+    def fail_lock_unlink(path, *args, **kwargs):
+        if path == directory.resume_lock_path:
+            raise OSError("injected release failure")
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_lock_unlink)
+    with pytest.raises(RunDirectoryError, match="RESUME_LOCK_RELEASE_FAILED"):
+        with directory.acquire_resume_lock():
+            pass
+    assert directory.resume_lock_path.exists()
+
+    # The failed release left an owned/stale lock by contract; remove it only
+    # as explicit test teardown, then exercise the double-failure path.
+    monkeypatch.setattr(Path, "unlink", original_unlink)
+    directory.resume_lock_path.unlink()
+    monkeypatch.setattr(Path, "unlink", fail_lock_unlink)
+    second_body_error = ValueError("second body failure")
+    with pytest.raises(ValueError) as double:
+        with directory.acquire_resume_lock():
+            raise second_body_error
+    assert double.value is second_body_error
+    assert isinstance(double.value.__cause__, RunDirectoryError)
+    assert double.value.__cause__.reason_code == "RESUME_LOCK_RELEASE_FAILED"
+    assert directory.resume_lock_path.exists()
 
 
 def test_resume_rendering_is_deterministic_plain_json():

@@ -777,6 +777,39 @@ def _architecture_payload(
     }
 
 
+def _legacy_radius_contract_mismatch(
+    model_config: Any,
+) -> tuple[float, float] | None:
+    """Recognize the pre-hardening v1 radius ambiguity without migrating it.
+
+    Both cutoffs participate in trained arithmetic, so choosing either value
+    as the other would silently change model meaning.  Only an otherwise
+    numeric mismatch is classified here; malformed payloads remain ordinary
+    model-config corruption.
+    """
+
+    if not isinstance(model_config, Mapping):
+        return None
+    feature = model_config.get("feature")
+    higher_body = model_config.get("higher_body")
+    if not isinstance(feature, Mapping) or not isinstance(higher_body, Mapping):
+        return None
+    feature_cutoff = feature.get("r_cut")
+    higher_cutoff = higher_body.get("cutoff")
+    if type(feature_cutoff) not in (int, float) or type(higher_cutoff) not in (
+        int,
+        float,
+    ):
+        return None
+    left = float(feature_cutoff)
+    right = float(higher_cutoff)
+    if not math.isfinite(left) or not math.isfinite(right) or left <= 0 or right <= 0:
+        return None
+    if left == right:
+        return None
+    return left, right
+
+
 @dataclass(frozen=True)
 class ReferenceSiteModelBundle:
     """Owned CPU snapshot of one portable reference-site potential runtime."""
@@ -893,6 +926,23 @@ class ReferenceSiteModelBundle:
                 bundle_path=bundle_path,
                 schema=schema,
                 validation_stage="schema",
+            )
+        legacy_radius_mismatch = _legacy_radius_contract_mismatch(
+            self.model_config
+        )
+        if legacy_radius_mismatch is not None:
+            feature_cutoff, higher_cutoff = legacy_radius_mismatch
+            raise _error(
+                "INCOMPATIBLE_LEGACY_RADIUS_CONTRACT",
+                "reference_site_model_bundle_v1 contains incompatible legacy "
+                "cutoffs: feature.r_cut="
+                f"{feature_cutoff!r}, higher_body.cutoff={higher_cutoff!r}; "
+                "these trained operators cannot be migrated deterministically "
+                "without changing model meaning, so the model must be rebuilt "
+                "or re-exported with equal cutoffs",
+                bundle_path=bundle_path,
+                schema=schema,
+                validation_stage="model_config.radius_contract",
             )
         try:
             config = PotentialConfig.from_dict(self.model_config)

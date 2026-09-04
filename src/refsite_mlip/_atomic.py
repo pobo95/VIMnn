@@ -2,8 +2,17 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import os
 from pathlib import Path
+
+
+@dataclass(frozen=True)
+class AtomicCommitResult:
+    """Outcome of a commit whose target is known to be durable by name."""
+
+    temporary_cleanup_succeeded: bool
+    orphaned_temporary: Path | None
 
 
 def commit_temporary_file(
@@ -11,7 +20,7 @@ def commit_temporary_file(
     target: Path,
     *,
     overwrite: bool,
-) -> None:
+) -> AtomicCommitResult:
     """Commit a same-directory temporary file without a no-clobber race.
 
     ``os.link`` atomically creates the immutable target only when it does not
@@ -22,9 +31,25 @@ def commit_temporary_file(
 
     if overwrite:
         os.replace(temporary, target)
-        return
+        return AtomicCommitResult(
+            temporary_cleanup_succeeded=True,
+            orphaned_temporary=None,
+        )
     os.link(temporary, target)
-    temporary.unlink()
+    try:
+        temporary.unlink()
+    except OSError:
+        # The link is the commit point.  A cleanup failure after it must not
+        # turn a successful immutable save into a reported failure or remove
+        # the target.  Callers may report/collect the orphan separately.
+        return AtomicCommitResult(
+            temporary_cleanup_succeeded=False,
+            orphaned_temporary=temporary,
+        )
+    return AtomicCommitResult(
+        temporary_cleanup_succeeded=True,
+        orphaned_temporary=None,
+    )
 
 
-__all__ = ["commit_temporary_file"]
+__all__ = ["AtomicCommitResult", "commit_temporary_file"]

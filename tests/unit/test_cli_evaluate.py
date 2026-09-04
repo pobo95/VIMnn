@@ -486,6 +486,36 @@ def test_atomic_json_output_failure_preserves_target_and_cleans_temp(
     assert not list(tmp_path.glob(".report.json.*.tmp"))
 
 
+def test_no_overwrite_commit_race_preserves_competing_symlink(
+    tmp_path, monkeypatch
+):
+    source = tmp_path / "input.xyz"
+    source.write_text("input")
+    target = tmp_path / "report.json"
+    foreign = tmp_path / "foreign.json"
+    foreign.write_bytes(b"foreign")
+    config = _config(tmp_path, output_path=target, overwrite=False)
+
+    def competing_link(temporary, destination):
+        del temporary
+        Path(destination).symlink_to(foreign)
+        raise FileExistsError("injected commit race")
+
+    monkeypatch.setattr(evaluate_module.os, "link", competing_link)
+    with pytest.raises(CLIError) as caught:
+        _write_atomic_json(
+            target,
+            render_evaluation_json(_report()),
+            source=source.resolve(),
+            config=config,
+        )
+    assert caught.value.reason_code == "OUTPUT_EXISTS"
+    assert target.is_symlink()
+    assert target.resolve() == foreign.resolve()
+    assert foreign.read_bytes() == b"foreign"
+    assert not list(tmp_path.glob(".report.json.*.tmp"))
+
+
 def test_term_error_context_is_concise():
     error = CLIError(
         "NO_VALID_LABELS",

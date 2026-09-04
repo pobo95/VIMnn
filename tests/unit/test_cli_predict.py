@@ -380,6 +380,36 @@ def test_atomic_replace_failure_preserves_target_and_cleans_temporary(
     assert not list(tmp_path.glob(".output.xyz.*.tmp"))
 
 
+def test_no_overwrite_commit_race_preserves_competing_output(
+    tmp_path, monkeypatch
+):
+    source = tmp_path / "input.xyz"
+    source.write_text("input remains")
+    target = tmp_path / "output.xyz"
+    config = _config(tmp_path, overwrite=False)
+    frame = _atoms()
+    frame.info.pop("energy")
+    frame.calc = None
+
+    def competing_link(temporary, destination):
+        del temporary
+        Path(destination).write_bytes(b"competing output")
+        raise FileExistsError("injected commit race")
+
+    monkeypatch.setattr(predict_module.os, "link", competing_link)
+    with pytest.raises(CLIError) as caught:
+        _write_atomic_extxyz(
+            target,
+            (frame,),
+            source=source.resolve(),
+            config=config,
+        )
+    assert caught.value.reason_code == "OUTPUT_EXISTS"
+    assert target.read_bytes() == b"competing output"
+    assert source.read_text() == "input remains"
+    assert not list(tmp_path.glob(".output.xyz.*.tmp"))
+
+
 def test_predictor_error_context_is_rendered_concisely(tmp_path):
     error = CLIError(
         "UNSUPPORTED_SPECIES",

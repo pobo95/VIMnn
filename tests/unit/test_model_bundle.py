@@ -438,6 +438,66 @@ def test_non_torch_and_truncated_bundle_rejected(tmp_path, contents):
     assert caught.value.reason_code == "SAFE_LOAD_FAILURE"
 
 
+def test_current_bundle_radius_contract_round_trip_preserves_fingerprints(
+    typed_crystal, tmp_path
+):
+    _, _, _, _, bundle = _capture(typed_crystal)
+    path = tmp_path / "current.pt"
+    save_reference_site_model_bundle(path, bundle)
+    restored = load_reference_site_model_bundle(path)
+    assert restored.model_config["feature"]["r_cut"] == restored.model_config[
+        "higher_body"
+    ]["cutoff"]
+    assert restored.architecture_fingerprint == bundle.architecture_fingerprint
+    assert restored.bundle_fingerprint == bundle.bundle_fingerprint
+
+
+def test_legacy_v1_radius_mismatch_has_explicit_nonmigration_error(
+    typed_crystal, tmp_path
+):
+    _, _, _, _, bundle = _capture(typed_crystal)
+    payload = bundle.to_payload()
+    bundle_payload = payload["payload"]
+    bundle_payload["model_config"]["feature"]["r_cut"] = 2.5
+    bundle_payload["architecture_fingerprint"] = bundle_module._fingerprint(
+        "reference_site_model_architecture_v1",
+        bundle_module._architecture_payload(
+            bundle_payload["model_config"],
+            bundle_payload["model_state"],
+            tuple(bundle_payload["model_state_keys"]),
+            tuple(bundle_payload["species_vocabulary"]),
+            bundle_payload["conventions"],
+        ),
+    )
+    payload["bundle_fingerprint"] = bundle_module._fingerprint(
+        "reference_site_model_bundle_v1", bundle_payload
+    )
+    path = tmp_path / "legacy-radius.pt"
+    torch.save(payload, path)
+
+    with pytest.raises(ModelBundleError) as caught:
+        load_reference_site_model_bundle(path)
+    assert caught.value.reason_code == "INCOMPATIBLE_LEGACY_RADIUS_CONTRACT"
+    assert caught.value.validation_stage == "model_config.radius_contract"
+    assert "feature.r_cut=2.5" in str(caught.value)
+    assert "higher_body.cutoff=3.0" in str(caught.value)
+    assert "cannot be migrated deterministically" in str(caught.value)
+
+
+def test_malformed_radius_payload_remains_corruption_not_legacy(
+    typed_crystal, tmp_path
+):
+    _, _, _, _, bundle = _capture(typed_crystal)
+    payload = bundle.to_payload()
+    payload["payload"]["model_config"]["feature"]["r_cut"] = "3.0"
+    path = tmp_path / "corrupt-radius.pt"
+    torch.save(payload, path)
+
+    with pytest.raises(ModelBundleError) as caught:
+        load_reference_site_model_bundle(path)
+    assert caught.value.reason_code == "INVALID_MODEL_CONFIG"
+
+
 def test_atomic_save_failure_overwrite_and_symlink_contract(typed_crystal, tmp_path, monkeypatch):
     _, _, _, _, bundle = _capture(typed_crystal)
     target = tmp_path / "bundle.pt"

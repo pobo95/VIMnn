@@ -497,9 +497,12 @@ class ResumeRunLock:
     def __exit__(self, exception_type, exception, traceback) -> bool:
         try:
             self.release()
-        except Exception:
+        except BaseException as release_error:
             if exception is None:
                 raise
+            # Propagate the original body exception as the primary failure,
+            # while preserving the release failure as its explicit cause.
+            raise exception.with_traceback(traceback) from release_error
         return False
 
 

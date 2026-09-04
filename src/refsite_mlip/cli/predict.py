@@ -15,6 +15,7 @@ from typing import Any
 
 import torch
 
+from refsite_mlip._atomic import commit_temporary_file
 from refsite_mlip.data import STRESS_SIGN, STRESS_VOIGT_ORDER, StructureSample
 from refsite_mlip.inference import (
     PredictorConfig,
@@ -1095,11 +1096,23 @@ def _write_atomic_extxyz(
             overwrite=config.overwrite,
         )
         try:
-            os.replace(temporary, target)
+            commit_temporary_file(
+                temporary,
+                target,
+                overwrite=config.overwrite,
+            )
+        except FileExistsError as error:
+            raise _file_error(
+                "OUTPUT_EXISTS",
+                "output was created concurrently; it was not replaced",
+                stage="prediction.output_commit",
+                path=target,
+                original_error=error,
+            ) from error
         except OSError as error:
             raise _file_error(
                 "OUTPUT_COMMIT_FAILED",
-                "atomic output replacement failed",
+                "atomic output commit failed",
                 stage="prediction.output_commit",
                 path=target,
                 original_error=error,

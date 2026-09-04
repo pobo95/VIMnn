@@ -1,15 +1,45 @@
 from __future__ import annotations
 
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+import ase
+import numpy
 import pytest
 import torch
 
+import refsite_mlip
 from refsite_mlip.compatibility import import_e3nn_0_4_4
+
+
+def _major_minor(version: str) -> tuple[int, int]:
+    fields = version.split(".")
+    return int(fields[0]), int(fields[1])
 
 
 def test_required_versions():
     e3nn, _ = import_e3nn_0_4_4()
     assert torch.__version__ == "2.6.0+cu118"
     assert e3nn.__version__ == "0.4.4"
+    assert (1, 24) <= _major_minor(numpy.__version__) < (3, 0)
+    assert (3, 22) <= _major_minor(ase.__version__) < (4, 0)
+    assert refsite_mlip.__version__
+
+
+def test_module_version_entry_point_from_source_tree():
+    environment = dict(os.environ)
+    environment["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src")
+    result = subprocess.run(
+        [sys.executable, "-m", "refsite_mlip", "version"],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == f"refsite-mlip {refsite_mlip.__version__}"
 
 
 @pytest.mark.parametrize(
