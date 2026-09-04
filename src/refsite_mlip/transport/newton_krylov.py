@@ -87,8 +87,14 @@ def _converged_candidate_within_objective_roundoff(
     objective evaluations.
     """
 
-    if not bool(torch.isfinite(candidate_objective).detach()) or not bool(
-        torch.isfinite(candidate_residual).detach()
+    if any(
+        not bool(torch.isfinite(value).detach())
+        for value in (
+            objective,
+            candidate_objective,
+            candidate_residual,
+            armijo_decrease,
+        )
     ):
         return False
     if float(candidate_residual.detach().cpu()) > convergence_tolerance:

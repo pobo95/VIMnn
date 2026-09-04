@@ -319,6 +319,62 @@ def test_sparse_fixed_dtype_and_marginals(dtype):
             )
 
 
+def test_sparse_q_physical_bounds_are_independent_of_loose_residual_tolerance():
+    displacements = torch.zeros((2, 1, 3), dtype=torch.float64)
+    displacements[:, 0, 0] = torch.tensor([0.4, 0.6])
+    edges = build_compact_transport_edges(
+        displacements,
+        epsilon_ot=0.5,
+        ell_ot=1.5,
+        config=_edge_config(),
+    )
+    numbers = torch.tensor([6], dtype=torch.long)
+    config = ProbabilityMultipoleConfig(
+        (6,), probability_tolerance=1.0
+    )
+    with pytest.raises(ValueError, match="outside.*probability bounds"):
+        build_sparse_probability_multipoles(
+            torch.tensor([1.0, 0.0], dtype=torch.float64),
+            torch.tensor([-0.5, 1.5], dtype=torch.float64),
+            edges,
+            numbers,
+            config,
+        )
+
+    for edge_plan, q in (
+        (
+            torch.tensor([1.0, 0.0], dtype=torch.float64),
+            torch.tensor([-5.0e-8, 1.0], dtype=torch.float64),
+        ),
+        (
+            torch.tensor([0.0, 1.0], dtype=torch.float64),
+            torch.tensor([1.0 + 5.0e-8, 0.0], dtype=torch.float64),
+        ),
+    ):
+        features = build_sparse_probability_multipoles(
+            edge_plan,
+            q,
+            edges,
+            numbers,
+            ProbabilityMultipoleConfig((6,)),
+        )
+        assert torch.equal(features.vacancy_probabilities, q)
+
+    solved = _solve_sparse(_displacements(dtype=torch.float32))
+    original_plan = solved.edge_plan.clone()
+    original_q = solved.q.clone()
+    features = build_sparse_probability_multipoles(
+        solved.edge_plan,
+        solved.q,
+        solved.edges,
+        torch.tensor([6, 41], dtype=torch.long),
+        ProbabilityMultipoleConfig((6, 41), probability_tolerance=1.0),
+    )
+    assert torch.equal(solved.edge_plan, original_plan)
+    assert torch.equal(solved.q, original_q)
+    assert torch.equal(features.vacancy_probabilities, original_q)
+
+
 def _geometric_sparse_energy(positions, references, cell):
     displacements = atom_site_displacements(
         positions, references, cell, (True, True, True)

@@ -40,6 +40,9 @@ from refsite_mlip.transport.dual import (
 )
 from refsite_mlip.transport.gauge import gauge_vector, project_gauge
 from refsite_mlip.transport.krylov import projected_pcg
+from refsite_mlip.transport.newton_krylov import (
+    _converged_candidate_within_objective_roundoff,
+)
 from refsite_mlip.transport.problem import build_ot_problem
 
 
@@ -207,11 +210,10 @@ def test_converged_newton_step_below_objective_resolution_avoids_fallback():
         assert residual <= 1e-12
     step = sparse.adaptive_diagnostics.line_search_steps[0]
     assert step.accepted_damping == 1.0 and step.failure_reason is None
-    assert step.objective_after > step.objective_before
     roundoff = torch.finfo(torch.float64).eps * (
         step.objective_before.abs() + step.objective_after.abs() + 1.0
     )
-    assert step.objective_after - step.objective_before <= roundoff
+    assert (step.objective_after - step.objective_before).abs() <= roundoff
 
     sparse_plan = materialize_dense_plan(sparse).plan
     torch.testing.assert_close(sparse_plan, dense.P, atol=2e-14, rtol=2e-14)
@@ -237,6 +239,58 @@ def test_converged_newton_step_below_objective_resolution_avoids_fallback():
         rtol=2e-12,
     )
     torch.testing.assert_close(sparse.q, sparse_fixed.q, atol=2e-12, rtol=2e-12)
+
+
+def test_objective_roundoff_acceptance_helper_has_deterministic_ulp_contract():
+    objective = torch.tensor(5.0, dtype=torch.float64)
+    candidate = torch.nextafter(
+        objective, objective.new_tensor(float("inf"))
+    )
+    tolerance = 1.0e-12
+    residual = objective.new_tensor(0.5 * tolerance)
+    roundoff = torch.finfo(objective.dtype).eps * (
+        objective.abs() + candidate.abs() + 1.0
+    )
+    requested_decrease = -0.5 * roundoff
+
+    assert candidate > objective
+    assert _converged_candidate_within_objective_roundoff(
+        objective,
+        candidate,
+        residual,
+        requested_decrease,
+        tolerance,
+    )
+    assert not _converged_candidate_within_objective_roundoff(
+        objective,
+        candidate,
+        objective.new_tensor(2.0 * tolerance),
+        requested_decrease,
+        tolerance,
+    )
+    assert not _converged_candidate_within_objective_roundoff(
+        objective,
+        objective + 4.0 * roundoff,
+        residual,
+        requested_decrease,
+        tolerance,
+    )
+    assert not _converged_candidate_within_objective_roundoff(
+        objective,
+        candidate,
+        residual,
+        -2.0 * roundoff,
+        tolerance,
+    )
+    for values in (
+        (objective.new_tensor(float("inf")), candidate, residual, requested_decrease),
+        (objective, objective.new_tensor(float("nan")), residual, requested_decrease),
+        (objective, candidate, objective.new_tensor(float("inf")), requested_decrease),
+        (objective, candidate, residual, objective.new_tensor(float("nan"))),
+    ):
+        assert not _converged_candidate_within_objective_roundoff(
+            *values, tolerance
+        )
 
 
 def test_sparse_objective_gradient_hvp_gauge_psd_and_newton_direction_oracle():

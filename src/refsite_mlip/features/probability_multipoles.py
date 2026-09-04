@@ -53,13 +53,47 @@ def effective_probability_validation_tolerances(
     epsilon = torch.finfo(P.dtype).eps
     local_depth = math.ceil(math.log2(max(atoms, 2))) + 3
     local = max(base, local_depth * epsilon)
-    count = max(base, global_reduction_depth * epsilon)
-    requested = 0.0 if configured_tolerance is None else float(configured_tolerance)
+    # Each atom column may carry its own representational normalization error.
+    # Species counts add as many as N such columns, matching the sparse
+    # segmented policy below rather than accounting only for reduction depth.
+    species_count_depth = atoms + global_reduction_depth
+    count = max(base, species_count_depth * epsilon)
+    requested = (
+        base if configured_tolerance is None else float(configured_tolerance)
+    )
     return {
         "simplex": max(requested, local),
         "species_count": max(requested, count),
         "vacancy_mass": max(requested, local),
     }
+
+
+def _effective_q_bound_tolerance(
+    *,
+    atoms: int,
+    dtype: torch.dtype,
+    configured_tolerance: float | None,
+) -> float:
+    """Return validation-only slack for the physical ``q in [0, 1]`` bound.
+
+    A loose balanced-residual tolerance must not turn the probability interval
+    into a correspondingly loose physical domain.  Conversely, an explicitly
+    strict tolerance cannot demand resolution below the dtype/row-reduction
+    floor.  This helper never alters the supplied probability values.
+    """
+
+    if dtype not in (torch.float32, torch.float64):
+        raise ValueError("probability validation supports float32 and float64")
+    epsilon = torch.finfo(dtype).eps
+    local_depth = math.ceil(math.log2(max(atoms, 2))) + 3
+    representational_floor = local_depth * epsilon
+    automatic = max(1.0e-7, representational_floor)
+    requested = (
+        automatic
+        if configured_tolerance is None
+        else float(configured_tolerance)
+    )
+    return min(automatic, max(requested, representational_floor))
 
 
 def _effective_sparse_tolerances(
@@ -217,7 +251,11 @@ def build_probability_multipoles(
     tolerances = effective_probability_validation_tolerances(
         P, config.probability_tolerance
     )
-    q_bound_tolerance = tolerances["simplex"]
+    q_bound_tolerance = _effective_q_bound_tolerance(
+        atoms=P.shape[1],
+        dtype=P.dtype,
+        configured_tolerance=config.probability_tolerance,
+    )
     if bool(torch.any(q < -q_bound_tolerance)) or bool(
         torch.any(q > 1.0 + q_bound_tolerance)
     ):
@@ -366,7 +404,11 @@ def build_sparse_probability_multipoles(
         dtype=edge_plan.dtype,
         configured_tolerance=config.probability_tolerance,
     )
-    q_bound_tolerance = tolerances["simplex"]
+    q_bound_tolerance = _effective_q_bound_tolerance(
+        atoms=edges.num_atoms,
+        dtype=edge_plan.dtype,
+        configured_tolerance=config.probability_tolerance,
+    )
     if bool(torch.any(q < -q_bound_tolerance)) or bool(
         torch.any(q > 1.0 + q_bound_tolerance)
     ):

@@ -35,12 +35,41 @@ def _finite_positive(value: Any, *, name: str) -> float:
     return result
 
 
+def _finite_nonnegative(value: Any, *, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise TypeError(f"{name} must be a real number")
+    result = float(value)
+    if not math.isfinite(result) or result < 0.0:
+        raise ValueError(f"{name} must be finite and nonnegative")
+    return result
+
+
 def _positive_int(value: Any, *, name: str) -> int:
     if isinstance(value, bool) or not isinstance(value, Integral):
         raise TypeError(f"{name} must be an integer")
     result = int(value)
     if result <= 0:
         raise ValueError(f"{name} must be positive")
+    return result
+
+
+def _canonical_integer_tuple(
+    values: Any, *, name: str, positive: bool = False
+) -> tuple[int, ...]:
+    if isinstance(values, (str, bytes)):
+        raise TypeError(f"{name} must be a sequence of integers")
+    try:
+        items = tuple(values)
+    except TypeError as error:
+        raise TypeError(f"{name} must be a sequence of integers") from error
+    if any(
+        isinstance(value, bool) or not isinstance(value, Integral)
+        for value in items
+    ):
+        raise TypeError(f"{name} must contain integers; bool is not accepted")
+    result = tuple(int(value) for value in items)
+    if positive and any(value <= 0 for value in result):
+        raise ValueError(f"{name} must contain positive integers")
     return result
 
 
@@ -195,7 +224,9 @@ class ReferenceTemplateBuilderConfig:
             raise ValueError("template_id must be nonempty")
         if not isinstance(self.strict_domain, StrictTemplateDomain):
             raise TypeError("strict_domain must be a StrictTemplateDomain")
-        ids = tuple(int(value) for value in self.site_type_ids)
+        ids = _canonical_integer_tuple(
+            self.site_type_ids, name="site_type_ids"
+        )
         if (
             len(ids) != len(self.strict_domain.species_vocabulary)
             or len(set(ids)) != len(ids)
@@ -209,7 +240,9 @@ class ReferenceTemplateBuilderConfig:
             self, "graph_cutoff", _finite_positive(self.graph_cutoff, name="graph_cutoff")
         )
         object.__setattr__(
-            self, "graph_skin", _finite_positive(self.graph_skin, name="graph_skin")
+            self,
+            "graph_skin",
+            _finite_nonnegative(self.graph_skin, name="graph_skin"),
         )
         maximum_strain = float(self.maximum_strain)
         if not math.isfinite(maximum_strain) or not 0.0 <= maximum_strain < 1.0:
@@ -306,7 +339,9 @@ def nbc_rocksalt_template_builder_config(
 ) -> ReferenceTemplateBuilderConfig:
     """Return the approved strict domain for the 222 or 333 NbC family."""
 
-    shape = tuple(int(value) for value in supercell_shape)
+    shape = _canonical_integer_tuple(
+        supercell_shape, name="supercell_shape", positive=True
+    )
     contracts = {
         (2, 2, 2): ("nbc_rocksalt_222_v1", 32, 64, 32),
         (3, 3, 3): ("nbc_rocksalt_333_v1", 108, 216, 108),

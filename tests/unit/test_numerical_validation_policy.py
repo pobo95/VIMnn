@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import math
 
 import pytest
 import torch
@@ -167,6 +168,72 @@ def test_vacancy_probability_bounds_allow_only_numerical_roundoff(P, q):
             torch.tensor([6], dtype=torch.long),
             torch.zeros((2, 1, 3), dtype=torch.float64),
             ProbabilityMultipoleConfig((6,)),
+        )
+
+
+def test_loose_dense_residual_tolerance_cannot_expand_q_physical_bounds():
+    P = torch.tensor([[1.0], [0.0]], dtype=torch.float64)
+    q = torch.tensor([-0.5, 1.5], dtype=torch.float64)
+    config = ProbabilityMultipoleConfig(
+        (6,), probability_tolerance=1.0
+    )
+    with pytest.raises(ValueError, match="outside.*probability bounds"):
+        build_probability_multipoles(
+            P,
+            q,
+            torch.tensor([6], dtype=torch.long),
+            torch.zeros((2, 1, 3), dtype=torch.float64),
+            config,
+        )
+
+    result, distances = _float32_transport()
+    original_P = result.P.clone()
+    original_q = result.q.clone()
+    features = build_probability_multipoles(
+        result.P,
+        result.q,
+        torch.tensor([6, 41, 6], dtype=torch.long),
+        torch.zeros((*distances.shape, 3), dtype=torch.float32),
+        ProbabilityMultipoleConfig((6, 41), probability_tolerance=1.0),
+    )
+    assert torch.equal(result.P, original_P)
+    assert torch.equal(result.q, original_q)
+    assert torch.equal(features.vacancy_probabilities, original_q)
+
+
+def test_dense_float32_species_count_allows_column_roundoff_accumulation():
+    sites = atoms = 64
+    epsilon = torch.finfo(torch.float32).eps
+    diagonal = torch.cat(
+        (
+            torch.full((32,), 1.0 + epsilon, dtype=torch.float32),
+            torch.full((32,), 1.0 - epsilon, dtype=torch.float32),
+        )
+    )
+    P = torch.diag(diagonal)
+    q = torch.zeros(sites, dtype=torch.float32)
+    numbers = torch.tensor([6] * 32 + [41] * 32, dtype=torch.long)
+    displacements = torch.zeros((sites, atoms, 3), dtype=torch.float32)
+    config = ProbabilityMultipoleConfig((6, 41))
+    tolerances = effective_probability_validation_tolerances(P, None)
+
+    assert tolerances["species_count"] >= (
+        atoms
+        + math.ceil(math.log2(atoms))
+        + math.ceil(math.log2(sites))
+        + 2
+    ) * epsilon
+    features = build_probability_multipoles(
+        P, q, numbers, displacements, config
+    )
+    assert torch.equal(features.vacancy_probabilities, q)
+    assert torch.equal(torch.diagonal(P), diagonal)
+
+    invalid = P.clone()
+    invalid[0, 0] += 20.0 * tolerances["species_count"]
+    with pytest.raises(ValueError, match="balanced probability-field"):
+        build_probability_multipoles(
+            invalid, q, numbers, displacements, config
         )
 
 

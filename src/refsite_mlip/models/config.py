@@ -70,6 +70,39 @@ class PotentialConfig:
 
     def __post_init__(self) -> None:
         self.validate()
+        object.__setattr__(
+            self,
+            "species_vocabulary",
+            tuple(int(value) for value in self.species_vocabulary),
+        )
+        for name in (
+            "num_layers",
+            "readout_hidden",
+            "train_sinkhorn_iterations",
+        ):
+            object.__setattr__(
+                self, name, _positive_integer(name, getattr(self, name))
+            )
+        object.__setattr__(
+            self,
+            "eval_sinkhorn_warmup_iterations",
+            _nonnegative_integer(
+                "eval_sinkhorn_warmup_iterations",
+                self.eval_sinkhorn_warmup_iterations,
+            ),
+        )
+        for name in ("energy_scale", "epsilon_ot", "ell_ot"):
+            object.__setattr__(
+                self, name, _positive_real(name, getattr(self, name))
+            )
+        object.__setattr__(
+            self, "phase_steps", _positive_schedule("phase_steps", self.phase_steps)
+        )
+        object.__setattr__(
+            self,
+            "phase_damping",
+            _positive_schedule("phase_damping", self.phase_damping),
+        )
 
     def validate(self) -> None:
         if (
@@ -122,10 +155,18 @@ class PotentialConfig:
             raise ValueError(
                 "feature.r_cut and higher_body.cutoff must match the v1 MP radius"
             )
-        if self.feature.site_type_vocabulary is not None and (
-            self.higher_body.site_type_count
-            != len(self.feature.site_type_vocabulary)
+        site_type_vocabulary = self.feature.site_type_vocabulary
+        if (
+            not isinstance(site_type_vocabulary, tuple)
+            or not site_type_vocabulary
+            or site_type_vocabulary
+            != tuple(range(len(site_type_vocabulary)))
         ):
+            raise ValueError(
+                "PotentialConfig v1 requires feature.site_type_vocabulary "
+                "to be the nonempty fixed tuple of global IDs 0..A-1"
+            )
+        if self.higher_body.site_type_count != len(site_type_vocabulary):
             raise ValueError(
                 "higher-body site_type_count must match feature site-type channels"
             )

@@ -110,6 +110,58 @@ def test_nbc_222_333_config_and_domain_serialization():
     assert restored_phase.approval_status == "provisional"
 
 
+def test_zero_graph_skin_contract_and_strict_numeric_validation():
+    zero_skin = replace(
+        _config_111(),
+        graph_skin=0.0,
+        maximum_strain=0.0,
+        expected_candidate_degree=6,
+    )
+    built = build_reference_template_from_atoms(
+        _atoms(1), config=zero_skin, phase_specification=_phase(1)
+    )
+    assert built.config.graph_skin == 0.0
+    assert built.template.topology.skin == 0.0
+    assert built.diagnostics.candidate_edge_count == (
+        built.diagnostics.active_edge_count
+    )
+
+    with pytest.raises(ValueError, match="cannot certify maximum_strain"):
+        replace(_config_111(), graph_skin=0.0, maximum_strain=0.01)
+    for value in (-1.0, float("nan"), float("inf")):
+        with pytest.raises(ValueError, match="finite and nonnegative"):
+            replace(_config_111(), graph_skin=value)
+    with pytest.raises(TypeError, match="real number"):
+        replace(_config_111(), graph_skin=True)
+
+
+def test_builder_integer_sequences_reject_silent_coercion_and_canonicalize():
+    for ids in ((False, 1), (True, 1), (0.5, 1), (0, 1.5)):
+        with pytest.raises(TypeError, match="site_type_ids.*integers"):
+            replace(_config_111(), site_type_ids=ids)
+    for shape in (
+        (False, 2, 2),
+        (True, 2, 2),
+        (0.5, 2, 2),
+        (2, 1.5, 2),
+    ):
+        with pytest.raises(TypeError, match="supercell_shape.*integers"):
+            nbc_rocksalt_template_builder_config(shape)
+
+    config = replace(
+        _config_111(), site_type_ids=(np.int64(0), np.int64(1))
+    )
+    assert config.site_type_ids == (0, 1)
+    assert all(type(value) is int for value in config.site_type_ids)
+    nbc = nbc_rocksalt_template_builder_config(
+        (np.int64(2), np.int64(2), np.int64(2))
+    )
+    assert nbc.strict_domain.supercell_shape == (2, 2, 2)
+    assert all(
+        type(value) is int for value in nbc.strict_domain.supercell_shape
+    )
+
+
 def test_canonical_222_333_count_composition_and_global_site_types():
     for size, expected in ((2, 32), (3, 108)):
         atoms = _atoms(size)
