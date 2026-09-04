@@ -318,6 +318,14 @@ class TrainingRunDirectory:
         return self.root / "preflight.json"
 
     @property
+    def data_manifest_path(self) -> Path:
+        return self.root / "data_manifest.json"
+
+    @property
+    def initial_bundle_path(self) -> Path:
+        return self.root / "initial_bundle.pt"
+
+    @property
     def status_path(self) -> Path:
         return self.root / "run_status.json"
 
@@ -336,6 +344,85 @@ class TrainingRunDirectory:
             overwrite=False,
             stage="run_directory.preflight",
         )
+
+    def write_data_manifest(self, value: Mapping[str, Any]) -> None:
+        _atomic_write_text(
+            self.data_manifest_path,
+            canonical_runtime_json(value),
+            overwrite=False,
+            stage="run_directory.data_manifest",
+        )
+
+    def create_checkpoints_directory(self) -> Path:
+        """Create the empty managed-checkpoint root exactly once.
+
+        The exclusive ``mkdir`` is the ownership boundary: an existing
+        directory, regular file, or symbolic link is never reused or changed.
+        """
+
+        target = self.checkpoints
+        if target.is_symlink():
+            raise RunDirectoryError(
+                "CHECKPOINT_DIRECTORY_SYMLINK_REJECTED",
+                "checkpoint directory must not be a symbolic link",
+                stage="run_directory.checkpoints.create",
+                path=target,
+            )
+        try:
+            target.mkdir(parents=False, exist_ok=False)
+        except FileExistsError as error:
+            reason = (
+                "CHECKPOINT_DIRECTORY_SYMLINK_REJECTED"
+                if target.is_symlink()
+                else "CHECKPOINT_DIRECTORY_ALREADY_EXISTS"
+            )
+            message = (
+                "checkpoint directory must not be a symbolic link"
+                if reason == "CHECKPOINT_DIRECTORY_SYMLINK_REJECTED"
+                else "checkpoint directory path already exists and is not reused"
+            )
+            raise RunDirectoryError(
+                reason,
+                message,
+                stage="run_directory.checkpoints.create",
+                path=target,
+                original_error=error,
+            ) from error
+        except OSError as error:
+            raise RunDirectoryError(
+                "CHECKPOINT_DIRECTORY_CREATE_FAILED",
+                "checkpoint directory could not be created exclusively",
+                stage="run_directory.checkpoints.create",
+                path=target,
+                original_error=error,
+            ) from error
+
+        if target.is_symlink() or not target.is_dir():
+            raise RunDirectoryError(
+                "INVALID_CHECKPOINT_DIRECTORY",
+                "new checkpoint path is not an owned regular directory",
+                stage="run_directory.checkpoints.validate",
+                path=target,
+            )
+        try:
+            if any(target.iterdir()):
+                raise RunDirectoryError(
+                    "CHECKPOINT_DIRECTORY_NOT_EMPTY",
+                    "new checkpoint directory must be empty",
+                    stage="run_directory.checkpoints.validate",
+                    path=target,
+                )
+        except RunDirectoryError:
+            raise
+        except OSError as error:
+            raise RunDirectoryError(
+                "CHECKPOINT_DIRECTORY_VALIDATE_FAILED",
+                "new checkpoint directory could not be validated",
+                stage="run_directory.checkpoints.validate",
+                path=target,
+                original_error=error,
+            ) from error
+        return target
 
     def write_status(self, value: Mapping[str, Any]) -> None:
         _atomic_write_text(

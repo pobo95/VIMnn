@@ -15,6 +15,7 @@ import json
 import math
 import os
 from pathlib import Path
+import stat
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
@@ -48,6 +49,7 @@ if TYPE_CHECKING:
 
 SCRATCH_PREPARATION_CONVENTION_VERSION = "scratch_training_preparation_v1"
 SCRATCH_DATA_MANIFEST_CONVENTION_VERSION = "scratch_training_data_manifest_v1"
+SCRATCH_INPUT_FILE_DIGEST_CONVENTION_VERSION = "scratch_input_file_digests_v1"
 
 
 def _freeze_plain(value: Any) -> Any:
@@ -102,6 +104,253 @@ def _fingerprint(scope: str, value: Mapping[str, Any]) -> str:
 
 def _immutable_mapping(value: Mapping[str, Any]) -> Mapping[str, Any]:
     return MappingProxyType(dict(sorted(value.items())))
+
+
+def _input_digest_error(
+    reason_code: str,
+    message: str,
+    *,
+    entry: Mapping[str, Any],
+    config_path: Path | str | None,
+    expected: Any = None,
+    actual: Any = None,
+    original_error: BaseException | None = None,
+):
+    # Delayed import preserves the existing config/training package dependency
+    # direction while retaining TrainingRunConfigError's structured context.
+    from refsite_mlip.config import training_run as run_config
+
+    return run_config._error(
+        reason_code,
+        message,
+        stage="scratch.input_digest",
+        config_path=None if config_path is None else str(config_path),
+        source_path=str(entry.get("runtime_path", "")) or None,
+        field=entry.get("field"),
+        split=entry.get("split"),
+        template_id=entry.get("template_id"),
+        expected=expected,
+        actual=actual,
+        original_reason_code=getattr(original_error, "reason_code", None),
+        original_error=original_error,
+    )
+
+
+def _regular_file_sha256(
+    entry: Mapping[str, Any], *, config_path: Path | str | None
+) -> str:
+    """Hash one pinned regular file without following a replacement symlink."""
+
+    path = Path(str(entry["runtime_path"]))
+    try:
+        before = os.lstat(path)
+    except FileNotFoundError as error:
+        raise _input_digest_error(
+            "INPUT_DIGEST_FILE_NOT_FOUND",
+            "scratch input disappeared while verifying its raw digest",
+            entry=entry,
+            config_path=config_path,
+            original_error=error,
+        ) from error
+    except OSError as error:
+        raise _input_digest_error(
+            "INPUT_DIGEST_READ_FAILED",
+            "scratch input metadata could not be read for raw digest verification",
+            entry=entry,
+            config_path=config_path,
+            original_error=error,
+        ) from error
+    if stat.S_ISLNK(before.st_mode):
+        raise _input_digest_error(
+            "INPUT_DIGEST_SYMLINK_REJECTED",
+            "scratch input digest verification refuses symbolic links",
+            entry=entry,
+            config_path=config_path,
+            actual=str(path),
+        )
+    if not stat.S_ISREG(before.st_mode):
+        raise _input_digest_error(
+            "INPUT_DIGEST_NOT_REGULAR_FILE",
+            "scratch input digest verification requires a regular file",
+            entry=entry,
+            config_path=config_path,
+            actual=str(path),
+        )
+
+    flags = os.O_RDONLY
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise _input_digest_error(
+            "INPUT_DIGEST_READ_FAILED",
+            "scratch input could not be opened without following symlinks",
+            entry=entry,
+            config_path=config_path,
+            original_error=error,
+        ) from error
+
+    digest = hashlib.sha256()
+    try:
+        opened_before = os.fstat(descriptor)
+        if not stat.S_ISREG(opened_before.st_mode):
+            raise _input_digest_error(
+                "INPUT_DIGEST_NOT_REGULAR_FILE",
+                "opened scratch input is not a regular file",
+                entry=entry,
+                config_path=config_path,
+                actual=str(path),
+            )
+        if (opened_before.st_dev, opened_before.st_ino) != (
+            before.st_dev,
+            before.st_ino,
+        ):
+            raise _input_digest_error(
+                "INPUT_DIGEST_FILE_CHANGED",
+                "scratch input path changed while opening it for digest verification",
+                entry=entry,
+                config_path=config_path,
+                actual=str(path),
+            )
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+        opened_after = os.fstat(descriptor)
+    except OSError as error:
+        raise _input_digest_error(
+            "INPUT_DIGEST_READ_FAILED",
+            "scratch input bytes could not be read for raw digest verification",
+            entry=entry,
+            config_path=config_path,
+            original_error=error,
+        ) from error
+    finally:
+        os.close(descriptor)
+
+    try:
+        after = os.lstat(path)
+    except OSError as error:
+        raise _input_digest_error(
+            "INPUT_DIGEST_FILE_CHANGED",
+            "scratch input path changed during raw digest verification",
+            entry=entry,
+            config_path=config_path,
+            original_error=error,
+        ) from error
+    if stat.S_ISLNK(after.st_mode):
+        raise _input_digest_error(
+            "INPUT_DIGEST_SYMLINK_REJECTED",
+            "scratch input became a symbolic link during digest verification",
+            entry=entry,
+            config_path=config_path,
+            actual=str(path),
+        )
+    identity = (opened_before.st_dev, opened_before.st_ino)
+    if (
+        not stat.S_ISREG(after.st_mode)
+        or identity != (opened_after.st_dev, opened_after.st_ino)
+        or identity != (after.st_dev, after.st_ino)
+        or opened_before.st_size != opened_after.st_size
+        or opened_before.st_mtime_ns != opened_after.st_mtime_ns
+    ):
+        raise _input_digest_error(
+            "INPUT_DIGEST_FILE_CHANGED",
+            "scratch input changed during raw digest verification",
+            entry=entry,
+            config_path=config_path,
+            actual=str(path),
+        )
+    return digest.hexdigest()
+
+
+def _input_file_specs(
+    config: Any,
+    *,
+    config_path: Path | None,
+    reference_paths: tuple[Path, ...],
+    train_paths: tuple[Path, ...],
+    validation_paths: tuple[Path, ...],
+) -> dict[str, dict[str, Any]]:
+    source = config.model_source
+    specs: dict[str, dict[str, Any]] = {}
+
+    def add(
+        label: str,
+        *,
+        role: str,
+        configured_path: str,
+        runtime_path: Path,
+        field: str,
+        source_index: int | None = None,
+        split: str | None = None,
+        template_id: str | None = None,
+    ) -> None:
+        specs[label] = {
+            "label": label,
+            "role": role,
+            "source_index": source_index,
+            "split": split,
+            "template_id": template_id,
+            "field": field,
+            "configured_path": configured_path,
+            "runtime_path": str(runtime_path),
+        }
+
+    if config_path is not None:
+        add(
+            "config",
+            role="config",
+            configured_path=str(config_path),
+            runtime_path=config_path,
+            field="config",
+        )
+    for index, (template, path) in enumerate(
+        zip(source.reference_templates, reference_paths)
+    ):
+        add(
+            f"reference_poscar[{index:06d}]",
+            role="reference_poscar",
+            configured_path=template.poscar_path,
+            runtime_path=path,
+            field=f"model_source.reference_templates[{index}].poscar_path",
+            source_index=index,
+            template_id=template.template_id,
+        )
+    for split, sources, paths in (
+        ("train", config.data.train, train_paths),
+        ("validation", config.data.validation, validation_paths),
+    ):
+        for index, (source_config, path) in enumerate(zip(sources, paths)):
+            add(
+                f"{split}[{index:06d}]",
+                role="extxyz",
+                configured_path=source_config.path,
+                runtime_path=path,
+                field=f"data.{split}[{index}].path",
+                source_index=index,
+                split=split,
+            )
+    return dict(sorted(specs.items()))
+
+
+def _capture_input_file_digests(
+    specs: Mapping[str, Mapping[str, Any]], *, config_path: Path | None
+) -> dict[str, Any]:
+    files: dict[str, Any] = {}
+    for label, spec in sorted(specs.items()):
+        entry = dict(spec)
+        entry["sha256"] = _regular_file_sha256(
+            entry, config_path=config_path
+        )
+        files[label] = entry
+    return {
+        "convention_version": SCRATCH_INPUT_FILE_DIGEST_CONVENTION_VERSION,
+        "path_kind": "runtime_location_not_semantic_fingerprint",
+        "files": files,
+    }
 
 
 class _ReadOnlyTemplateRegistry(TemplateRegistry):
@@ -258,6 +507,7 @@ class ScratchTrainingPreparation:
     baseline_preflight: Mapping[str, Any]
     configured_paths: Mapping[str, Any]
     runtime_paths: Mapping[str, Any]
+    input_file_digests: Mapping[str, Any]
     training_configuration: Mapping[str, Any]
     training_executed: bool = False
     scratch_execution_implemented: bool = False
@@ -299,6 +549,7 @@ class ScratchTrainingPreparation:
             "baseline_preflight",
             "configured_paths",
             "runtime_paths",
+            "input_file_digests",
             "training_configuration",
         ):
             object.__setattr__(self, name, _freeze_plain(getattr(self, name)))
@@ -375,6 +626,7 @@ class ScratchTrainingPreparation:
                 "seed": self.runtime.seed,
                 "configured_paths": _plain(self.configured_paths),
                 "paths": _plain(self.runtime_paths),
+                "input_file_digests": _plain(self.input_file_digests),
             },
             "radii": {
                 "config": self.radius_config.to_dict(),
@@ -395,6 +647,178 @@ class ScratchTrainingPreparation:
                 "output_directory_created": False,
             },
         }
+
+
+def _expected_input_file_specs(
+    preparation: ScratchTrainingPreparation,
+) -> tuple[dict[str, dict[str, Any]], Path | None]:
+    context = {
+        "runtime_path": str(
+            preparation.runtime_paths.get("config") or "<in-memory-config>"
+        ),
+        "field": "input_file_digests",
+        "split": None,
+        "template_id": None,
+    }
+    try:
+        config_text = preparation.runtime_paths["config"]
+        config_path = None if config_text is None else Path(str(config_text))
+        reference_values = tuple(preparation.runtime_paths["reference_poscars"])
+        train_values = tuple(preparation.runtime_paths["train_inputs"])
+        validation_values = tuple(preparation.runtime_paths["validation_inputs"])
+        reference_paths = tuple(
+            Path(str(value["path"])) for value in reference_values
+        )
+        train_paths = tuple(Path(str(value)) for value in train_values)
+        validation_paths = tuple(Path(str(value)) for value in validation_values)
+        if (
+            len(reference_paths)
+            != len(preparation.model_source.reference_templates)
+            or len(train_paths) != len(preparation.data.train)
+            or len(validation_paths) != len(preparation.data.validation)
+        ):
+            raise ValueError("runtime input path counts differ from the config")
+        for index, (runtime, source) in enumerate(
+            zip(reference_values, preparation.model_source.reference_templates)
+        ):
+            if runtime["template_id"] != source.template_id:
+                raise ValueError(
+                    "runtime reference template ordering differs at "
+                    f"index {index}"
+                )
+        specs = _input_file_specs(
+            preparation.config,
+            config_path=config_path,
+            reference_paths=reference_paths,
+            train_paths=train_paths,
+            validation_paths=validation_paths,
+        )
+    except Exception as error:
+        raise _input_digest_error(
+            "INVALID_INPUT_DIGEST_METADATA",
+            "scratch input digest paths are inconsistent with the preparation",
+            entry=context,
+            config_path=preparation.runtime_paths.get("config"),
+            original_error=error,
+        ) from error
+    return specs, config_path
+
+
+def verify_scratch_preparation_input_digests(
+    preparation: ScratchTrainingPreparation,
+) -> None:
+    """Verify every prepared config/POSCAR/extxyz byte snapshot in place.
+
+    Resolved paths are runtime identity only.  They are deliberately excluded
+    from the semantic preparation fingerprint so relocation does not change
+    model/data semantics, while a fresh-run TOCTOU gate can still pin the exact
+    files inspected by preflight.
+    """
+
+    if not isinstance(preparation, ScratchTrainingPreparation):
+        raise TypeError("preparation must be a ScratchTrainingPreparation")
+    expected_specs, config_path = _expected_input_file_specs(preparation)
+    metadata = preparation.input_file_digests
+    generic = {
+        "runtime_path": "<input-file-digest-metadata>",
+        "field": "input_file_digests",
+        "split": None,
+        "template_id": None,
+    }
+    if not isinstance(metadata, Mapping) or set(metadata) != {
+        "convention_version",
+        "path_kind",
+        "files",
+    }:
+        raise _input_digest_error(
+            "INVALID_INPUT_DIGEST_METADATA",
+            "scratch input digest metadata has invalid top-level keys",
+            entry=generic,
+            config_path=config_path,
+        )
+    if (
+        metadata["convention_version"]
+        != SCRATCH_INPUT_FILE_DIGEST_CONVENTION_VERSION
+        or metadata["path_kind"]
+        != "runtime_location_not_semantic_fingerprint"
+        or not isinstance(metadata["files"], Mapping)
+    ):
+        raise _input_digest_error(
+            "INVALID_INPUT_DIGEST_METADATA",
+            "scratch input digest metadata has an invalid convention or file mapping",
+            entry=generic,
+            config_path=config_path,
+        )
+    files = metadata["files"]
+    if set(files) != set(expected_specs):
+        raise _input_digest_error(
+            "INVALID_INPUT_DIGEST_METADATA",
+            "scratch input digest labels do not cover the configured input files",
+            entry=generic,
+            config_path=config_path,
+            expected=tuple(sorted(expected_specs)),
+            actual=tuple(sorted(files)),
+        )
+
+    expected_entry_keys = {
+        "label",
+        "role",
+        "source_index",
+        "split",
+        "template_id",
+        "field",
+        "configured_path",
+        "runtime_path",
+        "sha256",
+    }
+    for label, expected_spec in sorted(expected_specs.items()):
+        entry = files[label]
+        if not isinstance(entry, Mapping) or set(entry) != expected_entry_keys:
+            raise _input_digest_error(
+                "INVALID_INPUT_DIGEST_METADATA",
+                "scratch input digest entry has invalid keys",
+                entry=(entry if isinstance(entry, Mapping) else generic),
+                config_path=config_path,
+                expected=tuple(sorted(expected_entry_keys)),
+                actual=(
+                    type(entry).__name__
+                    if not isinstance(entry, Mapping)
+                    else tuple(sorted(entry))
+                ),
+            )
+        actual_spec = {key: entry[key] for key in expected_spec}
+        if actual_spec != expected_spec:
+            raise _input_digest_error(
+                "INVALID_INPUT_DIGEST_METADATA",
+                "scratch input digest entry differs from resolved config/runtime paths",
+                entry=entry,
+                config_path=config_path,
+                expected=expected_spec,
+                actual=actual_spec,
+            )
+        expected_digest = entry["sha256"]
+        if (
+            type(expected_digest) is not str
+            or len(expected_digest) != 64
+            or any(value not in "0123456789abcdef" for value in expected_digest)
+        ):
+            raise _input_digest_error(
+                "INVALID_INPUT_DIGEST_METADATA",
+                "scratch input digest must be a lowercase SHA-256 string",
+                entry=entry,
+                config_path=config_path,
+                actual=expected_digest,
+            )
+        actual_digest = _regular_file_sha256(entry, config_path=config_path)
+        if actual_digest != expected_digest:
+            raise _input_digest_error(
+                "INPUT_DIGEST_MISMATCH",
+                "scratch input bytes changed after full preflight",
+                entry=entry,
+                config_path=config_path,
+                expected=expected_digest,
+                actual=actual_digest,
+            )
 
 
 def prepare_scratch_training_run(
@@ -492,6 +916,16 @@ def prepare_scratch_training_run(
         base=output_base,
         config_path=config_path,
         protected=tuple(protected),
+    )
+    input_file_digests = _capture_input_file_digests(
+        _input_file_specs(
+            config,
+            config_path=config_path,
+            reference_paths=reference_paths,
+            train_paths=train_paths,
+            validation_paths=validation_paths,
+        ),
+        config_path=config_path,
     )
 
     try:
@@ -829,6 +1263,7 @@ def prepare_scratch_training_run(
         "path_kind": "original_config_expression_in_semantic_fingerprint",
     }
     runtime_paths = {
+        "base_directory": str(base),
         "config": None if config_path is None else str(config_path),
         "output_directory": str(output_path),
         "train_inputs": [str(path) for path in train_paths],
@@ -852,7 +1287,7 @@ def prepare_scratch_training_run(
         SCRATCH_PREPARATION_CONVENTION_VERSION, preparation_semantics
     )
     prepared_registry = _ReadOnlyTemplateRegistry(templates)
-    return ScratchTrainingPreparation(
+    preparation = ScratchTrainingPreparation(
         config_fingerprint=config.config_fingerprint,
         preparation_fingerprint=preparation_fingerprint,
         config=config,
@@ -883,15 +1318,22 @@ def prepare_scratch_training_run(
         baseline_preflight=baseline,
         configured_paths=configured_paths,
         runtime_paths=runtime_paths,
+        input_file_digests=input_file_digests,
         training_configuration=run_config._training_configuration_metadata(config),
         training_executed=False,
         scratch_execution_implemented=False,
     )
+    # Detect files changed while the relatively expensive builder/data
+    # preflight was running, not only changes observed later by training.
+    verify_scratch_preparation_input_digests(preparation)
+    return preparation
 
 
 __all__ = [
     "SCRATCH_DATA_MANIFEST_CONVENTION_VERSION",
+    "SCRATCH_INPUT_FILE_DIGEST_CONVENTION_VERSION",
     "SCRATCH_PREPARATION_CONVENTION_VERSION",
     "ScratchTrainingPreparation",
     "prepare_scratch_training_run",
+    "verify_scratch_preparation_input_digests",
 ]

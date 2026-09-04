@@ -79,15 +79,24 @@ from .resume_fit import (
 from .scheduler import SchedulerConfig, build_scheduler
 from .scratch_preparation import (
     SCRATCH_DATA_MANIFEST_CONVENTION_VERSION,
+    SCRATCH_INPUT_FILE_DIGEST_CONVENTION_VERSION,
     SCRATCH_PREPARATION_CONVENTION_VERSION,
     ScratchTrainingPreparation,
     prepare_scratch_training_run,
+    verify_scratch_preparation_input_digests,
 )
 from .scratch_initialization import (
     SCRATCH_MODEL_INITIALIZATION_CONVENTION_VERSION,
     ScratchModelInitialization,
     ScratchModelInitializationError,
     initialize_scratch_model,
+)
+from .scratch_startup import (
+    SCRATCH_TRAINING_STARTUP_CONVENTION_VERSION,
+    SCRATCH_TRAINING_STARTUP_STATUS_SCHEMA_VERSION,
+    ScratchTrainingStartup,
+    ScratchTrainingStartupError,
+    initialize_scratch_training_startup,
 )
 from .selection import (
     ModelSelectionConfig,
@@ -155,10 +164,15 @@ __all__ = [
     "ResumedFitResult",
     "SchedulerConfig",
     "SCRATCH_DATA_MANIFEST_CONVENTION_VERSION",
+    "SCRATCH_INPUT_FILE_DIGEST_CONVENTION_VERSION",
     "SCRATCH_MODEL_INITIALIZATION_CONVENTION_VERSION",
     "SCRATCH_PREPARATION_CONVENTION_VERSION",
+    "SCRATCH_TRAINING_STARTUP_CONVENTION_VERSION",
+    "SCRATCH_TRAINING_STARTUP_STATUS_SCHEMA_VERSION",
     "ScratchModelInitialization",
     "ScratchModelInitializationError",
+    "ScratchTrainingStartup",
+    "ScratchTrainingStartupError",
     "ScratchTrainingPreparation",
     "RunDirectoryError",
     "TrainStepConfig",
@@ -183,7 +197,9 @@ __all__ = [
     "load_runtime_json",
     "process_primary_validation",
     "prepare_scratch_training_run",
+    "verify_scratch_preparation_input_digests",
     "initialize_scratch_model",
+    "initialize_scratch_training_startup",
     "run_fit",
     "run_checkpointed_fit",
     "run_checkpointed_resumed_fit",

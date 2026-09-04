@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import random
 from dataclasses import replace
@@ -48,6 +49,10 @@ from refsite_mlip.training import (
     TrainStepConfig,
     ValidationStepConfig,
     prepare_scratch_training_run,
+)
+from refsite_mlip.training.scratch_preparation import (
+    SCRATCH_INPUT_FILE_DIGEST_CONVENTION_VERSION,
+    verify_scratch_preparation_input_digests,
 )
 from refsite_mlip.transport import TransportSupportConfig
 
@@ -369,6 +374,125 @@ def _assert_payload_equal(left, right) -> None:
             _assert_payload_equal(first, second)
     else:
         assert left == right
+
+
+def test_raw_input_file_digests_cover_inputs_are_immutable_and_verify(tmp_path):
+    reference = _atoms(1)
+    config_path, poscar, train_path, _ = _case(
+        tmp_path,
+        train_frames=(_labeled(reference, -8.0),),
+        validation_frames=(_labeled(reference, -7.75),),
+        selector={"template_id": "scratch-111-a"},
+    )
+    validation_path = tmp_path / "validation.xyz"
+    prepared = prepare_scratch_training_run(
+        load_training_run_config(config_path)
+    )
+
+    snapshot = prepared.input_file_digests
+    assert snapshot["convention_version"] == (
+        SCRATCH_INPUT_FILE_DIGEST_CONVENTION_VERSION
+    )
+    assert snapshot["path_kind"] == (
+        "runtime_location_not_semantic_fingerprint"
+    )
+    files = snapshot["files"]
+    assert tuple(files) == (
+        "config",
+        "reference_poscar[000000]",
+        "train[000000]",
+        "validation[000000]",
+    )
+    expected_paths = {
+        "config": config_path.resolve(),
+        "reference_poscar[000000]": poscar.resolve(),
+        "train[000000]": train_path.resolve(),
+        "validation[000000]": validation_path.resolve(),
+    }
+    for label, path in expected_paths.items():
+        entry = files[label]
+        assert entry["label"] == label
+        assert entry["runtime_path"] == str(path)
+        assert entry["sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
+    assert files["reference_poscar[000000]"]["template_id"] == (
+        "scratch-111-a"
+    )
+    assert files["train[000000]"]["split"] == "train"
+    assert files["validation[000000]"]["split"] == "validation"
+    assert verify_scratch_preparation_input_digests(prepared) is None
+    assert prepared.to_dict()["runtime"]["input_file_digests"] == {
+        "convention_version": SCRATCH_INPUT_FILE_DIGEST_CONVENTION_VERSION,
+        "path_kind": "runtime_location_not_semantic_fingerprint",
+        "files": {
+            label: dict(entry) for label, entry in files.items()
+        },
+    }
+    with pytest.raises(TypeError):
+        files["config"] = {}  # type: ignore[index]
+    with pytest.raises(TypeError):
+        files["config"]["sha256"] = "0" * 64  # type: ignore[index]
+
+
+def test_raw_input_digest_detects_byte_mutation_with_structured_context(tmp_path):
+    reference = _atoms(1)
+    config_path, _, train_path, _ = _case(
+        tmp_path,
+        train_frames=(_labeled(reference, -8.0),),
+        validation_frames=(_labeled(reference, -7.75),),
+        selector={"template_id": "scratch-111-a"},
+    )
+    prepared = prepare_scratch_training_run(
+        load_training_run_config(config_path)
+    )
+    semantic_fingerprint = prepared.preparation_fingerprint
+    train_path.write_bytes(train_path.read_bytes() + b"\n")
+
+    with pytest.raises(TrainingRunConfigError) as caught:
+        verify_scratch_preparation_input_digests(prepared)
+    assert caught.value.reason_code == "INPUT_DIGEST_MISMATCH"
+    assert caught.value.stage == "scratch.input_digest"
+    assert caught.value.field == "data.train[0].path"
+    assert caught.value.split == "train"
+    assert caught.value.source_path == str(train_path.resolve())
+    assert len(caught.value.expected) == len(caught.value.actual) == 64
+    assert prepared.preparation_fingerprint == semantic_fingerprint
+
+
+@pytest.mark.parametrize(
+    ("replacement", "reason"),
+    (
+        ("symlink", "INPUT_DIGEST_SYMLINK_REJECTED"),
+        ("directory", "INPUT_DIGEST_NOT_REGULAR_FILE"),
+    ),
+)
+def test_raw_input_digest_rejects_replacement_symlink_and_nonfile(
+    tmp_path, replacement, reason
+):
+    reference = _atoms(1)
+    config_path, _, train_path, _ = _case(
+        tmp_path,
+        train_frames=(_labeled(reference, -8.0),),
+        validation_frames=(_labeled(reference, -7.75),),
+        selector={"template_id": "scratch-111-a"},
+    )
+    prepared = prepare_scratch_training_run(
+        load_training_run_config(config_path)
+    )
+    original = train_path.read_bytes()
+    train_path.unlink()
+    if replacement == "symlink":
+        backing = tmp_path / "train-backing.xyz"
+        backing.write_bytes(original)
+        train_path.symlink_to(backing.name)
+    else:
+        train_path.mkdir()
+
+    with pytest.raises(TrainingRunConfigError) as caught:
+        verify_scratch_preparation_input_digests(prepared)
+    assert caught.value.reason_code == reason
+    assert caught.value.stage == "scratch.input_digest"
+    assert caught.value.field == "data.train[0].path"
+    assert caught.value.split == "train"
 
 
 def test_exact_pristine_vacancy_preparation_matches_direct_builder_and_is_stable(
