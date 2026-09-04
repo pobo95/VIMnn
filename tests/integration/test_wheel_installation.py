@@ -17,7 +17,7 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 SUBPROCESS_TIMEOUT_SECONDS = 300
 
 
-def _offline_environment() -> dict[str, str]:
+def _offline_environment(*, cuda_visible_devices: str = "") -> dict[str, str]:
     environment = dict(os.environ)
     environment.pop("PYTHONHOME", None)
     environment.pop("PYTHONPATH", None)
@@ -26,7 +26,7 @@ def _offline_environment() -> dict[str, str]:
             # 10C-1 is an explicitly CPU-only gate.  Hiding any accelerator
             # also prevents a system-site PyTorch install from capturing or
             # consuming CUDA RNG state while the wheel workflow is exercised.
-            "CUDA_VISIBLE_DEVICES": "",
+            "CUDA_VISIBLE_DEVICES": cuda_visible_devices,
             "PIP_DISABLE_PIP_VERSION_CHECK": "1",
             "PIP_NO_INDEX": "1",
             "PYTHONNOUSERSITE": "1",
@@ -120,6 +120,7 @@ def build_installed_wheel_environment(
     root: Path,
     *,
     repository_root: Path = REPOSITORY_ROOT,
+    cuda_visible_devices: str = "",
 ) -> InstalledWheelEnvironment:
     """Build offline, install non-editably, and return an isolated CLI runner."""
 
@@ -132,7 +133,14 @@ def build_installed_wheel_environment(
     wheelhouse.mkdir(parents=True)
     work = root / "work"
     work.mkdir()
-    environment = _offline_environment()
+    environment = _offline_environment(
+        cuda_visible_devices=cuda_visible_devices
+    )
+    if cuda_visible_devices:
+        # Surface asynchronous kernel failures in the command which launched
+        # them.  This is a verification-only process setting and is not part
+        # of any training or model configuration fingerprint.
+        environment["CUDA_LAUNCH_BLOCKING"] = "1"
 
     _run_checked(
         (
@@ -189,11 +197,15 @@ def build_installed_wheel_environment(
 
 @contextmanager
 def installed_wheel_environment_context(
-    *, repository_root: Path = REPOSITORY_ROOT,
+    *,
+    repository_root: Path = REPOSITORY_ROOT,
+    cuda_visible_devices: str = "",
 ) -> Iterator[InstalledWheelEnvironment]:
     with tempfile.TemporaryDirectory(prefix="refsite-mlip-wheel-") as temporary:
         yield build_installed_wheel_environment(
-            Path(temporary), repository_root=repository_root
+            Path(temporary),
+            repository_root=repository_root,
+            cuda_visible_devices=cuda_visible_devices,
         )
 
 

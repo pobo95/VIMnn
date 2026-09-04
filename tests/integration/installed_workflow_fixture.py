@@ -184,7 +184,11 @@ def _builder(
     )
 
 
-def _potential() -> PotentialConfig:
+def _potential(
+    *,
+    transport_backend: str = "dense",
+    candidate_backend: str = "dense",
+) -> PotentialConfig:
     feature = ProbabilityMultipoleConfig(
         species_vocabulary=(6, 41),
         n_radial=2,
@@ -217,6 +221,8 @@ def _potential() -> PotentialConfig:
             cutoff=4.0,
             switch_width=0.5,
             candidate_skin=0.2,
+            backend=transport_backend,
+            candidate_backend=candidate_backend,
         ),
     )
 
@@ -254,7 +260,13 @@ def _write_xyz(path: Path, frames) -> None:
     write(path, list(frames), format="extxyz")
 
 
-def _write_case(directory: Path, *, max_epochs: int) -> dict[str, Any]:
+def _write_case(
+    directory: Path,
+    *,
+    max_epochs: int,
+    transport_backend: str,
+    candidate_backend: str,
+) -> dict[str, Any]:
     directory.mkdir(parents=True, exist_ok=False)
     alpha_reference = _reference((1, 1, 1))
     zeta_reference = _reference((2, 1, 1))
@@ -370,7 +382,10 @@ def _write_case(directory: Path, *, max_epochs: int) -> dict[str, Any]:
         "model_source": {
             "kind": "scratch",
             "initialization_seed": INITIALIZATION_SEED,
-            "potential": _potential().to_dict(),
+            "potential": _potential(
+                transport_backend=transport_backend,
+                candidate_backend=candidate_backend,
+            ).to_dict(),
             "species_alignment_weights": [[1.0, -0.5], [-1.0, 2.0]],
             "reference_templates": templates,
             "default_template_id": ALPHA_TEMPLATE_ID,
@@ -444,12 +459,27 @@ def _write_case(directory: Path, *, max_epochs: int) -> dict[str, Any]:
     }
 
 
-def generate(root: Path) -> dict[str, Any]:
+def generate(
+    root: Path,
+    *,
+    transport_backend: str = "dense",
+    candidate_backend: str = "dense",
+) -> dict[str, Any]:
     root = root.resolve()
     root.mkdir(parents=True, exist_ok=False)
     cases = {
-        "continuous": _write_case(root / "continuous", max_epochs=2),
-        "split": _write_case(root / "split", max_epochs=1),
+        "continuous": _write_case(
+            root / "continuous",
+            max_epochs=2,
+            transport_backend=transport_backend,
+            candidate_backend=candidate_backend,
+        ),
+        "split": _write_case(
+            root / "split",
+            max_epochs=1,
+            transport_backend=transport_backend,
+            candidate_backend=candidate_backend,
+        ),
     }
     manifest = {
         "schema_version": "refsite_installed_workflow_fixture_v1",
@@ -474,6 +504,8 @@ def generate(root: Path) -> dict[str, Any]:
         "device": "cpu",
         "dtype": "float64",
         "template_key": "template",
+        "transport_backend": transport_backend,
+        "candidate_backend": candidate_backend,
         "cases": cases,
     }
     manifest_path = root / "fixture-manifest.json"
@@ -486,8 +518,22 @@ def generate(root: Path) -> dict[str, Any]:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("root", type=Path)
+    parser.add_argument(
+        "--transport-backend",
+        choices=("dense", "edge_list"),
+        default="dense",
+    )
+    parser.add_argument(
+        "--candidate-backend",
+        choices=("dense", "blocked"),
+        default="dense",
+    )
     arguments = parser.parse_args(argv)
-    manifest = generate(arguments.root)
+    manifest = generate(
+        arguments.root,
+        transport_backend=arguments.transport_backend,
+        candidate_backend=arguments.candidate_backend,
+    )
     print(
         json.dumps(
             manifest,
