@@ -83,6 +83,12 @@ from .scratch_preparation import (
     ScratchTrainingPreparation,
     prepare_scratch_training_run,
 )
+from .scratch_initialization import (
+    SCRATCH_MODEL_INITIALIZATION_CONVENTION_VERSION,
+    ScratchModelInitialization,
+    ScratchModelInitializationError,
+    initialize_scratch_model,
+)
 from .selection import (
     ModelSelectionConfig,
     ModelSelectionState,
@@ -149,7 +155,10 @@ __all__ = [
     "ResumedFitResult",
     "SchedulerConfig",
     "SCRATCH_DATA_MANIFEST_CONVENTION_VERSION",
+    "SCRATCH_MODEL_INITIALIZATION_CONVENTION_VERSION",
     "SCRATCH_PREPARATION_CONVENTION_VERSION",
+    "ScratchModelInitialization",
+    "ScratchModelInitializationError",
     "ScratchTrainingPreparation",
     "RunDirectoryError",
     "TrainStepConfig",
@@ -174,6 +183,7 @@ __all__ = [
     "load_runtime_json",
     "process_primary_validation",
     "prepare_scratch_training_run",
+    "initialize_scratch_model",
     "run_fit",
     "run_checkpointed_fit",
     "run_checkpointed_resumed_fit",
