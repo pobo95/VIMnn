@@ -42,6 +42,18 @@ from refsite_mlip.data.schema import (
     STRESS_VOIGT_ORDER,
 )
 from refsite_mlip.data.templates import ReferenceTemplate, TemplateRegistry
+from refsite_mlip.interactions.higher_body import (
+    LEGACY_HIGHER_BODY_CONTRACT_VERSION,
+    SYMMETRIC_POWER_CONTRACT_VERSION,
+)
+from refsite_mlip.interactions.symmetric_cg import (
+    SYMMETRIC_CG_PATH_ORDERING,
+    SymmetricCGBasisBank,
+    generate_generalized_cg,
+)
+from refsite_mlip.interactions.symmetric_contraction import (
+    FactorizedSymmetricContraction,
+)
 
 from .config import PotentialConfig
 from .evaluation_policy import EvaluationPolicy
@@ -769,12 +781,303 @@ def _architecture_payload(
     species_vocabulary: tuple[int, ...],
     conventions: Mapping[str, Any],
 ) -> dict[str, Any]:
-    return {
+    result = {
         "model_config": model_config,
         "state_contract": _state_descriptors(model_state, model_state_keys),
         "species_vocabulary": list(species_vocabulary),
         "conventions": conventions,
     }
+    higher = model_config.get("higher_body") if isinstance(model_config, Mapping) else None
+    if (
+        isinstance(higher, Mapping)
+        and higher.get("contract_version") == SYMMETRIC_POWER_CONTRACT_VERSION
+    ):
+        config = PotentialConfig.from_dict(model_config)
+        result["symmetric_correlation_contract"] = _validate_symmetric_state_contract(
+            config,
+            model_state,
+            bundle_path=None,
+            stage="architecture.state_contract",
+        )
+    return result
+
+
+def _central_channel_descriptor(config: PotentialConfig) -> list[dict[str, Any]]:
+    species = len(config.species_vocabulary)
+    embedding = config.higher_body.site_type_embedding_dim
+    boundaries = (
+        ("constant", 0, 1),
+        ("species", 1, 1 + species),
+        ("vacancy", 1 + species, 2 + species),
+        ("site_type", 2 + species, 2 + species + embedding),
+        (
+            "vacancy_site_type",
+            2 + species + embedding,
+            2 + species + 2 * embedding,
+        ),
+    )
+    return [
+        {"name": name, "start": start, "stop": stop}
+        for name, start, stop in boundaries
+    ]
+
+
+def _symmetric_coupling_irreps(config: PotentialConfig):
+    _, o3 = import_e3nn_0_4_4()
+    return o3.Irreps(
+        [
+            (1, o3.Irrep(l, 1 if l % 2 == 0 else -1))
+            for l in range(config.higher_body.lmax + 1)
+        ]
+    )
+
+
+def _symmetric_error(
+    reason_code: str,
+    message: str,
+    *,
+    bundle_path: str | None,
+    stage: str,
+    state_key: str | None = None,
+) -> ModelBundleError:
+    return _error(
+        reason_code,
+        message,
+        bundle_path=bundle_path,
+        schema=REFERENCE_SITE_MODEL_BUNDLE_SCHEMA_VERSION,
+        validation_stage=stage,
+        state_key=state_key,
+    )
+
+
+def _validate_symmetric_state_contract(
+    config: PotentialConfig,
+    state: Mapping[str, torch.Tensor],
+    *,
+    bundle_path: str | None,
+    stage: str,
+) -> dict[str, Any]:
+    """Validate and describe the v2 state without trusting its outer hashes."""
+
+    higher = config.higher_body
+    symmetric = higher.symmetric_correlation
+    if (
+        higher.contract_version != SYMMETRIC_POWER_CONTRACT_VERSION
+        or symmetric is None
+    ):
+        raise _symmetric_error(
+            "SYMMETRIC_CONFIG_MISMATCH",
+            "symmetric state validation requires a v2 PotentialConfig",
+            bundle_path=bundle_path,
+            stage=stage,
+        )
+    coupling = _symmetric_coupling_irreps(config)
+    bank = SymmetricCGBasisBank(
+        coupling,
+        coupling,
+        symmetric.correlation_order,
+        basis_version=symmetric.basis_version,
+        normalization=symmetric.normalization,
+        dtype=torch.float64,
+        device="cpu",
+    )
+    expected_u = {
+        f"symmetric_cg_basis.{name}": value
+        for name, value in bank.state_dict().items()
+    }
+    actual_u_keys = {
+        key for key in state if key.startswith("symmetric_cg_basis.")
+    }
+    if actual_u_keys != set(expected_u):
+        raise _symmetric_error(
+            "SYMMETRIC_BASIS_KEY_MISMATCH",
+            "top-level symmetric-CG buffer keys differ from the canonical basis: "
+            f"missing={sorted(set(expected_u) - actual_u_keys)} "
+            f"extra={sorted(actual_u_keys - set(expected_u))}",
+            bundle_path=bundle_path,
+            stage=stage,
+        )
+    layer_basis_keys = tuple(
+        key
+        for key in state
+        if key.startswith("layers.")
+        and (".u_output_" in key or ".symmetric_cg_basis." in key)
+    )
+    if layer_basis_keys:
+        raise _symmetric_error(
+            "SYMMETRIC_BASIS_DUPLICATED",
+            "v2 generalized-CG buffers must be owned only by the top-level bank",
+            bundle_path=bundle_path,
+            stage=stage,
+            state_key=layer_basis_keys[0],
+        )
+    legacy_keys = tuple(
+        key
+        for key in state
+        if key.startswith("layers.")
+        and any(token in key for token in (".corr.", ".outer.", ".contract."))
+    )
+    if legacy_keys:
+        raise _symmetric_error(
+            "SYMMETRIC_LEGACY_STATE_CONTAMINATION",
+            "v2 state contains a legacy correlation module",
+            bundle_path=bundle_path,
+            stage=stage,
+            state_key=legacy_keys[0],
+        )
+    u_descriptors = []
+    for metadata in bank.buffer_metadata:
+        key = f"symmetric_cg_basis.{metadata.buffer_name}"
+        actual = state[key]
+        expected = expected_u[key].to(dtype=actual.dtype)
+        if tuple(actual.shape) != tuple(expected.shape):
+            raise _symmetric_error(
+                "SYMMETRIC_BASIS_SHAPE_MISMATCH",
+                f"canonical U shape is {tuple(expected.shape)}, got {tuple(actual.shape)}",
+                bundle_path=bundle_path,
+                stage=stage,
+                state_key=key,
+            )
+        if not torch.equal(actual.detach().cpu(), expected):
+            raise _symmetric_error(
+                "SYMMETRIC_BASIS_CONTENT_MISMATCH",
+                "persistent U content differs from the canonical generalized-CG basis",
+                bundle_path=bundle_path,
+                stage=stage,
+                state_key=key,
+            )
+        u_descriptors.append(
+            {
+                "key": key,
+                "order": metadata.correlation_order,
+                "output_irrep": metadata.output_irrep,
+                "output_index": metadata.output_index,
+                "path_count": metadata.path_count,
+                "dtype": str(actual.dtype),
+                "shape": list(actual.shape),
+                "numel": actual.numel(),
+            }
+        )
+    generated = tuple(
+        generate_generalized_cg(
+            coupling,
+            coupling,
+            order,
+            normalization=symmetric.normalization,
+        )
+        for order in range(1, symmetric.correlation_order + 1)
+    )
+    path_metadata = [
+        {
+            "order": value.correlation_order,
+            "output_irrep": path.metadata.output_irrep,
+            "path_index": path.metadata.path_index,
+            "input_irreps": list(path.metadata.input_irreps),
+            "intermediate_irreps": list(path.metadata.intermediate_irreps),
+            "coefficient_shape": list(path.metadata.coefficient_shape),
+        }
+        for value in generated
+        for path in value.paths
+    ]
+    central_dimension = 2 + len(config.species_vocabulary) + 2 * higher.site_type_embedding_dim
+    expected_w: dict[str, tuple[int, int, int]] = {}
+    w_descriptors = []
+    for layer in range(config.num_layers):
+        for metadata in bank.buffer_metadata:
+            key = (
+                f"layers.{layer}.symmetric_contraction."
+                f"weight_output_{metadata.output_index}_order_{metadata.correlation_order}"
+            )
+            shape = (
+                central_dimension,
+                metadata.path_count,
+                higher.n_correlation_channels,
+            )
+            expected_w[key] = shape
+            w_descriptors.append(
+                {
+                    "key": key,
+                    "layer": layer,
+                    "order": metadata.correlation_order,
+                    "output_irrep": metadata.output_irrep,
+                    "output_index": metadata.output_index,
+                    "path_count": metadata.path_count,
+                    "shape": list(shape),
+                }
+            )
+    actual_w_keys = {
+        key
+        for key in state
+        if key.startswith("layers.") and ".symmetric_contraction.weight_" in key
+    }
+    if actual_w_keys != set(expected_w):
+        raise _symmetric_error(
+            "SYMMETRIC_WEIGHT_KEY_MISMATCH",
+            "v2 W keys differ from configured layers/orders: "
+            f"missing={sorted(set(expected_w) - actual_w_keys)} "
+            f"extra={sorted(actual_w_keys - set(expected_w))}",
+            bundle_path=bundle_path,
+            stage=stage,
+        )
+    for key, expected_shape in expected_w.items():
+        if tuple(state[key].shape) != expected_shape:
+            raise _symmetric_error(
+                "SYMMETRIC_WEIGHT_SHAPE_MISMATCH",
+                f"configured W shape is {expected_shape}, got {tuple(state[key].shape)}",
+                bundle_path=bundle_path,
+                stage=stage,
+                state_key=key,
+            )
+    return {
+        "contract_version": SYMMETRIC_POWER_CONTRACT_VERSION,
+        "correlation_order": symmetric.correlation_order,
+        "basis_kind": symmetric.basis_kind,
+        "normalization": symmetric.normalization,
+        "basis_version": symmetric.basis_version,
+        "input_irreps": bank.input_irreps,
+        "output_irreps": bank.requested_output_irreps,
+        "angular_basis_ordering": [
+            {"l": irrep.l, "parity": irrep.p, "irrep": str(irrep)}
+            for _, irrep in coupling
+        ],
+        "channel_multiplicity": higher.n_correlation_channels,
+        "central_feature_dimension": central_dimension,
+        "central_channel_ordering": _central_channel_descriptor(config),
+        "interaction_layer_count": config.num_layers,
+        "canonical_path_ordering": SYMMETRIC_CG_PATH_ORDERING,
+        "order_3_path_permutation_convention": (
+            "vimnn_eta_first_matches_mace_full_path_by_signed_permutation_v1"
+        ),
+        "basis_content_fingerprint": bank.basis_fingerprint,
+        "path_metadata": path_metadata,
+        "u_tensors": u_descriptors,
+        "w_tensors": w_descriptors,
+    }
+
+
+def _validate_legacy_state_separation(
+    config: PotentialConfig,
+    state: Mapping[str, torch.Tensor],
+    *,
+    bundle_path: str | None,
+    stage: str,
+) -> None:
+    if config.higher_body.contract_version != LEGACY_HIGHER_BODY_CONTRACT_VERSION:
+        return
+    contaminated = tuple(
+        key
+        for key in state
+        if key.startswith("symmetric_cg_basis.")
+        or ".symmetric_contraction." in key
+    )
+    if contaminated:
+        raise _symmetric_error(
+            "LEGACY_STATE_CONTAMINATION",
+            "legacy v1 model state contains symmetric-power v2 keys",
+            bundle_path=bundle_path,
+            stage=stage,
+            state_key=contaminated[0],
+        )
 
 
 def _legacy_radius_contract_mismatch(
@@ -1034,6 +1337,20 @@ class ReferenceSiteModelBundle:
                         validation_stage="model_state",
                         state_key=key,
                     )
+        if config.higher_body.contract_version == SYMMETRIC_POWER_CONTRACT_VERSION:
+            _validate_symmetric_state_contract(
+                config,
+                self.model_state,
+                bundle_path=bundle_path,
+                stage="model_state.symmetric_correlation",
+            )
+        else:
+            _validate_legacy_state_separation(
+                config,
+                self.model_state,
+                bundle_path=bundle_path,
+                stage="model_state.architecture_separation",
+            )
         _require_exact_keys(
             self.conventions,
             _CONVENTION_KEYS,
@@ -1343,6 +1660,91 @@ def _model_floating_dtype(model: ReferenceSitePotential) -> torch.dtype:
     return values[0]
 
 
+def _validate_model_architecture(
+    model: ReferenceSitePotential,
+    *,
+    stage: str,
+) -> None:
+    config = model.config
+    state = model.state_dict()
+    if config.higher_body.contract_version == LEGACY_HIGHER_BODY_CONTRACT_VERSION:
+        if hasattr(model, "symmetric_cg_basis"):
+            raise _symmetric_error(
+                "LEGACY_MODULE_CONTAMINATION",
+                "legacy v1 model unexpectedly owns a symmetric-CG basis bank",
+                bundle_path=None,
+                stage=stage,
+            )
+        _validate_legacy_state_separation(
+            config, state, bundle_path=None, stage=stage
+        )
+        return
+    if config.higher_body.contract_version != SYMMETRIC_POWER_CONTRACT_VERSION:
+        raise _symmetric_error(
+            "UNKNOWN_MODEL_CONTRACT",
+            "model uses an unsupported higher-body contract",
+            bundle_path=None,
+            stage=stage,
+        )
+    bank = getattr(model, "symmetric_cg_basis", None)
+    if not isinstance(bank, SymmetricCGBasisBank):
+        raise _symmetric_error(
+            "SYMMETRIC_MODULE_MISMATCH",
+            "v2 model does not own one top-level SymmetricCGBasisBank",
+            bundle_path=None,
+            stage=stage,
+        )
+    owned_banks = tuple(
+        name
+        for name, module in model.named_modules(remove_duplicate=False)
+        if isinstance(module, SymmetricCGBasisBank)
+    )
+    if owned_banks != ("symmetric_cg_basis",):
+        raise _symmetric_error(
+            "SYMMETRIC_BASIS_DUPLICATED",
+            f"v2 basis owners must be exactly ('symmetric_cg_basis',), got {owned_banks}",
+            bundle_path=None,
+            stage=stage,
+        )
+    try:
+        bank.validate_integrity()
+    except Exception as error:
+        raise _wrap_error(
+            "SYMMETRIC_BASIS_CONTENT_MISMATCH",
+            "top-level generalized-CG basis integrity validation failed",
+            error,
+            schema=REFERENCE_SITE_MODEL_BUNDLE_SCHEMA_VERSION,
+            validation_stage=stage,
+        ) from error
+    _validate_symmetric_state_contract(
+        config, state, bundle_path=None, stage=stage
+    )
+    if len(model.layers) != config.num_layers:
+        raise _symmetric_error(
+            "SYMMETRIC_LAYER_COUNT_MISMATCH",
+            "runtime residual layer count differs from PotentialConfig",
+            bundle_path=None,
+            stage=stage,
+        )
+    for index, layer in enumerate(model.layers):
+        contraction = getattr(layer, "symmetric_contraction", None)
+        if (
+            getattr(layer, "contract_version", None)
+            != SYMMETRIC_POWER_CONTRACT_VERSION
+            or not isinstance(contraction, FactorizedSymmetricContraction)
+            or getattr(contraction, "_owns_basis_buffers", True)
+            or getattr(layer, "symmetric_basis_fingerprint", None)
+            != bank.basis_fingerprint
+            or any(hasattr(layer, name) for name in ("corr", "outer", "contract"))
+        ):
+            raise _symmetric_error(
+                "SYMMETRIC_MODULE_MISMATCH",
+                f"residual layer {index} does not implement the configured weights-only v2 backend",
+                bundle_path=None,
+                stage=stage,
+            )
+
+
 def _topology_matches_model(model: ReferenceSitePotential, template: ReferenceTemplate) -> bool:
     left = model.topology
     right = template.topology
@@ -1411,6 +1813,7 @@ def capture_reference_site_model_bundle(
 
     if not isinstance(model, ReferenceSitePotential):
         raise TypeError("model must be a ReferenceSitePotential")
+    _validate_model_architecture(model, stage="capture.model_architecture")
     if not isinstance(structural_artifacts, Mapping) or not structural_artifacts:
         raise ValueError("structural_artifacts must be a nonempty mapping")
     if not isinstance(phase_specifications, Mapping):
@@ -1958,6 +2361,9 @@ def instantiate_reference_site_model_bundle(
                     )
             model.load_state_dict(dict(bundle.model_state), strict=True)
             model.to(device=target_device, dtype=dtype)
+            _validate_model_architecture(
+                model, stage="instantiate.model_architecture"
+            )
             model.eval()
     except ModelBundleError:
         raise

@@ -229,6 +229,25 @@ def test_capture_safe_owned_deterministic_and_preserves_model_state(typed_crysta
     }
 
 
+def test_legacy_bundle_rejects_rehashed_symmetric_state_contamination(
+    typed_crystal,
+):
+    *_, bundle = _capture(typed_crystal)
+    payload = copy.deepcopy(bundle.to_payload())
+    body = payload["payload"]
+    key = "symmetric_cg_basis.U_order_1_output_0"
+    body["model_state"][key] = torch.zeros((1, 1, 1), dtype=torch.float64)
+    body["model_state_keys"].append(key)
+    payload["bundle_fingerprint"] = bundle_module._fingerprint(
+        "reference_site_model_bundle_v1", body
+    )
+    with pytest.raises(ModelBundleError) as caught:
+        bundle_module._bundle_from_safe_payload(
+            payload, bundle_path="legacy-contaminated.pt"
+        )
+    assert caught.value.reason_code == "LEGACY_STATE_CONTAMINATION"
+
+
 def test_save_load_instantiate_exact_state_and_direct_runtime(typed_crystal, tmp_path, monkeypatch):
     model, template, _, policy, bundle = _capture(typed_crystal)
     path = tmp_path / "portable.pt"
