@@ -1,8 +1,9 @@
 """Standalone full-path factorized symmetric angular contraction.
 
 This module consumes the fixed generalized real-CG basis from
-``symmetric_cg``.  It is deliberately not connected to the current Potential,
-residual blocks, or legacy binary correlation implementation.
+``symmetric_cg``.  Standalone instances may own their basis buffers; residual
+layers use the weights-only construction and receive the single externally
+owned basis bank explicitly at each forward.
 """
 
 from __future__ import annotations
@@ -16,7 +17,11 @@ from torch import nn
 
 from refsite_mlip.compatibility import import_e3nn_0_4_4
 
-from .symmetric_cg import GeneralizedCGCoefficients, generate_generalized_cg
+from .symmetric_cg import (
+    GeneralizedCGCoefficients,
+    SymmetricCGBasisBank,
+    generate_generalized_cg,
+)
 
 
 _SUPPORTED_DTYPES = (torch.float32, torch.float64)
@@ -255,6 +260,7 @@ class FactorizedSymmetricContraction(nn.Module):
         normalization: str = "component",
         dtype: torch.dtype = torch.float64,
         device: torch.device | str = "cpu",
+        _external_basis_bank: SymmetricCGBasisBank | None = None,
     ) -> None:
         super().__init__()
         self.correlation_order = _correlation_order(correlation_order)
@@ -292,6 +298,14 @@ class FactorizedSymmetricContraction(nn.Module):
             [(channels, irrep) for _, irrep in outputs]
         )
         self.normalization = normalization
+        self._owns_basis_buffers = _external_basis_bank is None
+        self._external_basis_fingerprint = (
+            None
+            if _external_basis_bank is None
+            else _external_basis_bank.basis_fingerprint
+        )
+        if _external_basis_bank is not None:
+            self._validate_external_bank_architecture(_external_basis_bank)
 
         basis_names: dict[tuple[int, int], str] = {}
         weight_names: dict[tuple[int, int], str] = {}
@@ -300,36 +314,43 @@ class FactorizedSymmetricContraction(nn.Module):
             output_label = str(output_irrep)
             output_bases: dict[int, tuple[torch.Tensor, int]] = {}
             for order in range(1, self.correlation_order + 1):
-                try:
-                    basis = generate_generalized_cg(
-                        coupling_irreps,
-                        output_label,
-                        order,
-                        normalization=normalization,
-                        canonical_dtype=torch.float64,
+                if _external_basis_bank is None:
+                    try:
+                        basis = generate_generalized_cg(
+                            coupling_irreps,
+                            output_label,
+                            order,
+                            normalization=normalization,
+                            canonical_dtype=torch.float64,
+                        )
+                    except Exception as error:
+                        if isinstance(error, SymmetricContractionError):
+                            raise
+                        raise _error(
+                            "CG_BASIS_GENERATION_FAILED",
+                            f"generalized-CG generation failed: {error}",
+                            field="cg_basis",
+                        ) from error
+                    stacked, path_count = _validate_basis(
+                        basis,
+                        order=order,
+                        output_irrep=output_label,
+                        angular_dimension=self.angular_dimension,
                     )
-                except Exception as error:
-                    if isinstance(error, SymmetricContractionError):
-                        raise
-                    raise _error(
-                        "CG_BASIS_GENERATION_FAILED",
-                        f"generalized-CG generation failed: {error}",
-                        field="cg_basis",
-                    ) from error
-                stacked, path_count = _validate_basis(
-                    basis,
-                    order=order,
-                    output_irrep=output_label,
-                    angular_dimension=self.angular_dimension,
-                )
+                else:
+                    stacked = _external_basis_bank.basis_tensor(
+                        order, output_label
+                    )
+                    path_count = int(stacked.shape[0])
                 output_bases[order] = (stacked, path_count)
-                name = f"u_output_{output_index}_order_{order}"
-                self.register_buffer(
-                    name,
-                    stacked.to(device=target_device, dtype=dtype),
-                    persistent=True,
-                )
-                basis_names[(output_index, order)] = name
+                if _external_basis_bank is None:
+                    name = f"u_output_{output_index}_order_{order}"
+                    self.register_buffer(
+                        name,
+                        stacked.to(device=target_device, dtype=dtype),
+                        persistent=True,
+                    )
+                    basis_names[(output_index, order)] = name
                 path_counts.append(
                     SymmetricContractionPathCount(
                         order=order,
@@ -357,6 +378,65 @@ class FactorizedSymmetricContraction(nn.Module):
         self._weight_names = tuple(sorted(weight_names.items()))
         self._path_counts = tuple(path_counts)
 
+    @classmethod
+    def from_basis_bank(
+        cls,
+        input_irreps: Any,
+        *,
+        central_dimension: int,
+        basis_bank: SymmetricCGBasisBank,
+        dtype: torch.dtype = torch.float64,
+        device: torch.device | str = "cpu",
+    ) -> "FactorizedSymmetricContraction":
+        if not isinstance(basis_bank, SymmetricCGBasisBank):
+            raise _error(
+                "INVALID_CG_BASIS_BANK",
+                "basis_bank must be a SymmetricCGBasisBank",
+                field="basis_bank",
+            )
+        return cls(
+            input_irreps,
+            basis_bank.requested_output_irreps,
+            correlation_order=basis_bank.correlation_order,
+            central_dimension=central_dimension,
+            normalization=basis_bank.normalization,
+            dtype=dtype,
+            device=device,
+            _external_basis_bank=basis_bank,
+        )
+
+    def _validate_external_bank_architecture(
+        self, basis_bank: SymmetricCGBasisBank
+    ) -> None:
+        if not isinstance(basis_bank, SymmetricCGBasisBank):
+            raise _error(
+                "INVALID_CG_BASIS_BANK",
+                "external basis must be a SymmetricCGBasisBank",
+                field="basis_bank",
+            )
+        if (
+            basis_bank.input_irreps != str(self.coupling_irreps)
+            or basis_bank.requested_output_irreps
+            != str(self.requested_output_irreps)
+            or basis_bank.correlation_order != self.correlation_order
+            or basis_bank.normalization != self.normalization
+        ):
+            raise _error(
+                "MISMATCHED_CG_BASIS_BANK",
+                "external basis architecture differs from this contraction",
+                field="basis_bank",
+            )
+        if (
+            self._external_basis_fingerprint is not None
+            and basis_bank.basis_fingerprint
+            != self._external_basis_fingerprint
+        ):
+            raise _error(
+                "MISMATCHED_CG_BASIS_BANK",
+                "external basis fingerprint differs from construction",
+                field="basis_bank",
+            )
+
     def _name(self, entries, output_index: int, order: int) -> str:
         key = (output_index, order)
         for candidate, name in entries:
@@ -369,6 +449,12 @@ class FactorizedSymmetricContraction(nn.Module):
         )
 
     def basis_tensor(self, output_index: int, order: int) -> torch.Tensor:
+        if not self._owns_basis_buffers:
+            raise _error(
+                "EXTERNAL_CG_BASIS_REQUIRED",
+                "weights-only contraction does not own generalized-CG buffers",
+                field="basis_bank",
+            )
         name = self._name(self._basis_names, output_index, order)
         value = self._buffers.get(name)
         if not isinstance(value, torch.Tensor):
@@ -401,14 +487,41 @@ class FactorizedSymmetricContraction(nn.Module):
             self.angular_dimension,
         ) * order
 
-    def _validated_state(self, output_index: int, order: int):
-        basis = self.basis_tensor(output_index, order)
+    def _validated_state(
+        self,
+        output_index: int,
+        order: int,
+        basis_bank: SymmetricCGBasisBank | None,
+    ):
+        if self._owns_basis_buffers:
+            if basis_bank is not None:
+                raise _error(
+                    "UNEXPECTED_CG_BASIS_BANK",
+                    "internally-owned contraction must not receive an external basis",
+                    field="basis_bank",
+                )
+            basis = self.basis_tensor(output_index, order)
+        else:
+            if basis_bank is None:
+                raise _error(
+                    "EXTERNAL_CG_BASIS_REQUIRED",
+                    "weights-only contraction requires its external basis bank",
+                    field="basis_bank",
+                )
+            self._validate_external_bank_architecture(basis_bank)
+            output_irrep = str(self.requested_output_irreps[output_index].ir)
+            basis = basis_bank.basis_tensor(order, output_irrep)
         weight = self.weight_parameter(output_index, order)
+        basis_field = (
+            self._name(self._basis_names, output_index, order)
+            if self._owns_basis_buffers
+            else f"basis_bank.order_{order}.output_{output_index}"
+        )
         if tuple(basis.shape) != self._expected_basis_shape(output_index, order):
             raise _error(
                 "MISMATCHED_CG_PATH",
                 "persistent generalized-CG buffer shape is invalid",
-                field=self._name(self._basis_names, output_index, order),
+                field=basis_field,
             )
         expected_weight = (
             self.central_dimension,
@@ -425,13 +538,13 @@ class FactorizedSymmetricContraction(nn.Module):
             raise _error(
                 "CG_STATE_DTYPE_DEVICE_MISMATCH",
                 "basis buffer and weight must share dtype and device",
-                field=self._name(self._basis_names, output_index, order),
+                field=basis_field,
             )
         if not bool(torch.all(torch.isfinite(basis))):
             raise _error(
                 "NONFINITE_CG_BASIS",
                 "persistent generalized-CG buffer contains NaN or Infinity",
-                field=self._name(self._basis_names, output_index, order),
+                field=basis_field,
             )
         if not bool(torch.all(torch.isfinite(weight))):
             raise _error(
@@ -502,9 +615,10 @@ class FactorizedSymmetricContraction(nn.Module):
         output_index: int,
         central: torch.Tensor,
         density: torch.Tensor,
+        basis_bank: SymmetricCGBasisBank | None,
     ) -> tuple[torch.Tensor, tuple[tuple[int, ...], ...]]:
         top_basis, top_weight = self._validated_state(
-            output_index, self.correlation_order
+            output_index, self.correlation_order, basis_bank
         )
         intermediate = self._start_order(
             central,
@@ -515,7 +629,9 @@ class FactorizedSymmetricContraction(nn.Module):
         )
         shapes = [] if intermediate.ndim == 3 else [tuple(intermediate.shape)]
         for order in range(self.correlation_order - 1, 0, -1):
-            basis, weight = self._validated_state(output_index, order)
+            basis, weight = self._validated_state(
+                output_index, order, basis_bank
+            )
             weighted = self._central_weighted(central, weight, basis, order)
             if weighted.shape != intermediate.shape:
                 raise _error(
@@ -536,8 +652,11 @@ class FactorizedSymmetricContraction(nn.Module):
         order: int,
         central: torch.Tensor,
         density: torch.Tensor,
+        basis_bank: SymmetricCGBasisBank | None,
     ) -> torch.Tensor:
-        basis, weight = self._validated_state(output_index, order)
+        basis, weight = self._validated_state(
+            output_index, order, basis_bank
+        )
         value = self._start_order(central, weight, basis, density, order)
         for _ in range(order - 1):
             value = self._contract_one_density(value, density)
@@ -570,6 +689,7 @@ class FactorizedSymmetricContraction(nn.Module):
         central: torch.Tensor,
         *,
         return_order_contributions: bool = False,
+        basis_bank: SymmetricCGBasisBank | None = None,
     ) -> SymmetricContractionResult:
         if not isinstance(density, torch.Tensor) or density.ndim != 2:
             raise _error(
@@ -639,7 +759,9 @@ class FactorizedSymmetricContraction(nn.Module):
         output_blocks = []
         intermediate_shapes = []
         for output_index in range(len(self.requested_output_irreps)):
-            block, shapes = self._horner_output(output_index, central, packed)
+            block, shapes = self._horner_output(
+                output_index, central, packed, basis_bank
+            )
             output_blocks.append(block)
             intermediate_shapes.extend(shapes)
         output = self._flatten_outputs(output_blocks)
@@ -650,7 +772,11 @@ class FactorizedSymmetricContraction(nn.Module):
             for order in range(1, self.correlation_order + 1):
                 blocks = [
                     self._pure_order_output(
-                        output_index, order, central, packed
+                        output_index,
+                        order,
+                        central,
+                        packed,
+                        basis_bank,
                     )
                     for output_index in range(len(self.requested_output_irreps))
                 ]
