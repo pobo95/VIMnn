@@ -44,7 +44,7 @@ def _fingerprint_tensor(digest, tensor):
 
 class ReferenceSitePotential(nn.Module):
     def __init__(self,config:PotentialConfig,topology,phase_modes,phase_mode_weights,species_alignment_weights,site_alignment_weights,phase_channel_weights,atomic_baseline=None):
-        super().__init__(); config.validate(); self.config=config; self.topology=topology
+        config.validate(); config.higher_body.require_legacy_execution("ReferenceSitePotential"); super().__init__(); self.config=config; self.topology=topology
         self.register_buffer('phase_modes',phase_modes); self.register_buffer('phase_mode_weights',phase_mode_weights); self.register_buffer('species_alignment_weights',species_alignment_weights); self.register_buffer('site_alignment_weights',site_alignment_weights); self.register_buffer('phase_channel_weights',phase_channel_weights)
         baseline=torch.zeros(len(config.species_vocabulary),dtype=topology.reference_cell.dtype) if atomic_baseline is None else torch.as_tensor(atomic_baseline,dtype=topology.reference_cell.dtype)
         if baseline.shape!=(len(config.species_vocabulary),): raise ValueError('atomic baseline shape mismatch')

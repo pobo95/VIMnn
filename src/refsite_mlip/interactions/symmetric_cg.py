@@ -13,10 +13,12 @@ multiplicity, sites, edges, and model state are deliberately absent.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import itertools
+import json
 import math
 from numbers import Integral
-from typing import Any
+from typing import Any, Mapping
 
 import torch
 
@@ -26,6 +28,11 @@ from refsite_mlip.compatibility import import_e3nn_0_4_4
 _SUPPORTED_ORDERS = (1, 2, 3)
 _SUPPORTED_NORMALIZATIONS = ("component",)
 _SUPPORTED_MATERIALIZATION_DTYPES = (torch.float32, torch.float64)
+SYMMETRIC_CG_BASIS_VERSION = "full_path_real_cg_e3nn_0_4_4_v1"
+SYMMETRIC_CG_FINGERPRINT_SCHEMA_VERSION = "symmetric_cg_basis_fingerprint_v1"
+SYMMETRIC_CG_PATH_ORDERING = (
+    "output_irrep_order_then_input_block_lexicographic_then_intermediate_l_ascending_v1"
+)
 
 
 class SymmetricCGError(ValueError):
@@ -212,6 +219,74 @@ class GeneralizedCGCoefficients:
             for path in self.paths
             if path.metadata.output_irrep == output_irrep
         )
+
+
+@dataclass(frozen=True)
+class SymmetricCGBasisBufferMetadata:
+    correlation_order: int
+    output_irrep: str
+    output_index: int
+    path_count: int
+    buffer_name: str
+    tensor_shape: tuple[int, ...]
+
+
+def _ordered_coefficient_collection(values: Any) -> tuple[GeneralizedCGCoefficients, ...]:
+    if isinstance(values, Mapping):
+        source=tuple(values.values())
+    elif isinstance(values,(tuple,list)):
+        source=tuple(values)
+    else:
+        raise TypeError("coefficient collection must be a mapping or sequence")
+    if not source or any(not isinstance(value,GeneralizedCGCoefficients) for value in source):
+        raise TypeError("coefficient collection must contain generalized-CG results")
+    ordered=tuple(sorted(source,key=lambda value:value.correlation_order))
+    orders=tuple(value.correlation_order for value in ordered)
+    if len(set(orders))!=len(orders):
+        raise ValueError("coefficient collection orders must be unique")
+    first=ordered[0]
+    for value in ordered:
+        if value.input_irreps!=first.input_irreps or value.requested_output_irreps!=first.requested_output_irreps or value.normalization!=first.normalization or value.canonical_dtype!="float64":
+            raise ValueError("coefficient collection has incompatible architecture metadata")
+    return ordered
+
+
+def fingerprint_generalized_cg_basis(
+    coefficients: Mapping[int,GeneralizedCGCoefficients]|tuple[GeneralizedCGCoefficients,...]|list[GeneralizedCGCoefficients],
+    *,
+    basis_version: str=SYMMETRIC_CG_BASIS_VERSION,
+) -> str:
+    """SHA-256 identity of canonical CPU-float64 generalized-CG content."""
+    if basis_version!=SYMMETRIC_CG_BASIS_VERSION:
+        raise _error("UNSUPPORTED_BASIS_VERSION",f"basis_version must be {SYMMETRIC_CG_BASIS_VERSION!r}",field="basis_version")
+    ordered=_ordered_coefficient_collection(coefficients)
+    first=ordered[0]
+    header={
+        "schema_version":SYMMETRIC_CG_FINGERPRINT_SCHEMA_VERSION,
+        "basis_version":basis_version,
+        "e3nn_convention_version":"0.4.4",
+        "input_irreps":first.input_irreps,
+        "requested_output_irreps":first.requested_output_irreps,
+        "correlation_order":ordered[-1].correlation_order,
+        "normalization":first.normalization,
+        "canonical_path_ordering":SYMMETRIC_CG_PATH_ORDERING,
+        "canonical_dtype":"float64",
+    }
+    digest=hashlib.sha256()
+    encoded=json.dumps(header,sort_keys=True,separators=(",",":"),allow_nan=False).encode("utf-8")
+    digest.update(len(encoded).to_bytes(8,"little")); digest.update(encoded)
+    for result in ordered:
+        outputs=[{"output_irrep":item.output_irrep,"output_index":item.output_index,"path_count":item.path_count,"nonzero_path_count":item.nonzero_path_count} for item in result.outputs]
+        encoded=json.dumps({"correlation_order":result.correlation_order,"outputs":outputs},sort_keys=True,separators=(",",":"),allow_nan=False).encode("utf-8")
+        digest.update(len(encoded).to_bytes(8,"little")); digest.update(encoded)
+        for path in result.paths:
+            metadata=path.metadata
+            plain={"correlation_order":metadata.correlation_order,"output_irrep":metadata.output_irrep,"path_index":metadata.path_index,"input_irreps":list(metadata.input_irreps),"intermediate_irreps":list(metadata.intermediate_irreps),"coefficient_dtype":"float64","coefficient_shape":list(metadata.coefficient_shape),"nonzero":metadata.nonzero}
+            encoded=json.dumps(plain,sort_keys=True,separators=(",",":"),allow_nan=False).encode("utf-8")
+            digest.update(len(encoded).to_bytes(8,"little")); digest.update(encoded)
+            tensor=path.coefficient.detach().cpu().contiguous()
+            digest.update(tensor.numel().to_bytes(8,"little")); digest.update(tensor.numpy().tobytes(order="C"))
+    return digest.hexdigest()
 
 
 def _validated_order(value: Any) -> int:
@@ -452,12 +527,100 @@ def generate_generalized_cg(
     )
 
 
+class SymmetricCGBasisBank(torch.nn.Module):
+    """Single persistent owner for one full-path generalized-CG architecture."""
+    def __init__(
+        self,
+        input_irreps: Any,
+        requested_output_irreps: Any,
+        correlation_order: int,
+        *,
+        basis_version: str=SYMMETRIC_CG_BASIS_VERSION,
+        normalization: str="component",
+        dtype: torch.dtype=torch.float64,
+        device: torch.device|str="cpu",
+    ) -> None:
+        super().__init__()
+        order=_validated_order(correlation_order)
+        if basis_version!=SYMMETRIC_CG_BASIS_VERSION:
+            raise _error("UNSUPPORTED_BASIS_VERSION",f"basis_version must be {SYMMETRIC_CG_BASIS_VERSION!r}",field="basis_version")
+        if normalization!="component":
+            raise _error("UNSUPPORTED_NORMALIZATION","only e3nn component normalization is supported",field="normalization")
+        if dtype not in _SUPPORTED_MATERIALIZATION_DTYPES:
+            raise _error("UNSUPPORTED_MATERIALIZATION_DTYPE","basis bank dtype must be torch.float32 or torch.float64",field="dtype")
+        try:
+            target=torch.device(device)
+        except (TypeError,RuntimeError) as error:
+            raise _error("INVALID_MATERIALIZATION_DEVICE",f"invalid basis bank device: {error}",field="device") from error
+        inputs=_parse_multiplicity_free_irreps(input_irreps,field="input_irreps")
+        outputs=_parse_multiplicity_free_irreps(requested_output_irreps,field="requested_output_irreps")
+        if max(irrep.l for _,irrep in inputs)>2 or max(irrep.l for _,irrep in outputs)>2:
+            raise _error("UNSUPPORTED_ANGULAR_MOMENTUM","symmetric-power v2 supports lmax <= 2",field="irreps")
+        if any(irrep.p!=(-1)**irrep.l for _,irrep in inputs) or any(irrep.p!=(-1)**irrep.l for _,irrep in outputs):
+            raise _error("UNSUPPORTED_PARITY_LAYOUT","symmetric-power v2 requires natural O(3) parity (-1)^l",field="irreps")
+        generated=tuple(generate_generalized_cg(inputs,outputs,current,normalization=normalization) for current in range(1,order+1))
+        self.input_irreps=str(inputs)
+        self.requested_output_irreps=str(outputs)
+        self.correlation_order=order
+        self.basis_kind="full_path"
+        self.basis_version=basis_version
+        self.normalization=normalization
+        self.canonical_dtype="float64"
+        self.canonical_path_ordering=SYMMETRIC_CG_PATH_ORDERING
+        self.basis_fingerprint=fingerprint_generalized_cg_basis(generated,basis_version=basis_version)
+        self.order_fingerprints=tuple((value.correlation_order,fingerprint_generalized_cg_basis((value,),basis_version=basis_version)) for value in generated)
+        entries=[]
+        for value in generated:
+            for output in value.outputs:
+                paths=value.paths_for(output.output_irrep)
+                if not paths:
+                    raise _error("MISSING_CG_PATH",f"no full-path basis for order={value.correlation_order}, output={output.output_irrep}",field="basis")
+                tensor=torch.stack(tuple(path.coefficient for path in paths),dim=0).to(device=target,dtype=dtype)
+                name=f"U_order_{value.correlation_order}_output_{output.output_index}"
+                self.register_buffer(name,tensor,persistent=True)
+                entries.append(SymmetricCGBasisBufferMetadata(value.correlation_order,output.output_irrep,output.output_index,len(paths),name,tuple(tensor.shape)))
+        self.buffer_metadata=tuple(entries)
+
+    def basis_tensor(self,correlation_order:int,output_irrep:str)->torch.Tensor:
+        order=_validated_order(correlation_order)
+        matches=tuple(item for item in self.buffer_metadata if item.correlation_order==order and item.output_irrep==output_irrep)
+        if len(matches)!=1:
+            raise _error("MISSING_CG_PATH",f"basis bank has no unique order={order}, output={output_irrep!r}",field="basis")
+        tensor=self._buffers.get(matches[0].buffer_name)
+        if not isinstance(tensor,torch.Tensor):
+            raise _error("MISSING_CG_PATH","persistent basis buffer is missing",field=matches[0].buffer_name)
+        return tensor
+
+    @property
+    def buffer_byte_count(self)->int:
+        return sum(value.numel()*value.element_size() for value in self.buffers())
+
+    def validate_integrity(self)->None:
+        generated=tuple(generate_generalized_cg(self.input_irreps,self.requested_output_irreps,current,normalization=self.normalization) for current in range(1,self.correlation_order+1))
+        observed=fingerprint_generalized_cg_basis(generated,basis_version=self.basis_version)
+        if observed!=self.basis_fingerprint:
+            raise _error("BASIS_FINGERPRINT_MISMATCH","canonical generalized-CG architecture fingerprint changed",field="basis_fingerprint")
+        for value in generated:
+            for output in value.outputs:
+                expected=torch.stack(tuple(path.coefficient for path in value.paths_for(output.output_irrep)),dim=0)
+                actual=self.basis_tensor(value.correlation_order,output.output_irrep)
+                expected=expected.to(device=actual.device,dtype=actual.dtype)
+                if tuple(actual.shape)!=tuple(expected.shape) or not torch.equal(actual,expected):
+                    raise _error("BASIS_BUFFER_MISMATCH",f"runtime U differs for order={value.correlation_order}, output={output.output_irrep}",field="basis")
+
+
 __all__ = [
     "AngularIrrepBlock",
     "GeneralizedCGCoefficients",
     "GeneralizedCGOutputMetadata",
     "GeneralizedCGPath",
     "GeneralizedCGPathMetadata",
+    "SYMMETRIC_CG_BASIS_VERSION",
+    "SYMMETRIC_CG_FINGERPRINT_SCHEMA_VERSION",
+    "SYMMETRIC_CG_PATH_ORDERING",
+    "SymmetricCGBasisBank",
+    "SymmetricCGBasisBufferMetadata",
     "SymmetricCGError",
+    "fingerprint_generalized_cg_basis",
     "generate_generalized_cg",
 ]
