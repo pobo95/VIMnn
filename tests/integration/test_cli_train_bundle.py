@@ -137,6 +137,7 @@ def test_synthetic_cpu_float64_one_epoch_writes_recoverable_state(
         "preflight.json",
         "resolved_config.json",
         "run_status.json",
+        "training.log",
     ]
     checkpoints = output / "checkpoints"
     assert sorted(path.name for path in checkpoints.iterdir()) == [
@@ -165,6 +166,7 @@ def test_synthetic_cpu_float64_one_epoch_writes_recoverable_state(
     metric = json.loads(metric_lines[0])
     assert metric["event"] == "epoch_committed"
     assert metric["epoch_index"] == 0
+    assert (output / "training.log").read_text(encoding="utf-8") == captured.err
     assert render_train_result_json(report) == render_train_result_json(
         dict(reversed(tuple(report.items())))
     )
@@ -218,8 +220,14 @@ def test_bundle_progress_summary_and_quiet_are_trajectory_neutral(
     assert "checkpoint=epoch_000000.pt" in rendered
     assert "elapsed=2.5s eta=0.0s" in rendered
     assert rendered.rstrip().endswith("latest=latest.pt")
+    assert (
+        visible_root / "run-output" / "training.log"
+    ).read_text(encoding="utf-8") == rendered
     assert quiet_stream.getvalue().startswith("Training completed |")
     assert "Epoch " not in quiet_stream.getvalue()
+    assert (
+        quiet_root / "run-output" / "training.log"
+    ).read_text(encoding="utf-8") == quiet_stream.getvalue()
     assert first_journal == second_journal
     assert first_draws == second_draws
     assert first["config_fingerprint"] == second["config_fingerprint"]

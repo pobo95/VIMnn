@@ -592,19 +592,22 @@ def _run_train(args: argparse.Namespace) -> int:
         TrainingProgressConfig(enabled=not args.quiet),
         stream=sys.stderr,
     )
-    result = run_training(
-        _training_config_path(args),
-        dry_run=args.dry_run,
-        progress_renderer=progress_renderer,
-        overrides=_training_config_overrides(args),
-    )
-    output = (
-        render_train_result_json(result)
-        if args.json_output
-        else render_train_result_human(result)
-    )
-    print(output)
-    return 0
+    try:
+        result = run_training(
+            _training_config_path(args),
+            dry_run=args.dry_run,
+            progress_renderer=progress_renderer,
+            overrides=_training_config_overrides(args),
+        )
+        output = (
+            render_train_result_json(result)
+            if args.json_output
+            else render_train_result_human(result)
+        )
+        print(output)
+        return 0
+    finally:
+        progress_renderer.close_log()
 
 
 def _run_resume(args: argparse.Namespace) -> int:
@@ -619,19 +622,22 @@ def _run_resume(args: argparse.Namespace) -> int:
         TrainingProgressConfig(enabled=not args.quiet),
         stream=sys.stderr,
     )
-    result = resume_training(
-        args.run_directory,
-        max_epochs=args.max_epochs,
-        dry_run=args.dry_run,
-        progress_renderer=progress_renderer,
-    )
-    output = (
-        render_resume_json(result)
-        if args.json_output
-        else render_resume_human(result)
-    )
-    print(output)
-    return 0
+    try:
+        result = resume_training(
+            args.run_directory,
+            max_epochs=args.max_epochs,
+            dry_run=args.dry_run,
+            progress_renderer=progress_renderer,
+        )
+        output = (
+            render_resume_json(result)
+            if args.json_output
+            else render_resume_human(result)
+        )
+        print(output)
+        return 0
+    finally:
+        progress_renderer.close_log()
 
 
 def _run_export_bundle(args: argparse.Namespace) -> int:

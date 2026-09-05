@@ -2106,6 +2106,11 @@ def _execute_resume(
     progress_renderer: TrainingProgressRenderer | None,
 ) -> dict[str, Any]:
     max_epochs = int(preflight.report["requested_max_epochs"])
+    if progress_renderer is not None:
+        progress_renderer.attach_log(
+            preflight.directory.training_log_path,
+            append=True,
+        )
     journal, provenance = _recheck_resume_sources(preflight, lock)
     phase = "metrics_journal.reconcile"
     prepared: _PreparedTrainingRuntime | None = None

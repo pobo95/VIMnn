@@ -73,6 +73,27 @@ from .validate_train_config import (
 TRAINING_RESULT_SCHEMA_VERSION = "refsite_training_run_result_v1"
 
 
+def _attach_training_progress_log(
+    progress_renderer: Any | None,
+    path: Path,
+    *,
+    append: bool,
+) -> None:
+    """Attach the optional non-semantic transcript without affecting training."""
+
+    if progress_renderer is None:
+        return
+    attach = getattr(progress_renderer, "attach_log", None)
+    if not callable(attach):
+        return
+    try:
+        attach(path, append=append)
+    except Exception:
+        # Presentation is explicitly outside the training transaction.  The
+        # concrete renderer records its own log_error for diagnostics.
+        return
+
+
 @dataclass(frozen=True)
 class _PreparedTrainingRuntime:
     bundle: Any
@@ -1407,8 +1428,20 @@ def _run_training_impl(
         )
 
         try:
+            scratch_log_path: Path | None = None
             if progress_renderer is not None:
                 progress_renderer.render_stage("initializing training run")
+                scratch_log_path = Path(
+                    str(resolved.runtime_paths["output_directory"])
+                ) / "training.log"
+
+            def observe_scratch_event(event: str) -> None:
+                if event == "lock_acquired" and scratch_log_path is not None:
+                    _attach_training_progress_log(
+                        progress_renderer,
+                        scratch_log_path,
+                        append=False,
+                    )
 
             def observe_startup(startup: Any) -> None:
                 if progress_renderer is None:
@@ -1423,6 +1456,7 @@ def _run_training_impl(
             scratch_presentation: dict[str, Any] = {}
             if progress_renderer is not None:
                 scratch_presentation.update(
+                    event_callback=observe_scratch_event,
                     startup_observer=observe_startup,
                     committed_epoch_observer=progress_renderer,
                 )
@@ -1486,6 +1520,11 @@ def _run_training_impl(
         ) from error
     try:
         with lock:
+            _attach_training_progress_log(
+                progress_renderer,
+                directory.training_log_path,
+                append=False,
+            )
             return _execute_training(
                 config,
                 resolved,

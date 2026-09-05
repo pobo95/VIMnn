@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import FrozenInstanceError
 import io
 import math
+from pathlib import Path
 
 import pytest
 
@@ -351,6 +352,94 @@ def test_flush_failure_disables_progress_without_second_write(error: OSError) ->
     assert stream.flushes == 1
     assert renderer.presentation_error is not None
     assert renderer.presentation_error.original_error is error
+
+
+def test_run_log_replays_early_output_and_matches_console(tmp_path: Path) -> None:
+    stream = io.StringIO()
+    renderer = TrainingProgressRenderer(
+        stream=stream,
+        monotonic=_Clock(10.0, 12.0),
+    )
+    renderer.render_stage("loading training configuration")
+    log_path = tmp_path / "training.log"
+    renderer.attach_log(log_path, append=False)
+    renderer.render_start(_summary(max_epochs=1))
+    renderer.render_epoch(_event())
+    renderer.render_terminal(
+        "completed",
+        epochs=1,
+        global_step=2,
+        latest_checkpoint="latest.pt",
+    )
+    renderer.close_log()
+
+    assert renderer.log_path == log_path.absolute()
+    assert renderer.log_error is None
+    assert log_path.read_text(encoding="utf-8") == stream.getvalue()
+    assert log_path.read_text(encoding="utf-8").startswith(
+        "refsite-mlip: loading training configuration\n"
+    )
+
+
+def test_resume_log_appends_and_preserves_existing_prefix(tmp_path: Path) -> None:
+    log_path = tmp_path / "training.log"
+    first_stream = io.StringIO()
+    first = TrainingProgressRenderer(stream=first_stream)
+    first.render_stage("first session")
+    first.attach_log(log_path, append=False)
+    first.render_terminal("completed", epochs=1, global_step=2)
+    first.close_log()
+    prefix = log_path.read_bytes()
+
+    resumed_stream = io.StringIO()
+    resumed = TrainingProgressRenderer(stream=resumed_stream)
+    resumed.render_stage("loading resumed run")
+    resumed.attach_log(log_path, append=True)
+    resumed.render_terminal("completed", epochs=2, global_step=4)
+    resumed.close_log()
+
+    assert log_path.read_bytes().startswith(prefix)
+    assert log_path.read_bytes()[len(prefix) :] == resumed_stream.getvalue().encode()
+
+
+def test_console_failure_does_not_disable_attached_run_log(tmp_path: Path) -> None:
+    log_path = tmp_path / "training.log"
+    renderer = TrainingProgressRenderer(
+        stream=_FailingStream(BrokenPipeError("closed"))
+    )
+    renderer.attach_log(log_path, append=False)
+    renderer.render_stage("first")
+    renderer.render_stage("second")
+    renderer.render_terminal("completed", epochs=1, global_step=2)
+    renderer.close_log()
+
+    assert renderer.presentation_error is not None
+    assert renderer.log_error is None
+    assert log_path.read_text(encoding="utf-8") == (
+        "refsite-mlip: first\n"
+        "refsite-mlip: second\n"
+        "Training completed | epochs=1 step=2 best_epoch=n/a "
+        "best=n/a latest=n/a\n"
+    )
+
+
+def test_run_log_rejects_symlink_without_interrupting_console(tmp_path: Path) -> None:
+    target = tmp_path / "target.log"
+    target.write_text("owned by another target\n", encoding="utf-8")
+    link = tmp_path / "training.log"
+    link.symlink_to(target)
+    stream = io.StringIO()
+    renderer = TrainingProgressRenderer(stream=stream)
+
+    renderer.render_stage("before attach")
+    renderer.attach_log(link, append=True)
+    renderer.render_stage("after attach")
+
+    assert renderer.log_error is not None
+    assert renderer.enabled
+    assert target.read_text(encoding="utf-8") == "owned by another target\n"
+    assert "before attach" in stream.getvalue()
+    assert "after attach" in stream.getvalue()
 
 
 def test_quiet_suppresses_progress_but_not_terminal_result() -> None:

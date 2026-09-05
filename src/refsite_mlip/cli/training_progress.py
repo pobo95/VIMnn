@@ -11,6 +11,9 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 import math
 from numbers import Integral, Real
+import os
+from pathlib import Path
+import stat
 import sys
 import time
 from typing import TextIO
@@ -22,6 +25,7 @@ from refsite_mlip.training.metrics_journal import (
 
 
 TRAINING_PROGRESS_CONFIG_VERSION = "refsite_training_progress_config_v1"
+TRAINING_LOG_FILENAME = "training.log"
 
 
 def _bool(name: str, value: object) -> bool:
@@ -474,6 +478,11 @@ class TrainingProgressRenderer:
         self._monotonic = monotonic
         self._io_available = True
         self._presentation_error: TrainingProgressError | None = None
+        self._log_stream: TextIO | None = None
+        self._log_path: Path | None = None
+        self._log_available = False
+        self._log_error: TrainingProgressError | None = None
+        self._pending_log_values: list[str] = []
         self._summary: TrainingStartSummary | None = None
         self._session_started_at: float | None = None
         self._session_event_count = 0
@@ -484,15 +493,112 @@ class TrainingProgressRenderer:
 
     @property
     def enabled(self) -> bool:
-        return self._config.enabled and self._io_available
+        return self._config.enabled and (
+            self._io_available or self._log_available
+        )
 
     @property
     def presentation_error(self) -> TrainingProgressError | None:
         return self._presentation_error
 
     @property
+    def log_path(self) -> Path | None:
+        return self._log_path
+
+    @property
+    def log_error(self) -> TrainingProgressError | None:
+        return self._log_error
+
+    @property
     def session_event_count(self) -> int:
         return self._session_event_count
+
+    def attach_log(
+        self,
+        path: str | os.PathLike[str],
+        *,
+        append: bool,
+    ) -> None:
+        """Tee presentation output to a run-local UTF-8 transcript.
+
+        Values rendered before the run directory exists are retained and
+        replayed exactly once when the log is attached.  Fresh runs use
+        exclusive creation; resume appends without following a target
+        symlink.  Log I/O remains presentation-only and can never replace the
+        training outcome.
+        """
+
+        if type(append) is not bool:
+            raise TypeError("append must be a bool")
+        target = Path(path).absolute()
+        if self._log_stream is not None:
+            if self._log_path == target and self._log_available:
+                return
+            self._record_log_error(
+                RuntimeError("a different training progress log is already attached")
+            )
+            return
+
+        descriptor = -1
+        stream: TextIO | None = None
+        try:
+            try:
+                target_status = target.lstat()
+            except FileNotFoundError:
+                target_status = None
+            if target_status is not None and stat.S_ISLNK(target_status.st_mode):
+                raise OSError("training progress log target must not be a symlink")
+
+            flags = os.O_WRONLY | os.O_CREAT
+            flags |= os.O_APPEND if append else os.O_EXCL
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            descriptor = os.open(target, flags, 0o600)
+            opened_status = os.fstat(descriptor)
+            if not stat.S_ISREG(opened_status.st_mode):
+                raise OSError("training progress log target must be a regular file")
+            stream = os.fdopen(
+                descriptor,
+                "a" if append else "w",
+                encoding="utf-8",
+                newline="\n",
+                buffering=1,
+            )
+            descriptor = -1
+            pending = "".join(self._pending_log_values)
+            if pending:
+                stream.write(pending)
+                stream.flush()
+            self._pending_log_values.clear()
+            self._log_stream = stream
+            self._log_path = target
+            self._log_available = True
+        except Exception as error:
+            if stream is not None:
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+            elif descriptor >= 0:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+            self._record_log_error(error)
+
+    def close_log(self) -> None:
+        """Best-effort close of the optional presentation transcript."""
+
+        stream = self._log_stream
+        self._log_stream = None
+        self._log_available = False
+        if stream is None:
+            return
+        try:
+            stream.flush()
+            stream.close()
+        except Exception as error:
+            self._record_log_error(error)
 
     def render_stage(self, message: str) -> None:
         if not self.enabled:
@@ -571,7 +677,7 @@ class TrainingProgressRenderer:
     ) -> None:
         # --quiet suppresses progress only; terminal information remains. A
         # failed stream, however, is never written again.
-        if not self._io_available:
+        if not self._io_available and not self._log_available:
             return
         try:
             self._write(
@@ -591,16 +697,52 @@ class TrainingProgressRenderer:
             self._disable(error)
 
     def _write(self, value: str) -> None:
-        self._stream.write(value)
-        self._stream.flush()
+        if self._log_stream is None and self._log_error is None:
+            self._pending_log_values.append(value)
+        elif self._log_available and self._log_stream is not None:
+            try:
+                self._log_stream.write(value)
+                self._log_stream.flush()
+            except Exception as error:
+                self._disable_log(error)
+
+        if self._io_available:
+            try:
+                self._stream.write(value)
+                self._stream.flush()
+            except Exception as error:
+                self._record_presentation_error(error)
+                self._io_available = False
 
     def _disable(self, error: Exception) -> None:
+        self._record_presentation_error(error)
+        self._io_available = False
+        self._disable_log(error)
+
+    def _record_presentation_error(self, error: Exception) -> None:
         if self._presentation_error is None:
             self._presentation_error = TrainingProgressError(
                 "training console progress was disabled after a presentation failure",
                 original_error=error,
             )
-        self._io_available = False
+
+    def _record_log_error(self, error: Exception) -> None:
+        if self._log_error is None:
+            self._log_error = TrainingProgressError(
+                "automatic training progress log was disabled after an I/O failure",
+                original_error=error,
+            )
+
+    def _disable_log(self, error: Exception) -> None:
+        self._record_log_error(error)
+        stream = self._log_stream
+        self._log_stream = None
+        self._log_available = False
+        if stream is not None:
+            try:
+                stream.close()
+            except Exception:
+                pass
 
     def _float(self, value: float) -> str:
         return format(_finite("display value", value), f".{self._config.float_precision}g")
@@ -895,6 +1037,7 @@ def _learning_rates(
 
 
 __all__ = [
+    "TRAINING_LOG_FILENAME",
     "TRAINING_PROGRESS_CONFIG_VERSION",
     "TrainingProgressConfig",
     "TrainingProgressError",

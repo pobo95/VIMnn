@@ -280,6 +280,9 @@ def test_resume_recovers_a_missing_committed_journal_suffix_before_continuing(
     assert "elapsed=2.0s eta=0.0s" in rendered
     assert "Training completed | epochs=2 step=2" in rendered
     assert renderer.session_event_count == 1
+    assert (run_directory / "training.log").read_text(
+        encoding="utf-8"
+    ) == rendered
 
 
 def test_resume_journal_failure_preserves_checkpoint_and_next_resume_recovers(
@@ -362,7 +365,10 @@ def test_resume_console_broken_pipe_is_nonfatal_after_journal_commit(
     assert resumed["metrics_event_count"] == 2
     assert renderer.presentation_error is not None
     assert renderer.presentation_error.original_exception_type == "BrokenPipeError"
-    assert renderer.session_event_count == 0
+    assert renderer.session_event_count == 1
+    training_log = (run_directory / "training.log").read_text(encoding="utf-8")
+    assert "Epoch 002/2" in training_log
+    assert "Training completed | epochs=2 step=2" in training_log
     events = (
         (run_directory / "metrics.jsonl")
         .read_text(encoding="utf-8")

@@ -794,6 +794,9 @@ def test_cli_positional_and_config_alias_execute_scratch_training(tmp_path, caps
     assert "Reference-site MLIP training" in positional.err
     assert "Source: scratch" in positional.err
     assert "Epoch 001/1" in positional.err
+    assert Path(
+        first_preparation.runtime_paths["output_directory"], "training.log"
+    ).read_text(encoding="utf-8") == positional.err
     first_checkpoint = load_training_checkpoint(
         positional_report["latest_checkpoint"]
     )
@@ -809,6 +812,9 @@ def test_cli_positional_and_config_alias_execute_scratch_training(tmp_path, caps
     option_report = json.loads(option.out)
     assert option_report["status"] == "completed"
     assert "refsite-mlip: training started" in option.err
+    assert Path(
+        second_preparation.runtime_paths["output_directory"], "training.log"
+    ).read_text(encoding="utf-8") == option.err
     second_checkpoint = load_training_checkpoint(
         option_report["latest_checkpoint"]
     )

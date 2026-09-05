@@ -333,6 +333,12 @@ class TrainingRunDirectory:
     def metrics_path(self) -> Path:
         return self.root / "metrics.jsonl"
 
+    @property
+    def training_log_path(self) -> Path:
+        """Non-semantic human-readable CLI progress transcript."""
+
+        return self.root / "training.log"
+
     def write_resolved_config(self, value: Mapping[str, Any]) -> None:
         _atomic_write_text(
             self.resolved_config_path,
