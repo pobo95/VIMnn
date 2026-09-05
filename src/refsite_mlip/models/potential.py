@@ -8,7 +8,8 @@ from refsite_mlip.compatibility import import_e3nn_0_4_4
 from refsite_mlip.features import build_probability_multipoles,build_sparse_probability_multipoles
 from refsite_mlip.geometry.reference import aligned_reference_sites
 from refsite_mlip.graph import update_reference_edge_geometry
-from refsite_mlip.interactions import CentralConditioner,EquivariantNodeEncoder,squared_edge_radial_basis
+from refsite_mlip.interactions import CentralConditioner,EquivariantNodeEncoder,SymmetricCGBasisBank,squared_edge_radial_basis
+from refsite_mlip.interactions.higher_body import LEGACY_HIGHER_BODY_CONTRACT_VERSION,SYMMETRIC_POWER_CONTRACT_VERSION,HigherBodyArchitectureError
 from refsite_mlip.phase.initialization import primary_phase_initialization
 from refsite_mlip.phase.evaluation import solve_evaluation_phase
 from refsite_mlip.phase.modes import (
@@ -44,15 +45,51 @@ def _fingerprint_tensor(digest, tensor):
 
 class ReferenceSitePotential(nn.Module):
     def __init__(self,config:PotentialConfig,topology,phase_modes,phase_mode_weights,species_alignment_weights,site_alignment_weights,phase_channel_weights,atomic_baseline=None):
-        config.validate(); config.higher_body.require_legacy_execution("ReferenceSitePotential"); super().__init__(); self.config=config; self.topology=topology
+        config.validate()
+        higher=config.higher_body
+        symmetric_basis=None
+        if higher.contract_version==LEGACY_HIGHER_BODY_CONTRACT_VERSION:
+            higher.require_legacy_execution("ReferenceSitePotential")
+        elif higher.contract_version==SYMMETRIC_POWER_CONTRACT_VERSION:
+            # Build and validate the fixed angular architecture before any
+            # trainable parameter is created or the caller RNG is consumed.
+            try:
+                _,o3=import_e3nn_0_4_4()
+                coupling_irreps=o3.Irreps([(1,o3.Irrep(l,1 if l%2==0 else -1)) for l in range(higher.lmax+1)])
+                symmetric=higher.symmetric_correlation
+                symmetric_basis=SymmetricCGBasisBank(
+                    coupling_irreps,
+                    coupling_irreps,
+                    symmetric.correlation_order,
+                    basis_version=symmetric.basis_version,
+                    normalization=symmetric.normalization,
+                    dtype=topology.reference_cell.dtype,
+                    device=topology.reference_cell.device,
+                )
+                symmetric_basis.validate_integrity()
+            except Exception as error:
+                reason=getattr(error,"reason_code","SYMMETRIC_CORRELATION_INVALID")
+                raise HigherBodyArchitectureError(
+                    reason,
+                    "ReferenceSitePotential symmetric correlation architecture "
+                    f"validation failed: {type(error).__name__}: {error}",
+                ) from error
+        else:
+            raise HigherBodyArchitectureError("UNSUPPORTED_HIGHER_BODY_CONTRACT",f"ReferenceSitePotential cannot execute {higher.contract_version!r}")
+        super().__init__(); self.config=config; self.topology=topology
         self.register_buffer('phase_modes',phase_modes); self.register_buffer('phase_mode_weights',phase_mode_weights); self.register_buffer('species_alignment_weights',species_alignment_weights); self.register_buffer('site_alignment_weights',site_alignment_weights); self.register_buffer('phase_channel_weights',phase_channel_weights)
         baseline=torch.zeros(len(config.species_vocabulary),dtype=topology.reference_cell.dtype) if atomic_baseline is None else torch.as_tensor(atomic_baseline,dtype=topology.reference_cell.dtype)
         if baseline.shape!=(len(config.species_vocabulary),): raise ValueError('atomic baseline shape mismatch')
         self.register_buffer('atomic_baseline',baseline)
-        _,o3=import_e3nn_0_4_4(); higher=config.higher_body; self.central=CentralConditioner(higher.species_count,higher.site_type_count,higher.site_type_embedding_dim)
+        if symmetric_basis is not None: self.symmetric_cg_basis=symmetric_basis
+        _,o3=import_e3nn_0_4_4(); self.central=CentralConditioner(higher.species_count,higher.site_type_count,higher.site_type_embedding_dim)
         self.irreps_hidden=o3.Irreps([(higher.n_correlation_channels,o3.Irrep(l,1 if l%2==0 else -1)) for l in range(higher.lmax+1)])
         self.probability_encoder=EquivariantNodeEncoder(config.feature_irreps,self.irreps_hidden); self.central_encoder=o3.Linear(self.central.irreps,self.irreps_hidden,biases=False)
-        beta=1/math.sqrt(config.num_layers); self.layers=nn.ModuleList([ResidualInteractionBlock(self.irreps_hidden,self.central.irreps,higher,beta) for _ in range(config.num_layers)])
+        beta=1/math.sqrt(config.num_layers)
+        if symmetric_basis is None:
+            self.layers=nn.ModuleList([ResidualInteractionBlock(self.irreps_hidden,self.central.irreps,higher,beta) for _ in range(config.num_layers)])
+        else:
+            self.layers=nn.ModuleList([ResidualInteractionBlock(self.irreps_hidden,self.central.irreps,higher,beta,basis_bank=symmetric_basis) for _ in range(config.num_layers)])
         scalar_dim=self.irreps_hidden[0].mul; self.scalar_slice=self.irreps_hidden.slices()[0]
         self.readout=SiteEnergyReadout(scalar_dim,self.central.num_channels,config.readout_hidden,config.energy_scale)
 
@@ -855,7 +892,10 @@ class ReferenceSitePotential(nn.Module):
         geometry=update_reference_edge_geometry(topology,cell,edge_length_scale=self.config.higher_body.edge_length_scale); radial=squared_edge_radial_basis(geometry.radial_coordinate,self.config.higher_body.radial_feature_dim)
         correlations=[]
         for layer in self.layers:
-            h,corr=layer(h,c_bar,topology.edge_index,geometry.edge_vectors,radial,geometry.cutoff_values)
+            if hasattr(self,"symmetric_cg_basis"):
+                h,corr=layer(h,c_bar,topology.edge_index,geometry.edge_vectors,radial,geometry.cutoff_values,symmetric_cg_basis=self.symmetric_cg_basis)
+            else:
+                h,corr=layer(h,c_bar,topology.edge_index,geometry.edge_vectors,radial,geometry.cutoff_values)
             if return_aux: correlations.append(corr)
         site_energy=self.readout(h[:,self.scalar_slice],c_bar); residual=site_energy.sum(); baseline=self.atomic_baseline.to(positions)[species].sum(); total=baseline+residual
         if solver_path == EVAL_ADAPTIVE and not bool(torch.isfinite(total).detach()):

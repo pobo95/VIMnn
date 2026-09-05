@@ -27,7 +27,7 @@ from refsite_mlip.interactions.symmetric_cg import (
     fingerprint_generalized_cg_basis,
     generate_generalized_cg,
 )
-from refsite_mlip.models import PotentialConfig, ReferenceSitePotential
+from refsite_mlip.models import PotentialConfig
 
 
 ANGULAR = "0e + 1o + 2e"
@@ -321,23 +321,10 @@ def test_basis_bank_cuda_float_materialization_preserves_canonical_fingerprint()
     assert all(value.device.type == "cuda" and value.dtype == torch.float32 for value in bank.buffers())
 
 
-def test_v2_execution_fails_before_legacy_parameters_or_rng_are_touched(monkeypatch):
+def test_standalone_legacy_higher_body_rejects_v2_before_rng_is_touched():
     higher = _v2_config()
     rng = torch.random.get_rng_state().clone()
     with pytest.raises(HigherBodyArchitectureError, match="SYMMETRIC_CORRELATION_NOT_INTEGRATED") as caught:
         CentralConditionedHigherBody(higher)
     assert caught.value.reason_code == "SYMMETRIC_CORRELATION_NOT_INTEGRATED"
-    assert torch.equal(torch.random.get_rng_state(), rng)
-
-    config = _potential_config(_potential_higher(v2=True))
-    import refsite_mlip.models.potential as potential_module
-
-    def forbidden(*args, **kwargs):
-        del args, kwargs
-        raise AssertionError("legacy residual block was partially created")
-
-    monkeypatch.setattr(potential_module, "ResidualInteractionBlock", forbidden)
-    rng = torch.random.get_rng_state().clone()
-    with pytest.raises(HigherBodyArchitectureError, match="SYMMETRIC_CORRELATION_NOT_INTEGRATED"):
-        ReferenceSitePotential(config, None, None, None, None, None, None)
     assert torch.equal(torch.random.get_rng_state(), rng)
