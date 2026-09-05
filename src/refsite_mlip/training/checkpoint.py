@@ -21,6 +21,11 @@ import torch
 from refsite_mlip._atomic import commit_temporary_file
 
 from refsite_mlip.data import StructureBatch
+from refsite_mlip.models import (
+    PotentialConfig,
+    validate_reference_site_model_state_contract,
+)
+from refsite_mlip.interactions.higher_body import SYMMETRIC_POWER_CONTRACT_VERSION
 
 from .fit import FitConfig, FitEpochRecord
 from .optimizer import validate_optimizer_binding
@@ -101,6 +106,11 @@ def _plain(value, *, path: str = "value"):
         return str(value)
     if isinstance(value, Enum):
         return _plain(value.value, path=path)
+    if isinstance(value, PotentialConfig):
+        # PotentialConfig has version-aware canonical serialization.  A raw
+        # dataclass walk would leak the v1-only ``correlation_mode`` field into
+        # the v2 payload and make the checkpoint impossible to reconstruct.
+        return _plain(value.to_dict(), path=path)
     if is_dataclass(value) and not isinstance(value, type):
         return {
             field.name: _plain(getattr(value, field.name), path=f"{path}.{field.name}")
@@ -664,6 +674,11 @@ def capture_training_checkpoint(
     if not isinstance(optimizer, torch.optim.Optimizer):
         raise TypeError("optimizer must be a torch optimizer")
     validate_optimizer_binding(model, optimizer)
+    validate_reference_site_model_state_contract(
+        model_config,
+        model.state_dict(),
+        validation_stage="checkpoint.capture.model_architecture",
+    )
     if not hasattr(scheduler, "state_dict"):
         raise TypeError("scheduler must provide state_dict")
     if not isinstance(selection_state, ModelSelectionState):
@@ -672,6 +687,12 @@ def capture_training_checkpoint(
         raise TypeError("progress must be a FitProgress")
     if not isinstance(fit_config, FitConfig):
         raise TypeError("fit_config must be a FitConfig")
+    _validate_symmetric_optimizer_state(
+        model,
+        optimizer.state_dict(),
+        optimizer,
+        require_initialized=progress.global_step > 0,
+    )
     if progress.stopped_early != selection_state.stopped_early:
         raise ValueError("progress and selection stopped_early states do not match")
     if progress.best_epoch != selection_state.best_epoch:
@@ -764,6 +785,73 @@ def capture_training_checkpoint(
         cuda_device_count=cuda_count,
         fit_history=history,
     )
+
+
+def _validate_symmetric_optimizer_state(
+    model: torch.nn.Module,
+    saved_optimizer_state: Mapping[str, Any],
+    optimizer: torch.optim.Optimizer,
+    *,
+    require_initialized: bool,
+) -> None:
+    """Bind every v2 W parameter to its persisted AdamW slot read-only."""
+
+    config = getattr(model, "config", None)
+    higher = getattr(config, "higher_body", None)
+    if getattr(higher, "contract_version", None) != SYMMETRIC_POWER_CONTRACT_VERSION:
+        return
+    named_weights = tuple(
+        (name, parameter)
+        for name, parameter in model.named_parameters()
+        if ".symmetric_contraction.weight_" in name
+    )
+    expected_count = (
+        config.num_layers
+        * (higher.lmax + 1)
+        * higher.symmetric_correlation.correlation_order
+    )
+    if len(named_weights) != expected_count:
+        raise ValueError(
+            "symmetric W parameter count mismatch: "
+            f"expected={expected_count}, actual={len(named_weights)}"
+        )
+    groups = saved_optimizer_state.get("param_groups")
+    states = saved_optimizer_state.get("state")
+    if not isinstance(groups, list) or not isinstance(states, Mapping):
+        raise ValueError("optimizer state has invalid param_groups/state structure")
+    if len(groups) != len(optimizer.param_groups):
+        raise ValueError("optimizer state parameter-group count mismatch")
+    parameter_to_slot: dict[int, Any] = {}
+    for live_group, saved_group in zip(optimizer.param_groups, groups):
+        live_parameters = live_group.get("params", ())
+        saved_slots = saved_group.get("params", ())
+        if len(live_parameters) != len(saved_slots):
+            raise ValueError("optimizer state parameter slot count mismatch")
+        for parameter, slot in zip(live_parameters, saved_slots):
+            if id(parameter) in parameter_to_slot:
+                raise ValueError("optimizer state contains a duplicate parameter slot")
+            parameter_to_slot[id(parameter)] = slot
+    for name, parameter in named_weights:
+        if id(parameter) not in parameter_to_slot:
+            raise ValueError(f"symmetric W is absent from optimizer binding: {name}")
+        slot = parameter_to_slot[id(parameter)]
+        if not require_initialized:
+            continue
+        if slot not in states or not isinstance(states[slot], Mapping):
+            raise ValueError(
+                f"symmetric W optimizer state is missing after updates: {name}"
+            )
+        entry = states[slot]
+        for field in ("exp_avg", "exp_avg_sq"):
+            value = entry.get(field)
+            if not isinstance(value, torch.Tensor) or value.shape != parameter.shape:
+                raise ValueError(
+                    f"symmetric W optimizer {field} shape mismatch: {name}"
+                )
+            if not bool(torch.all(torch.isfinite(value))):
+                raise ValueError(
+                    f"symmetric W optimizer {field} is nonfinite: {name}"
+                )
 
 
 def save_training_checkpoint(

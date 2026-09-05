@@ -38,6 +38,7 @@ from refsite_mlip.models import (
     capture_reference_site_model_bundle,
     instantiate_reference_site_model_bundle,
     load_reference_site_model_bundle,
+    reference_site_model_architecture_fingerprint,
     save_reference_site_model_bundle,
 )
 from refsite_mlip.training import (
@@ -1625,6 +1626,37 @@ def _strict_load_checkpoint_state(
                 checkpoint_stage="model_state_finite",
                 config_field=key,
             )
+    try:
+        checkpoint_architecture = reference_site_model_architecture_fingerprint(
+            bundle.model_config,
+            trained,
+            tuple(trained),
+            bundle.species_vocabulary,
+            bundle.conventions,
+        )
+    except ModelBundleError as error:
+        raise CLIError(
+            error.reason_code,
+            "checkpoint model state violates the initial bundle architecture",
+            stage="export.model_state.architecture",
+            path=checkpoint_path,
+            source_kind=source,
+            checkpoint_stage="architecture_semantics",
+            config_field=error.state_key,
+            bundle_fingerprint=bundle.bundle_fingerprint,
+            underlying_reason_code=error.reason_code,
+            original_error=error,
+        ) from error
+    if checkpoint_architecture != bundle.architecture_fingerprint:
+        raise CLIError(
+            "CHECKPOINT_ARCHITECTURE_FINGERPRINT_MISMATCH",
+            "checkpoint architecture differs from the initial portable bundle",
+            stage="export.model_state.architecture",
+            path=checkpoint_path,
+            source_kind=source,
+            checkpoint_stage="architecture_fingerprint",
+            bundle_fingerprint=bundle.bundle_fingerprint,
+        )
     try:
         with torch.no_grad():
             model.load_state_dict(trained, strict=True)

@@ -802,6 +802,32 @@ def _architecture_payload(
     return result
 
 
+def reference_site_model_architecture_fingerprint(
+    model_config: PotentialConfig | Mapping[str, Any],
+    model_state: Mapping[str, torch.Tensor],
+    model_state_keys: tuple[str, ...],
+    species_vocabulary: tuple[int, ...],
+    conventions: Mapping[str, Any],
+) -> str:
+    """Return the canonical v1/v2 architecture identity after semantic checks."""
+
+    config_payload = (
+        model_config.to_dict()
+        if isinstance(model_config, PotentialConfig)
+        else model_config
+    )
+    return _fingerprint(
+        "reference_site_model_architecture_v1",
+        _architecture_payload(
+            config_payload,
+            model_state,
+            model_state_keys,
+            species_vocabulary,
+            conventions,
+        ),
+    )
+
+
 def _central_channel_descriptor(config: PotentialConfig) -> list[dict[str, Any]]:
     species = len(config.species_vocabulary)
     embedding = config.higher_body.site_type_embedding_dim
@@ -1080,6 +1106,72 @@ def _validate_legacy_state_separation(
         )
 
 
+def validate_reference_site_model_state_contract(
+    model_config: PotentialConfig | Mapping[str, Any],
+    model_state: Mapping[str, torch.Tensor],
+    *,
+    validation_stage: str = "model_state.architecture",
+    bundle_path: str | None = None,
+) -> Mapping[str, Any] | None:
+    """Validate v1/v2 architecture semantics encoded by config and state.
+
+    The returned v2 descriptor contains plain immutable architecture metadata;
+    v1 deliberately returns ``None`` so its historical fingerprint payload is
+    unchanged.  This validator is also used by training checkpoints before any
+    runtime state is mutated.
+    """
+
+    if isinstance(model_config, PotentialConfig):
+        config = model_config
+    else:
+        # TrainingCheckpoint is intentionally generic enough to support small
+        # test/application modules whose configuration is not a PotentialConfig.
+        # Only mappings carrying the identifying PotentialConfig structure are
+        # subject to this architecture contract.
+        if not (
+            isinstance(model_config, Mapping)
+            and "species_vocabulary" in model_config
+            and "higher_body" in model_config
+        ):
+            return None
+        try:
+            config = PotentialConfig.from_dict(model_config)
+        except Exception as error:
+            raise _wrap_error(
+                "INVALID_MODEL_CONFIG",
+                "PotentialConfig reconstruction failed during state validation",
+                error,
+                bundle_path=bundle_path,
+                schema=REFERENCE_SITE_MODEL_BUNDLE_SCHEMA_VERSION,
+                validation_stage=validation_stage,
+            ) from error
+    if not isinstance(model_state, Mapping) or any(
+        type(key) is not str or not isinstance(value, torch.Tensor)
+        for key, value in model_state.items()
+    ):
+        raise _symmetric_error(
+            "INVALID_MODEL_STATE",
+            "model state must be a string-to-tensor mapping",
+            bundle_path=bundle_path,
+            stage=validation_stage,
+        )
+    if config.higher_body.contract_version == SYMMETRIC_POWER_CONTRACT_VERSION:
+        descriptor = _validate_symmetric_state_contract(
+            config,
+            model_state,
+            bundle_path=bundle_path,
+            stage=validation_stage,
+        )
+        return MappingProxyType(descriptor)
+    _validate_legacy_state_separation(
+        config,
+        model_state,
+        bundle_path=bundle_path,
+        stage=validation_stage,
+    )
+    return None
+
+
 def _legacy_radius_contract_mismatch(
     model_config: Any,
 ) -> tuple[float, float] | None:
@@ -1172,15 +1264,12 @@ class ReferenceSiteModelBundle:
                 schema=self.schema_version,
                 validation_stage="model_state",
             )
-        architecture = _fingerprint(
-            "reference_site_model_architecture_v1",
-            _architecture_payload(
-                model_config,
-                state,
-                tuple(self.model_state_keys),
-                tuple(self.species_vocabulary),
-                conventions,
-            ),
+        architecture = reference_site_model_architecture_fingerprint(
+            model_config,
+            state,
+            tuple(self.model_state_keys),
+            tuple(self.species_vocabulary),
+            conventions,
         )
         if self.architecture_fingerprint is None:
             object.__setattr__(self, "architecture_fingerprint", architecture)
@@ -1583,15 +1672,12 @@ class ReferenceSiteModelBundle:
                     template_id=self.default_template_id,
                     state_key=key,
                 )
-        architecture = _fingerprint(
-            "reference_site_model_architecture_v1",
-            _architecture_payload(
-                self.model_config,
-                self.model_state,
-                self.model_state_keys,
-                self.species_vocabulary,
-                self.conventions,
-            ),
+        architecture = reference_site_model_architecture_fingerprint(
+            self.model_config,
+            self.model_state,
+            self.model_state_keys,
+            self.species_vocabulary,
+            self.conventions,
         )
         if self.architecture_fingerprint != architecture:
             raise _error(
@@ -2460,4 +2546,6 @@ __all__ = [
     "instantiate_reference_site_model_bundle",
     "load_reference_site_model_bundle",
     "save_reference_site_model_bundle",
+    "reference_site_model_architecture_fingerprint",
+    "validate_reference_site_model_state_contract",
 ]

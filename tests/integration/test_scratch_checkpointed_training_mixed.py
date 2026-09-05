@@ -31,7 +31,9 @@ from test_scratch_training_preparation import (
 )
 
 
-def _mixed_pristine_vacancy_preparation(directory: Path):
+def _mixed_pristine_vacancy_preparation(
+    directory: Path, *, symmetric_v2=False, max_epochs=1
+):
     """Build one deterministic mixed-M batch containing K=0 and K=1."""
 
     directory.mkdir(parents=True, exist_ok=True)
@@ -94,7 +96,17 @@ def _mixed_pristine_vacancy_preparation(directory: Path):
         "validation_batch_size": 2,
         "shuffle": False,
     }
-    payload["fit"]["max_epochs"] = 1
+    payload["fit"]["max_epochs"] = max_epochs
+    if symmetric_v2:
+        higher = payload["model_source"]["potential"]["higher_body"]
+        higher.pop("correlation_mode")
+        higher["contract_version"] = "central_conditioned_symmetric_power_v2"
+        higher["symmetric_correlation"] = {
+            "correlation_order": 3,
+            "basis_kind": "full_path",
+            "normalization": "component",
+            "basis_version": "full_path_real_cg_e3nn_0_4_4_v1",
+        }
     config_path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
     config = load_training_run_config(config_path)
     return config, prepare_scratch_training_run(config)

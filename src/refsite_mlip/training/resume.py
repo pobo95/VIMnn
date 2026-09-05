@@ -14,6 +14,7 @@ import numpy as np
 import torch
 
 from refsite_mlip.data import StructureBatch
+from refsite_mlip.models import validate_reference_site_model_state_contract
 from refsite_mlip.models.batch_executor import _validated_context
 from refsite_mlip.models.template_context import TemplateExecutionContext
 
@@ -30,6 +31,7 @@ from .checkpoint import (
     _template_fingerprint_mapping,
     _unit_conventions,
     _validated_batch_sequence,
+    _validate_symmetric_optimizer_state,
 )
 from .fit import FitConfig
 from .scheduler import SchedulerConfig, _validate_scheduler_binding
@@ -310,6 +312,27 @@ def _validate_data_and_templates(
 def _validate_model_state(checkpoint: TrainingCheckpoint, model: torch.nn.Module) -> None:
     current = model.state_dict()
     saved = checkpoint.model_state_dict
+    saved_config = checkpoint.metadata.resolved_configuration["model"]
+    try:
+        saved_architecture = validate_reference_site_model_state_contract(
+            saved_config,
+            saved,
+            validation_stage="checkpoint.resume.saved_model_architecture",
+        )
+        current_architecture = validate_reference_site_model_state_contract(
+            saved_config,
+            current,
+            validation_stage="checkpoint.resume.current_model_architecture",
+        )
+        if saved_architecture != current_architecture:
+            _compatibility_error(
+                "checkpoint and current model architecture descriptors differ"
+            )
+    except Exception as error:
+        _compatibility_error(
+            "model architecture semantic validation failed before restore: "
+            f"{type(error).__name__}: {error}"
+        )
     if list(current) != list(saved):
         _compatibility_error("model state_dict keys or ordering do not match")
     for key in current:
@@ -339,6 +362,7 @@ def _validate_optimizer_binding(
 
 def _validate_optimizer_structure(
     checkpoint: TrainingCheckpoint,
+    model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
     optimizer_config: Mapping[str, Any],
 ) -> None:
@@ -356,6 +380,18 @@ def _validate_optimizer_structure(
     kind = optimizer_config.get("optimizer")
     if kind != "adamw" or not isinstance(optimizer, torch.optim.AdamW):
         _compatibility_error("optimizer kind must match configured AdamW")
+    try:
+        _validate_symmetric_optimizer_state(
+            model,
+            checkpoint.optimizer_state_dict,
+            optimizer,
+            require_initialized=checkpoint.progress.global_step > 0,
+        )
+    except (TypeError, ValueError) as error:
+        _compatibility_error(
+            "symmetric optimizer state is incompatible before restore: "
+            f"{error}"
+        )
 
 
 def _validate_scheduler_structure(
@@ -509,7 +545,10 @@ def validate_checkpoint_compatibility(
     _validate_model_state(checkpoint, model)
     _validate_optimizer_binding(model, optimizer)
     _validate_optimizer_structure(
-        checkpoint, optimizer, checkpoint.metadata.resolved_configuration["optimizer"]
+        checkpoint,
+        model,
+        optimizer,
+        checkpoint.metadata.resolved_configuration["optimizer"],
     )
     scheduler_config = SchedulerConfig.from_dict(
         checkpoint.metadata.resolved_configuration["scheduler"]

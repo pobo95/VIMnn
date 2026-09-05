@@ -9,6 +9,7 @@ from numbers import Integral, Real
 from typing import Any
 
 from refsite_mlip.data import PhaseSpecification, ReferenceTemplateBuilderConfig
+from refsite_mlip.interactions import HigherBodyConfig
 from refsite_mlip.models import EvaluationPolicy, PotentialConfig
 
 
@@ -347,11 +348,31 @@ def _canonical_feature_payload(value: Any) -> dict[str, Any]:
 
 def _canonical_higher_body_payload(value: Any) -> dict[str, Any]:
     field = "model_source.potential.higher_body"
+    if not isinstance(value, Mapping):
+        raise _error(
+            "INVALID_MODEL_SOURCE_SECTION",
+            "value must be a mapping",
+            field,
+        )
+    version = value.get(
+        "contract_version", "central_conditioned_higher_body_v1"
+    )
+    if version == "central_conditioned_higher_body_v1":
+        allowed = required = _HIGHER_BODY_KEYS
+    elif version == "central_conditioned_symmetric_power_v2":
+        allowed = required = (
+            (_HIGHER_BODY_KEYS - {"correlation_mode"})
+            | {"symmetric_correlation"}
+        )
+    else:
+        # Let HigherBodyConfig provide the authoritative unsupported-contract
+        # diagnostic after the common strict key check.
+        allowed = required = _HIGHER_BODY_KEYS
     payload = dict(
         _strict_mapping(
             value,
-            allowed=_HIGHER_BODY_KEYS,
-            required=_HIGHER_BODY_KEYS,
+            allowed=frozenset(allowed),
+            required=frozenset(required),
             field=field,
         )
     )
@@ -369,9 +390,20 @@ def _canonical_higher_body_payload(value: Any) -> dict[str, Any]:
     )
     for name in ("avg_num_neighbors", "cutoff", "edge_length_scale"):
         payload[name] = _real(payload[name], field=f"{field}.{name}")
-    for name in ("irreps_feature", "correlation_mode", "contract_version"):
+    for name in ("irreps_feature", "contract_version"):
         payload[name] = _string(payload[name], field=f"{field}.{name}")
-    return payload
+    if version == "central_conditioned_higher_body_v1":
+        payload["correlation_mode"] = _string(
+            payload["correlation_mode"], field=f"{field}.correlation_mode"
+        )
+    try:
+        return HigherBodyConfig.from_dict(payload).to_dict()
+    except Exception as error:
+        raise _error(
+            "INVALID_MODEL_SOURCE_CONFIG",
+            f"HigherBodyConfig validation failed: {error}",
+            field,
+        ) from error
 
 
 def _canonical_support_payload(value: Any) -> dict[str, Any]:

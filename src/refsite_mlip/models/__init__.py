@@ -17,7 +17,9 @@ from .bundle import (
     capture_reference_site_model_bundle,
     instantiate_reference_site_model_bundle,
     load_reference_site_model_bundle,
+    reference_site_model_architecture_fingerprint,
     save_reference_site_model_bundle,
+    validate_reference_site_model_state_contract,
 )
 
 __all__ = [
@@ -41,5 +43,7 @@ __all__ = [
     'evaluate_structure_batch',
     'instantiate_reference_site_model_bundle',
     'load_reference_site_model_bundle',
+    'reference_site_model_architecture_fingerprint',
     'save_reference_site_model_bundle',
+    'validate_reference_site_model_state_contract',
 ]
