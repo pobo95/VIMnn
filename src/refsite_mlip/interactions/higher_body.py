@@ -82,7 +82,6 @@ class HigherBodyConfig:
         integer=(self.species_count,self.site_type_count,self.site_type_embedding_dim,self.n_correlation_channels,self.radial_feature_dim)
         if any(isinstance(v,bool) or not isinstance(v,Integral) or v<=0 for v in integer): raise ValueError("channel dimensions must be positive integers")
         if self.lmax not in (0,1,2): raise ValueError("prototype lmax must be 0, 1, or 2")
-        if self.n_correlation_channels>16: raise ValueError("prototype correlation channel count is capped at 16")
         if any(isinstance(v,bool) or not isinstance(v,Integral) or v<=0 for v in self.radial_hidden_dims): raise ValueError("radial hidden dimensions must be positive")
         for name,v in (("avg_num_neighbors",self.avg_num_neighbors),("cutoff",self.cutoff),("edge_length_scale",self.edge_length_scale)):
             if isinstance(v,bool) or not isinstance(v,Real) or not math.isfinite(float(v)) or v<=0: raise ValueError(f"{name} must be finite and positive")

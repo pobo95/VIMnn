@@ -196,6 +196,34 @@ def test_v2_config_roundtrip_is_strict_frozen_and_deterministic(order):
         config.symmetric_correlation.correlation_order = 2
 
 
+@pytest.mark.parametrize("channels", [17, 64])
+def test_correlation_channel_count_has_no_general_prototype_ceiling(channels):
+    symmetric = _v2_config(channels=channels)
+    symmetric.validate()
+    symmetric_payload = symmetric.to_dict()
+    symmetric_restored = HigherBodyConfig.from_dict(symmetric_payload)
+    assert symmetric_restored == symmetric
+    assert symmetric_restored.n_correlation_channels == channels
+    assert symmetric_restored.canonical_json() == symmetric.canonical_json()
+
+    sequential = replace(
+        _legacy_config(),
+        n_correlation_channels=channels,
+        correlation_mode="uuu",
+    )
+    sequential.validate()
+    assert HigherBodyConfig.from_dict(sequential.to_dict()) == sequential
+
+
+def test_dense_uvw_correlation_keeps_its_independent_channel_limit():
+    with pytest.raises(ValueError, match="dense uvw.*n_corr<=2"):
+        replace(
+            _legacy_config(),
+            n_correlation_channels=3,
+            correlation_mode="uvw",
+        ).validate()
+
+
 @pytest.mark.parametrize("order", [0, 4, True, False, 1.5])
 def test_v2_invalid_order_is_rejected(order):
     with pytest.raises((TypeError, ValueError), match="correlation_order"):

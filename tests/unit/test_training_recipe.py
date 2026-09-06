@@ -243,6 +243,35 @@ def test_hidden_irreps_alias_and_explicit_layout_compile_identically():
         )
 
 
+@pytest.mark.parametrize("channels", [17, 64])
+def test_symmetric_recipe_compiles_large_hidden_channel_counts(channels):
+    payload = _payload()
+    payload["model"]["hidden_channels"] = channels
+    resolved = compile_training_recipe(
+        TrainingRecipeConfig.from_dict(payload), (_spec(),)
+    )
+    higher = resolved.config.model_source.potential.higher_body
+    assert higher.n_correlation_channels == channels
+    higher.validate()
+    restored = HigherBodyConfig.from_dict(higher.to_dict())
+    assert restored == higher
+    assert restored.canonical_json() == higher.canonical_json()
+
+
+def test_large_hidden_irreps_alias_canonicalizes_to_uniform_channels():
+    payload = _payload(alias=True)
+    payload["model"]["hidden_irreps"] = "64x0e + 64x1o + 64x2e"
+    resolved = compile_training_recipe(
+        TrainingRecipeConfig.from_dict(payload), (_spec(),)
+    )
+    higher = resolved.config.model_source.potential.higher_body
+    assert resolved.recipe.model.hidden_irreps == RecipeModelConfig(
+        hidden_irreps="64x0e+64x1o+64x2e"
+    ).hidden_irreps
+    assert higher.n_correlation_channels == 64
+    assert higher.lmax == 2
+
+
 def test_omitted_and_explicit_symmetric_method_are_canonically_identical():
     implicit_payload = _payload()
     implicit_payload["model"].pop("correlation")
@@ -537,7 +566,12 @@ def test_recipe_validation_is_strict_frozen_and_rng_neutral():
     with pytest.raises(FrozenInstanceError):
         recipe.name = "changed"
 
-    for field_name, value in (("num_interactions", True), ("correlation", 4), ("hidden_channels", 0)):
+    for field_name, value in (
+        ("num_interactions", True),
+        ("correlation", 4),
+        ("hidden_channels", 0),
+        ("max_L", 3),
+    ):
         payload = _payload()
         payload["model"][field_name] = value
         with pytest.raises(TrainingRecipeError):
@@ -547,6 +581,15 @@ def test_recipe_validation_is_strict_frozen_and_rng_neutral():
     with pytest.raises(TrainingRecipeError) as caught:
         TrainingRecipeConfig.from_dict(payload)
     assert caught.value.reason_code == "UNKNOWN_RECIPE_KEY"
+
+
+@pytest.mark.parametrize("value", [-1, True, 64.0, "64"])
+def test_recipe_hidden_channels_remains_a_strict_positive_integer(value):
+    payload = _payload()
+    payload["model"]["hidden_channels"] = value
+    with pytest.raises(TrainingRecipeError) as caught:
+        TrainingRecipeConfig.from_dict(payload)
+    assert caught.value.reason_code == "INVALID_RECIPE_INTEGER"
 
 
 def test_reference_specification_fingerprint_detects_semantic_corruption():
