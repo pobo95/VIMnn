@@ -511,6 +511,7 @@ class ScratchTrainingPreparation:
     training_configuration: Mapping[str, Any]
     training_executed: bool = False
     scratch_execution_implemented: bool = True
+    automatic_reference_preparation: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if type(self.training_executed) is not bool or self.training_executed:
@@ -553,6 +554,12 @@ class ScratchTrainingPreparation:
             "training_configuration",
         ):
             object.__setattr__(self, name, _freeze_plain(getattr(self, name)))
+        if self.automatic_reference_preparation is not None:
+            object.__setattr__(
+                self,
+                "automatic_reference_preparation",
+                _freeze_plain(self.automatic_reference_preparation),
+            )
         object.__setattr__(
             self,
             "train_composition_statistics",
@@ -583,7 +590,7 @@ class ScratchTrainingPreparation:
                 Counter(sample.template_id for sample in self.validation_samples).items()
             )
         )
-        return {
+        result = {
             "status": "scratch_preflight_ready",
             "training_executed": False,
             "schema_version": "refsite_training_run_config_v2",
@@ -647,6 +654,11 @@ class ScratchTrainingPreparation:
                 "output_directory_created": False,
             },
         }
+        if self.automatic_reference_preparation is not None:
+            result["reference_preparation"] = _plain(
+                self.automatic_reference_preparation
+            )
+        return result
 
 
 def _expected_input_file_specs(
@@ -825,6 +837,7 @@ def prepare_scratch_training_run(
     config: Any,
     *,
     base_directory: str | os.PathLike[str] | None = None,
+    automatic_reference_preparation: Mapping[str, Any] | None = None,
 ) -> ScratchTrainingPreparation:
     """Perform complete scratch reference/data preflight without side effects."""
 
@@ -1283,9 +1296,48 @@ def prepare_scratch_training_run(
         "validation_semantic_digest": validation_digest,
         "data_manifest_fingerprint": manifest_payload["fingerprint"],
     }
+    if automatic_reference_preparation is not None:
+        preparation_semantics["automatic_reference_fingerprint"] = str(
+            automatic_reference_preparation["content_fingerprint"]
+        )
     preparation_fingerprint = _fingerprint(
         SCRATCH_PREPARATION_CONVENTION_VERSION, preparation_semantics
     )
+    if automatic_reference_preparation is not None:
+        try:
+            certificates = {
+                str(item["template_id"]): item
+                for item in automatic_reference_preparation["references"]
+            }
+            reference_digests = {
+                str(item["template_id"]): str(item["sha256"])
+                for item in input_file_digests["files"].values()
+                if item["role"] == "reference_poscar"
+            }
+            if set(certificates) != set(template_fingerprints):
+                raise ValueError("automatic certificate template set differs from preflight")
+            for template_id, certificate in certificates.items():
+                if reference_digests.get(template_id) != certificate["poscar_content_sha256"]:
+                    raise ValueError(
+                        f"POSCAR bytes changed after automatic preparation for {template_id}"
+                    )
+                if (
+                    template_fingerprints[template_id][
+                        "structural_artifact_fingerprint"
+                    ]
+                    != certificate["artifact_sha256"]
+                ):
+                    raise ValueError(
+                        f"reference artifact changed after automatic preparation for {template_id}"
+                    )
+        except Exception as error:
+            raise run_config._error(
+                "AUTOMATIC_REFERENCE_TOCTOU_MISMATCH",
+                "automatic reference certificate no longer matches the full scratch preflight",
+                stage="scratch.reference.toctou",
+                config_path=None if config_path is None else str(config_path),
+                original_error=error,
+            ) from error
     prepared_registry = _ReadOnlyTemplateRegistry(templates)
     preparation = ScratchTrainingPreparation(
         config_fingerprint=config.config_fingerprint,
@@ -1322,6 +1374,7 @@ def prepare_scratch_training_run(
         training_configuration=run_config._training_configuration_metadata(config),
         training_executed=False,
         scratch_execution_implemented=True,
+        automatic_reference_preparation=automatic_reference_preparation,
     )
     # Detect files changed while the relatively expensive builder/data
     # preflight was running, not only changes observed later by training.

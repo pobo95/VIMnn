@@ -557,20 +557,30 @@ class RecipeOTSolverConfig:
         payload = _strict_mapping(
             value,
             allowed=frozenset({"training", "inference"}),
-            required=frozenset({"training", "inference"}),
+            required=frozenset({"training"}),
             field_name="ot_solver",
         )
-        return cls(training=payload["training"], inference=payload["inference"])
+        return cls(
+            training=payload["training"],
+            inference=payload.get("inference", SINKHORN_OT_SOLVER),
+        )
 
 
 @dataclass(frozen=True)
 class RecipeReferenceSourceConfig:
-    specification: str
+    specification: str | None
     poscar: str
     allow_provisional_phase: bool = False
+    template_id: str | None = None
+    maximum_strain: str | float | None = None
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "specification", _path(self.specification, field_name="reference.specification"))
+        if self.specification is not None:
+            object.__setattr__(
+                self,
+                "specification",
+                _path(self.specification, field_name="reference.specification"),
+            )
         object.__setattr__(self, "poscar", _path(self.poscar, field_name="reference.poscar"))
         if type(self.allow_provisional_phase) is not bool:
             raise _error(
@@ -579,8 +589,73 @@ class RecipeReferenceSourceConfig:
                 stage="recipe.reference",
                 field="reference.allow_provisional_phase",
             )
+        if self.template_id is not None and (
+            type(self.template_id) is not str or not self.template_id
+        ):
+            raise _error(
+                "INVALID_TEMPLATE_ID",
+                "template_id must be a nonempty string",
+                stage="recipe.reference",
+                field="reference.template_id",
+            )
+        if self.specification is not None:
+            if self.template_id is not None or self.maximum_strain is not None:
+                raise _error(
+                    "CONFLICTING_REFERENCE_MODE",
+                    "explicit specification fields cannot be mixed with automatic reference fields",
+                    stage="recipe.reference",
+                    field="reference",
+                )
+        else:
+            if self.allow_provisional_phase:
+                raise _error(
+                    "CONFLICTING_REFERENCE_MODE",
+                    "allow_provisional_phase belongs only to explicit specifications; automatic references are explicitly provisional",
+                    stage="recipe.reference",
+                    field="reference.allow_provisional_phase",
+                )
+            value = "auto" if self.maximum_strain is None else self.maximum_strain
+            if type(value) is str:
+                if value != "auto":
+                    raise _error(
+                        "INVALID_MAXIMUM_STRAIN",
+                        "automatic maximum_strain must be the exact token 'auto' or a positive finite number",
+                        stage="recipe.reference",
+                        field="reference.maximum_strain",
+                        actual=value,
+                    )
+            elif isinstance(value, bool) or not isinstance(value, Real):
+                raise _error(
+                    "INVALID_MAXIMUM_STRAIN",
+                    "maximum_strain must be 'auto' or a positive finite number; bool is forbidden",
+                    stage="recipe.reference",
+                    field="reference.maximum_strain",
+                    actual=value,
+                )
+            else:
+                value = float(value)
+                if not math.isfinite(value) or value <= 0.0:
+                    raise _error(
+                        "INVALID_MAXIMUM_STRAIN",
+                        "explicit maximum_strain must be finite and positive",
+                        stage="recipe.reference",
+                        field="reference.maximum_strain",
+                        actual=value,
+                    )
+            object.__setattr__(self, "maximum_strain", value)
+
+    @property
+    def is_automatic(self) -> bool:
+        return self.specification is None
 
     def to_dict(self) -> dict[str, Any]:
+        if self.is_automatic:
+            result: dict[str, Any] = {"poscar": self.poscar}
+            if self.template_id is not None:
+                result["template_id"] = self.template_id
+            if self.maximum_strain != "auto":
+                result["maximum_strain"] = self.maximum_strain
+            return result
         return {
             "specification": self.specification,
             "poscar": self.poscar,
@@ -589,13 +664,32 @@ class RecipeReferenceSourceConfig:
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any], *, field_name: str) -> "RecipeReferenceSourceConfig":
+        if not isinstance(value, Mapping):
+            raise _error(
+                "INVALID_REFERENCE_SOURCE",
+                "reference source must be a POSCAR path or strict mapping",
+                stage="recipe.reference",
+                field=field_name,
+            )
+        automatic = "specification" not in value
+        allowed = (
+            frozenset({"poscar", "template_id", "maximum_strain"})
+            if automatic
+            else frozenset({"specification", "poscar", "allow_provisional_phase"})
+        )
         payload = _strict_mapping(
             value,
-            allowed=frozenset({"specification", "poscar", "allow_provisional_phase"}),
-            required=frozenset({"specification", "poscar"}),
+            allowed=allowed,
+            required=(frozenset({"poscar"}) if automatic else frozenset({"specification", "poscar"})),
             field_name=field_name,
         )
-        return cls(**dict(payload))
+        return cls(specification=None, **dict(payload)) if automatic else cls(**dict(payload))
+
+    @classmethod
+    def from_value(cls, value: Any, *, field_name: str) -> "RecipeReferenceSourceConfig":
+        if type(value) is str:
+            return cls(specification=None, poscar=value)
+        return cls.from_dict(value, field_name=field_name)
 
 
 @dataclass(frozen=True)
@@ -620,6 +714,14 @@ class RecipeReferenceConfig:
                 field="reference",
             )
         object.__setattr__(self, "sources", sources)
+        automatic_count = sum(source.is_automatic for source in sources)
+        if automatic_count not in (0, len(sources)):
+            raise _error(
+                "CONFLICTING_REFERENCE_MODE",
+                "explicit and automatic reference sources cannot be mixed",
+                stage="recipe.reference",
+                field="reference",
+            )
         if self.default_template_id is not None and (
             type(self.default_template_id) is not str or not self.default_template_id
         ):
@@ -631,6 +733,20 @@ class RecipeReferenceConfig:
             )
 
     def to_dict(self) -> dict[str, Any]:
+        if all(source.is_automatic for source in self.sources):
+            simple = all(
+                source.template_id is None and source.maximum_strain == "auto"
+                for source in self.sources
+            )
+            if simple:
+                values = [source.poscar for source in self.sources]
+                return values[0] if len(values) == 1 else values
+            result: dict[str, Any] = {
+                "sources": [source.to_dict() for source in self.sources]
+            }
+            if self.default_template_id is not None:
+                result["default_template_id"] = self.default_template_id
+            return result
         if len(self.sources) == 1 and self.default_template_id is None:
             return self.sources[0].to_dict()
         return {
@@ -639,12 +755,48 @@ class RecipeReferenceConfig:
         }
 
     @classmethod
-    def from_dict(cls, value: Mapping[str, Any]) -> "RecipeReferenceConfig":
+    def from_dict(cls, value: Any) -> "RecipeReferenceConfig":
+        if type(value) is str:
+            return cls((RecipeReferenceSourceConfig.from_value(value, field_name="reference"),))
+        if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+            if not value:
+                raise _error(
+                    "EMPTY_REFERENCE_SEQUENCE", "reference list must not be empty",
+                    stage="recipe.reference", field="reference"
+                )
+            return cls(
+                tuple(
+                    RecipeReferenceSourceConfig.from_value(
+                        item, field_name=f"reference[{index}]"
+                    )
+                    for index, item in enumerate(value)
+                )
+            )
         if not isinstance(value, Mapping):
             raise _error(
-                "INVALID_RECIPE_SECTION", "reference must be a mapping",
+                "INVALID_RECIPE_SECTION", "reference must be a POSCAR path, list, or mapping",
                 stage="recipe.schema", field="reference"
             )
+        if "sources" in value:
+            payload = _strict_mapping(
+                value,
+                allowed=frozenset({"sources", "default_template_id"}),
+                required=frozenset({"sources"}),
+                field_name="reference",
+            )
+            raw = payload["sources"]
+            if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes, bytearray)) or not raw:
+                raise _error(
+                    "EMPTY_REFERENCE_SEQUENCE", "reference.sources must be a nonempty sequence",
+                    stage="recipe.reference", field="reference.sources"
+                )
+            sources = tuple(
+                RecipeReferenceSourceConfig.from_value(
+                    item, field_name=f"reference.sources[{index}]"
+                )
+                for index, item in enumerate(raw)
+            )
+            return cls(sources, default_template_id=payload.get("default_template_id"))
         if "templates" in value:
             payload = _strict_mapping(
                 value,
@@ -962,8 +1114,18 @@ class TrainingRecipeConfig:
         allowed = frozenset(
             {"schema_version", "name", "output_directory", "model", "reference", "data", "ot_solver", "loss", "baseline", "radii", "training", "runtime"}
         )
-        required = frozenset({"schema_version", "model", "reference", "data", "ot_solver", "loss", "baseline", "training", "runtime"})
+        required = frozenset({"schema_version", "model", "reference", "data", "loss", "baseline", "training", "runtime"})
         payload = _strict_mapping(value, allowed=allowed, required=required, field_name="recipe")
+        reference = RecipeReferenceConfig.from_dict(payload["reference"])
+        if "ot_solver" not in payload and not all(
+            source.is_automatic for source in reference.sources
+        ):
+            raise _error(
+                "MISSING_RECIPE_KEY",
+                "explicit reference recipes require ot_solver",
+                stage="recipe.schema",
+                field="ot_solver",
+            )
         radii_value = payload.get("radii", {"r_ot": 4.0, "r_mp": 3.0})
         radii_payload = _strict_mapping(
             radii_value,
@@ -983,9 +1145,16 @@ class TrainingRecipeConfig:
             schema_version=payload["schema_version"],
             name=payload.get("name"), output_directory=payload.get("output_directory"),
             model=RecipeModelConfig.from_dict(payload["model"]),
-            reference=RecipeReferenceConfig.from_dict(payload["reference"]),
+            reference=reference,
             data=RecipeDataConfig.from_dict(payload["data"]),
-            ot_solver=RecipeOTSolverConfig.from_dict(payload["ot_solver"]),
+            ot_solver=(
+                RecipeOTSolverConfig(
+                    training=SINKHORN_OT_SOLVER,
+                    inference=SINKHORN_OT_SOLVER,
+                )
+                if "ot_solver" not in payload
+                else RecipeOTSolverConfig.from_dict(payload["ot_solver"])
+            ),
             loss=RecipeLossConfig.from_dict(payload["loss"]),
             baseline=payload["baseline"], radii=radii,
             training=RecipeTrainingConfig.from_dict(payload["training"]),
@@ -1150,6 +1319,8 @@ class RecipeResolutionManifest:
         ("training", TRAINING_DEFAULTS_VERSION),
     )
     preset_fingerprints: tuple[tuple[str, str], ...] = ()
+    automatic_reference_fingerprint: str | None = None
+    automatic_reference_certificates: tuple[tuple[str, Any], ...] = ()
 
     def __post_init__(self) -> None:
         for value in (self.recipe_fingerprint, self.compiled_config_fingerprint):
@@ -1160,6 +1331,15 @@ class RecipeResolutionManifest:
         object.__setattr__(self, "paths", tuple(sorted(self.paths)))
         object.__setattr__(self, "preset_versions", tuple(sorted(self.preset_versions)))
         object.__setattr__(self, "preset_fingerprints", tuple(sorted(self.preset_fingerprints)))
+        object.__setattr__(
+            self,
+            "automatic_reference_certificates",
+            tuple(sorted(self.automatic_reference_certificates)),
+        )
+        if self.automatic_reference_fingerprint is not None and _SHA256.fullmatch(
+            self.automatic_reference_fingerprint
+        ) is None:
+            raise ValueError("automatic reference fingerprint must be lowercase SHA-256")
         RecipeOTSolverConfig(
             training=self.training_ot_solver,
             inference=self.inference_ot_solver,
@@ -1178,7 +1358,7 @@ class RecipeResolutionManifest:
             raise ValueError("nonconvergence_policy must be fail-fast")
 
     def semantic_dict(self) -> dict[str, Any]:
-        return {
+        result = {
             "schema_version": "refsite_training_recipe_resolution_manifest_v1",
             "recipe_schema_version": self.recipe_schema_version,
             "recipe_fingerprint": self.recipe_fingerprint,
@@ -1201,6 +1381,18 @@ class RecipeResolutionManifest:
             ],
             "compiled_config_fingerprint": self.compiled_config_fingerprint,
         }
+        # Do not perturb the byte-level manifest contract of explicit recipes.
+        if self.automatic_reference_fingerprint is not None:
+            result["automatic_reference_preparation"] = {
+                "scope": "dataset_bounded",
+                "approval_status": "provisional",
+                "content_fingerprint": self.automatic_reference_fingerprint,
+                "certificates": {
+                    template_id: certificate
+                    for template_id, certificate in self.automatic_reference_certificates
+                },
+            }
+        return result
 
     @property
     def content_fingerprint(self) -> str:
@@ -1217,6 +1409,9 @@ class ResolvedTrainingRecipe:
     config: TrainingRunConfig
     manifest: RecipeResolutionManifest
     recipe: TrainingRecipeConfig
+    automatic_reference_preparation: Any = field(
+        default=None, repr=False, compare=False
+    )
 
     def __post_init__(self) -> None:
         if self.config.schema_version != TRAINING_RUN_CONFIG_SCHEMA_VERSION_V2:
@@ -1225,7 +1420,7 @@ class ResolvedTrainingRecipe:
             raise ValueError("manifest and compiled canonical config disagree")
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        result = {
             "recipe_summary": {
                 "correlation_method": self.recipe.model.correlation_method,
                 "maximum_correlation_order": (
@@ -1243,6 +1438,11 @@ class ResolvedTrainingRecipe:
             "compiled_config": self.config.to_dict(),
             "resolution_manifest": self.manifest.to_dict(),
         }
+        if self.automatic_reference_preparation is not None:
+            result["reference_preparation"] = (
+                self.automatic_reference_preparation.to_dict()
+            )
+        return result
 
 
 _MODEL_DEFAULTS = {
@@ -1302,6 +1502,7 @@ def _compile_data_source(
     source: RecipeDataSourceConfig,
     *,
     template_ids: tuple[str, ...],
+    automatic_reference_mode: bool = False,
 ) -> TrainingDataSourceConfig:
     if source.template_id is not None:
         if source.template_id not in template_ids:
@@ -1310,7 +1511,7 @@ def _compile_data_source(
                 stage="recipe.compile", field="data.template_id", actual=source.template_id
             )
         return TrainingDataSourceConfig(path=source.path, template_id=source.template_id)
-    if source.automatic_template_assignment:
+    if source.automatic_template_assignment or automatic_reference_mode:
         return TrainingDataSourceConfig(path=source.path, automatic_template_assignment=True)
     if len(template_ids) != 1:
         raise _error(
@@ -1367,12 +1568,14 @@ def _compile_training_recipe_impl(
         )
     default_template = recipe.reference.default_template_id
     if default_template is None:
-        if len(template_ids) != 1:
+        if len(template_ids) != 1 and not all(
+            source.is_automatic for source in recipe.reference.sources
+        ):
             raise _error(
                 "MISSING_DEFAULT_TEMPLATE", "multi-template recipe requires default_template_id",
                 stage="recipe.compile", field="reference.default_template_id"
             )
-        default_template = template_ids[0]
+        default_template = sorted(template_ids)[0]
     if default_template not in template_ids:
         raise _error(
             "DEFAULT_TEMPLATE_MISSING", "default_template_id does not name a loaded specification",
@@ -1409,7 +1612,11 @@ def _compile_training_recipe_impl(
     alignment = first.species_alignment_weights
     for source, specification in zip(recipe.reference.sources, specifications):
         phase = specification.phase_specification
-        if phase.approval_status == "provisional" and not source.allow_provisional_phase:
+        if (
+            phase.approval_status == "provisional"
+            and not source.is_automatic
+            and not source.allow_provisional_phase
+        ):
             raise _error(
                 "PROVISIONAL_PHASE_NOT_APPROVED",
                 "provisional phase requires allow_provisional_phase: true",
@@ -1530,8 +1737,26 @@ def _compile_training_recipe_impl(
         default_template_id=default_template,
     )
     data = TrainingDataConfig(
-        train=tuple(_compile_data_source(item, template_ids=template_ids) for item in recipe.data.train),
-        validation=tuple(_compile_data_source(item, template_ids=template_ids) for item in recipe.data.validation),
+        train=tuple(
+            _compile_data_source(
+                item,
+                template_ids=template_ids,
+                automatic_reference_mode=all(
+                    source.is_automatic for source in recipe.reference.sources
+                ),
+            )
+            for item in recipe.data.train
+        ),
+        validation=tuple(
+            _compile_data_source(
+                item,
+                template_ids=template_ids,
+                automatic_reference_mode=all(
+                    source.is_automatic for source in recipe.reference.sources
+                ),
+            )
+            for item in recipe.data.validation
+        ),
         batch_size=recipe.training.batch_size,
         validation_batch_size=recipe.training.validation_batch_size,
         shuffle=False,
@@ -1623,10 +1848,19 @@ def _compile_training_recipe_impl(
     if recipe.source_path is not None:
         paths.append(("recipe", recipe.source_path, str(Path(recipe.source_path).resolve(strict=False))))
     for index, source in enumerate(recipe.reference.sources):
-        paths.extend(
+        if source.specification is not None:
+            paths.append(
+                (
+                    f"reference[{index}].specification",
+                    source.specification,
+                    _resolved_text(source.specification, base),
+                )
+            )
+        paths.append(
             (
-                (f"reference[{index}].specification", source.specification, _resolved_text(source.specification, base)),
-                (f"reference[{index}].poscar", source.poscar, _resolved_text(source.poscar, base)),
+                f"reference[{index}].poscar",
+                source.poscar,
+                _resolved_text(source.poscar, base),
             )
         )
     for split, sources in (("train", recipe.data.train), ("validation", recipe.data.validation)):
@@ -1879,8 +2113,80 @@ def resolve_training_recipe(
     recipe = load_training_recipe(path)
     assert recipe.source_path is not None
     base = Path(recipe.source_path).parent
+    automatic_mode = all(
+        source.is_automatic for source in recipe.reference.sources
+    )
+    if automatic_mode:
+        if recipe.ot_solver.inference == SINKHORN_NEWTON_KRYLOV_OT_SOLVER:
+            raise _error(
+                "AUTOMATIC_EVALUATION_POLICY_NOT_AVAILABLE",
+                "POSCAR-only references are provisional and do not create an EvaluationPolicy; use inference: sinkhorn or provide an explicit reference specification",
+                stage="recipe.ot_solver",
+                field="ot_solver.inference",
+                actual=recipe.ot_solver.inference,
+            )
+        from .automatic_reference import (
+            AutomaticReferenceError,
+            prepare_automatic_references,
+        )
+
+        try:
+            automatic = prepare_automatic_references(
+                recipe,
+                base=base,
+                read_file=_read_regular_file,
+                specification_factory=ReferenceSpecificationConfig,
+            )
+        except AutomaticReferenceError as error:
+            context = " ".join(
+                f"{name}={value!r}"
+                for name, value in (
+                    ("sample_id", error.sample_id),
+                    ("template_id", error.template_id),
+                )
+                if value is not None
+            )
+            raise _error(
+                error.reason_code,
+                error.message if not context else f"{error.message}; {context}",
+                stage=error.stage,
+                path=error.source_path,
+                expected=error.expected,
+                actual=(error.diagnostics if error.diagnostics is not None else error.actual),
+                original_error=error,
+            ) from error
+        ordered_sources = tuple(
+            recipe.reference.sources[result.source_index]
+            for result in automatic.results
+        )
+        ordered_reference = RecipeReferenceConfig(
+            sources=ordered_sources,
+            default_template_id=recipe.reference.default_template_id,
+        )
+        recipe = replace(recipe, reference=ordered_reference)
+        compiled = compile_training_recipe(
+            recipe,
+            tuple(result.specification for result in automatic.results),
+            overrides=overrides,
+            cli_cwd=cli_cwd,
+        )
+        manifest = replace(
+            compiled.manifest,
+            automatic_reference_fingerprint=automatic.content_fingerprint,
+            automatic_reference_certificates=tuple(
+                (result.template_id, result.to_dict())
+                for result in automatic.results
+            ),
+        )
+        return ResolvedTrainingRecipe(
+            compiled.config,
+            manifest,
+            recipe,
+            automatic,
+        )
     specifications = []
     for index, source in enumerate(recipe.reference.sources):
+        assert source.specification is not None
         specification_path = Path(source.specification)
         if not specification_path.is_absolute():
             specification_path = base / specification_path

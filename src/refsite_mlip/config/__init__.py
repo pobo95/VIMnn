@@ -65,6 +65,16 @@ from .training_recipe import (
     load_training_recipe,
     resolve_training_recipe,
 )
+from .automatic_reference import (
+    AUTO_PHASE_SEARCH_VERSION,
+    AUTO_REFERENCE_CONVENTION_VERSION,
+    AUTO_STRAIN_POLICY_VERSION,
+    AutomaticReferenceError,
+    AutomaticReferencePreparation,
+    AutomaticReferenceResult,
+    prepare_automatic_references,
+    resolve_auto_maximum_strain,
+)
 
 __all__ = [
     "INTERACTION_RADIUS_CONFIG_SCHEMA_VERSION",
@@ -75,6 +85,12 @@ __all__ = [
     "TRAINING_RUN_CONFIG_SCHEMA_VERSION_V2",
     "SUPPORTED_TRAINING_RUN_CONFIG_SCHEMA_VERSIONS",
     "BundleModelSourceConfig",
+    "AUTO_PHASE_SEARCH_VERSION",
+    "AUTO_REFERENCE_CONVENTION_VERSION",
+    "AUTO_STRAIN_POLICY_VERSION",
+    "AutomaticReferenceError",
+    "AutomaticReferencePreparation",
+    "AutomaticReferenceResult",
     "DerivedInteractionRadii",
     "InteractionRadiusConfig",
     "ModelSourceConfig",
@@ -117,6 +133,8 @@ __all__ = [
     "load_training_run_config",
     "resolve_training_run",
     "resolve_training_recipe",
+    "prepare_automatic_references",
+    "resolve_auto_maximum_strain",
     "SYMMETRIC_MODEL_DEFAULTS_VERSION",
     "TRAINING_DEFAULTS_VERSION",
     "TRAINING_RECIPE_SCHEMA_VERSION",

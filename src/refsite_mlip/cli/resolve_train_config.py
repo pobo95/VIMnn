@@ -130,6 +130,7 @@ def resolve_train_config(
                     compiled_config_fingerprint=canonical.config_fingerprint,
                 ),
                 resolved.recipe,
+                resolved.automatic_reference_preparation,
             )
     except TrainingRecipeError as error:
         raise _cli_error(error, recipe_path) from error
@@ -154,7 +155,9 @@ def resolve_train_config(
     protected = [recipe]
     base = Path(resolved.recipe.source_path).parent
     for source in resolved.recipe.reference.sources:
-        protected.extend((base / source.specification, base / source.poscar))
+        if source.specification is not None:
+            protected.append(base / source.specification)
+        protected.append(base / source.poscar)
     for sources in (resolved.recipe.data.train, resolved.recipe.data.validation):
         protected.extend(base / source.path for source in sources)
     for target in (output, manifest):
@@ -213,8 +216,7 @@ def render_resolution_human(resolved: ResolvedTrainingRecipe) -> str:
         if resolved.recipe.model.correlation_method == "symmetric"
         else 3
     )
-    return "\n".join(
-        (
+    lines = [
             "Reference-site MLIP training recipe resolution",
             "Status: resolved (no training executed)",
             f"Recipe SHA-256: {resolved.recipe.content_fingerprint}",
@@ -236,8 +238,40 @@ def render_resolution_human(resolved: ResolvedTrainingRecipe) -> str:
             f"Radii: r_ot={config.radii.r_ot}, r_mp={config.radii.r_mp}, "
             f"r_candidate_ot={radii.r_candidate_ot}, r_candidate_mp={radii.r_candidate_mp}",
             f"Output directory: {config.output_directory}",
-        )
-    )
+    ]
+    automatic = resolved.automatic_reference_preparation
+    if automatic is not None:
+        lines.extend(("", f"References: {len(automatic.results)}"))
+        for result in automatic.results:
+            certificate = result.to_dict()
+            strain = certificate["strain"]
+            vacancies = certificate["vacancies"]
+            train_ids = vacancies["train"]["sample_ids"]
+            validation_ids = vacancies["validation"]["sample_ids"]
+            observed_k = sorted(
+                set(vacancies["train"]["observed_K_values"])
+                | set(vacancies["validation"]["observed_K_values"])
+            )
+            lines.extend(
+                (
+                    f"  Template {result.template_id}",
+                    f"    POSCAR: {result.original_poscar}",
+                    f"    M: {certificate['num_reference_sites']}",
+                    f"    Assigned train frames: {len(train_ids)}",
+                    f"    Assigned validation frames: {len(validation_ids)}",
+                    "    Observed maximum strain: "
+                    f"{strain['observed_all']:.17g}",
+                    "    Resolved maximum strain: "
+                    f"{strain['resolved_maximum_strain']:.17g}",
+                    f"    Vacancy range: K={observed_k}",
+                    f"    Phase approval: {certificate['approval_status']}",
+                    "    Specification SHA-256: "
+                    f"{certificate['specification_sha256']}",
+                    f"    Artifact SHA-256: {certificate['artifact_sha256']}",
+                )
+            )
+        lines.extend(("", "No training was executed."))
+    return "\n".join(lines)
 
 
 __all__ = [

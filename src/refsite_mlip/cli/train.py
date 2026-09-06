@@ -149,6 +149,7 @@ def _load_preflight(
     bool,
 ]:
     recipe_input = False
+    recipe_resolution = None
     try:
         try:
             config = load_effective_training_run_config(
@@ -161,9 +162,10 @@ def _load_preflight(
             ):
                 raise
             recipe_input = True
-            config = resolve_training_recipe(
+            recipe_resolution = resolve_training_recipe(
                 path, overrides=overrides, cli_cwd=cli_cwd
-            ).config
+            )
+            config = recipe_resolution.config
     except TrainingRecipeError as error:
         raise CLIConfigPreflightError(
             error.reason_code,
@@ -181,7 +183,15 @@ def _load_preflight(
         if stage is not None:
             stage("preparing data and reference templates")
         try:
-            resolved = prepare_scratch_training_run(config)
+            resolved = prepare_scratch_training_run(
+                config,
+                automatic_reference_preparation=(
+                    None
+                    if recipe_resolution is None
+                    or recipe_resolution.automatic_reference_preparation is None
+                    else recipe_resolution.automatic_reference_preparation.to_dict()
+                ),
+            )
         except TrainingRunConfigError as error:
             converted = _preflight_cli_error(
                 error,

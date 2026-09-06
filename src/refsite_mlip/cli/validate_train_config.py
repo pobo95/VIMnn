@@ -59,6 +59,7 @@ def validate_train_config(
 ) -> ResolvedTrainingRun | ScratchTrainingPreparation:
     """Run the shared bundle or scratch preflight without creating a runtime."""
 
+    recipe_resolution = None
     try:
         try:
             config = load_effective_training_run_config(
@@ -70,9 +71,10 @@ def validate_train_config(
                 and canonical_error.actual == TRAINING_RECIPE_SCHEMA_VERSION
             ):
                 raise
-            config = resolve_training_recipe(
+            recipe_resolution = resolve_training_recipe(
                 path, overrides=overrides, cli_cwd=cli_cwd
-            ).config
+            )
+            config = recipe_resolution.config
     except TrainingRecipeError as error:
         raise CLIConfigPreflightError(
             error.reason_code,
@@ -91,7 +93,15 @@ def validate_train_config(
         ) from error
     if isinstance(config.model_source, ScratchModelSourceConfig):
         try:
-            return prepare_scratch_training_run(config)
+            return prepare_scratch_training_run(
+                config,
+                automatic_reference_preparation=(
+                    None
+                    if recipe_resolution is None
+                    or recipe_resolution.automatic_reference_preparation is None
+                    else recipe_resolution.automatic_reference_preparation.to_dict()
+                ),
+            )
         except TrainingRunConfigError as error:
             raise _cli_error(
                 error,
@@ -192,6 +202,38 @@ def render_train_config_human(
                     f"    Binding: {values['binding_fingerprint']}",
                 ]
             )
+        automatic = report.get("reference_preparation")
+        if automatic is not None:
+            lines.extend(("", f"References: {len(automatic['references'])}"))
+            for certificate in automatic["references"]:
+                strain = certificate["strain"]
+                vacancies = certificate["vacancies"]
+                train_ids = vacancies["train"]["sample_ids"]
+                validation_ids = vacancies["validation"]["sample_ids"]
+                observed_k = sorted(
+                    set(vacancies["train"]["observed_K_values"])
+                    | set(vacancies["validation"]["observed_K_values"])
+                )
+                lines.extend(
+                    (
+                        f"  Template {certificate['template_id']}",
+                        f"    POSCAR: {certificate['poscar']}",
+                        f"    M: {certificate['num_reference_sites']}",
+                        f"    Assigned train frames: {len(train_ids)}",
+                        "    Assigned validation frames: "
+                        f"{len(validation_ids)}",
+                        "    Observed maximum strain: "
+                        f"{strain['observed_all']:.17g}",
+                        "    Resolved maximum strain: "
+                        f"{strain['resolved_maximum_strain']:.17g}",
+                        f"    Vacancy range: K={observed_k}",
+                        f"    Phase approval: {certificate['approval_status']}",
+                        "    Specification SHA-256: "
+                        f"{certificate['specification_sha256']}",
+                        "    Artifact SHA-256: "
+                        f"{certificate['artifact_sha256']}",
+                    )
+                )
         lines.extend(["", "Labels"])
         _label_lines(lines, split="train", statistics=train["label_statistics"])
         _label_lines(

@@ -31,6 +31,74 @@ from refsite_mlip.training import prepare_scratch_training_run
 from test_scratch_training_preparation import _atoms, _case, _labeled
 
 
+def _write_automatic_recipe(
+    directory: Path,
+    *,
+    references,
+    train,
+    validation,
+    inference="sinkhorn",
+):
+    from ase.io import write
+
+    (directory / "runs").mkdir(exist_ok=True)
+    for filename, atoms, _, _ in references:
+        write(directory / filename, atoms, format="vasp", direct=True)
+    for filename, frames, _ in train:
+        write(directory / filename, list(frames), format="extxyz")
+    for filename, frames, _ in validation:
+        write(directory / filename, list(frames), format="extxyz")
+    payload = {
+        "schema_version": "refsite_training_recipe_v1",
+        "name": "automatic-run",
+        "model": {
+            "num_interactions": 1,
+            "correlation": 1,
+            "hidden_channels": 1,
+            "max_L": 2,
+            "initialization_seed": 19,
+        },
+        "reference": {
+            "sources": [
+                {
+                    "poscar": filename,
+                    "template_id": template_id,
+                    "maximum_strain": maximum_strain,
+                }
+                for filename, _, template_id, maximum_strain in references
+            ]
+        },
+        "data": {
+            "train": [
+                {"path": filename, "template_id": template_id}
+                for filename, _, template_id in train
+            ],
+            "validation": [
+                {"path": filename, "template_id": template_id}
+                for filename, _, template_id in validation
+            ],
+        },
+        "ot_solver": {"training": "sinkhorn", "inference": inference},
+        "loss": {
+            "energy_weight": 1.0,
+            "forces_weight": 0.0,
+            "stress_weight": 0.0,
+        },
+        "baseline": "zero",
+        "radii": {"r_ot": 4.0, "r_mp": 3.0},
+        "training": {
+            "batch_size": 2,
+            "validation_batch_size": 2,
+            "max_epochs": 1,
+            "learning_rate": 0.001,
+        },
+        "runtime": {"device": "cpu", "dtype": "float64", "seed": 23},
+    }
+    recipe = directory / "automatic.yaml"
+    recipe.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+    return recipe
+
+
 def _write_recipe_case(
     directory: Path, *, yaml_recipe: bool = True, frame_count: int = 1
 ):
@@ -162,6 +230,260 @@ def test_resolve_validate_and_train_dry_run_share_canonical_resolution(tmp_path,
     dry_run = json.loads(capsys.readouterr().out)
     assert dry_run == validated
     assert not (tmp_path / "runs" / "recipe-run").exists()
+
+
+def test_poscar_only_recipe_resolves_and_full_preflight_is_shared(tmp_path, capsys):
+    recipe_path, specification_path, poscar = _write_recipe_case(tmp_path)
+    payload = yaml.safe_load(recipe_path.read_text(encoding="utf-8"))
+    payload["reference"] = poscar.name
+    payload["ot_solver"]["inference"] = "sinkhorn"
+    recipe_path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+    specification_path.unlink()
+
+    resolved = resolve_training_recipe(recipe_path)
+    automatic = resolved.automatic_reference_preparation
+    assert automatic is not None
+    assert len(automatic.results) == 1
+    certificate = automatic.results[0].to_dict()
+    assert certificate["approval_status"] == "provisional"
+    assert certificate["scope"] == "dataset_bounded"
+    assert certificate["evaluation_policy"] is None
+    assert certificate["strain"]["resolved_maximum_strain"] == 0.01
+    assert certificate["vacancies"]["train"]["observed_K_values"] == [0]
+
+    output = tmp_path / "automatic-resolved.json"
+    manifest = tmp_path / "automatic-manifest.json"
+    assert main(
+        [
+            "resolve-train-config",
+            str(recipe_path),
+            "--output",
+            str(output),
+            "--manifest",
+            str(manifest),
+            "--dry-run",
+            "--json",
+        ]
+    ) == 0
+    resolution_report = json.loads(capsys.readouterr().out)
+    assert resolution_report["reference_preparation"] == automatic.to_dict()
+    assert not output.exists() and not manifest.exists()
+
+    assert main(["validate-train-config", str(recipe_path), "--json"]) == 0
+    validated = json.loads(capsys.readouterr().out)
+    assert validated["status"] == "scratch_preflight_ready"
+    assert validated["reference_preparation"] == automatic.to_dict()
+    assert (
+        validated["reference_preparation"]["content_fingerprint"]
+        == resolved.manifest.automatic_reference_fingerprint
+    )
+    assert main(["train", str(recipe_path), "--dry-run", "--json", "--quiet"]) == 0
+    dry_run = json.loads(capsys.readouterr().out)
+    assert dry_run == validated
+    assert not (tmp_path / "runs" / "recipe-run").exists()
+
+
+def test_automatic_mixed_templates_assignment_manifest_and_order_are_deterministic(tmp_path):
+    reference_a = _atoms(1)
+    reference_b = _atoms(1).repeat((2, 1, 1))
+    vacancy_a = reference_a.copy()
+    del vacancy_a[0]
+    vacancy_b = reference_b.copy()
+    del vacancy_b[:2]
+    references = (
+        ("POSCAR_a", reference_a, "alpha", "auto"),
+        ("POSCAR_b", reference_b, "zeta", "auto"),
+    )
+    train = (
+        ("train_a.xyz", (_labeled(reference_a, -8.0), _labeled(vacancy_a, -7.0)), "alpha"),
+        ("train_b.xyz", (_labeled(reference_b, -16.0), _labeled(vacancy_b, -14.0)), "zeta"),
+    )
+    validation = (
+        ("validation_a.xyz", (_labeled(vacancy_a, -7.1),), "alpha"),
+        ("validation_b.xyz", (_labeled(reference_b, -15.8),), "zeta"),
+    )
+    first_path = _write_automatic_recipe(
+        tmp_path, references=references, train=train, validation=validation
+    )
+    first = resolve_training_recipe(first_path)
+    automatic = first.automatic_reference_preparation
+    assert automatic is not None
+    assert [result.template_id for result in automatic.results] == ["alpha", "zeta"]
+    by_id = {result.template_id: result.to_dict() for result in automatic.results}
+    assert by_id["alpha"]["vacancies"]["train"]["observed_K_values"] == [0, 1]
+    assert by_id["zeta"]["vacancies"]["train"]["observed_K_values"] == [0, 2]
+    assert by_id["alpha"]["evaluation_policy"] is None
+    assert by_id["zeta"]["approval_status"] == "provisional"
+
+    payload = yaml.safe_load(first_path.read_text(encoding="utf-8"))
+    payload["reference"]["sources"].reverse()
+    second_path = tmp_path / "automatic-reversed.yaml"
+    second_path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+    second = resolve_training_recipe(second_path)
+    assert first.config.canonical_json() == second.config.canonical_json()
+    assert first.config.config_fingerprint == second.config.config_fingerprint
+    assert automatic.content_fingerprint == second.automatic_reference_preparation.content_fingerprint
+
+    shorthand_payload = yaml.safe_load(first_path.read_text(encoding="utf-8"))
+    shorthand_payload["reference"] = ["POSCAR_a", "POSCAR_b"]
+    shorthand_payload["data"] = {
+        "train": ["train_a.xyz", "train_b.xyz"],
+        "validation": ["validation_a.xyz", "validation_b.xyz"],
+    }
+    shorthand_path = tmp_path / "automatic-list-shorthand.yaml"
+    shorthand_path.write_text(
+        yaml.safe_dump(shorthand_payload, sort_keys=False), encoding="utf-8"
+    )
+    shorthand = resolve_training_recipe(shorthand_path)
+    shorthand_auto = shorthand.automatic_reference_preparation
+    assert shorthand_auto is not None
+    assert len(shorthand_auto.results) == 2
+    assert all(result.template_id.startswith("ref_m") for result in shorthand_auto.results)
+    assert len(shorthand_auto.train_assignments) == 4
+    assert len({template_id for _, template_id in shorthand_auto.train_assignments}) == 2
+
+
+def test_automatic_reference_rejects_ambiguity_unused_and_newton_policy(tmp_path):
+    reference = _atoms(1)
+    shifted = reference.copy()
+    shifted.positions[0, 0] += 0.01
+    common_train = (("train.xyz", (_labeled(reference, -8.0),), "alpha"),)
+    common_validation = (("validation.xyz", (_labeled(reference, -7.9),), "alpha"),)
+    recipe = _write_automatic_recipe(
+        tmp_path,
+        references=(
+            ("POSCAR_a", reference, "alpha", "auto"),
+            ("POSCAR_b", shifted, "zeta", "auto"),
+        ),
+        train=common_train,
+        validation=common_validation,
+    )
+    # Remove the exact selector so both content-distinct, same-domain templates
+    # are genuinely eligible.  No volume/filename heuristic may choose one.
+    payload = yaml.safe_load(recipe.read_text(encoding="utf-8"))
+    payload["data"]["train"] = "train.xyz"
+    payload["data"]["validation"] = "validation.xyz"
+    recipe.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+    with pytest.raises(Exception, match="AMBIGUOUS_TEMPLATE_ASSIGNMENT"):
+        resolve_training_recipe(recipe)
+
+    payload["data"]["train"] = [{"path": "train.xyz", "template_id": "alpha"}]
+    payload["data"]["validation"] = [{"path": "validation.xyz", "template_id": "alpha"}]
+    recipe.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+    with pytest.raises(Exception, match="UNUSED_AUTOMATIC_REFERENCE"):
+        resolve_training_recipe(recipe)
+
+    payload["reference"]["sources"] = [payload["reference"]["sources"][0]]
+    payload["ot_solver"]["inference"] = "sinkhorn_newton_krylov"
+    recipe.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+    with pytest.raises(Exception, match="AUTOMATIC_EVALUATION_POLICY_NOT_AVAILABLE"):
+        resolve_training_recipe(recipe)
+
+
+def test_automatic_reference_is_geometry_only_path_independent_and_rng_free(tmp_path):
+    from ase.io import write
+
+    reference = _atoms(1)
+    recipe = _write_automatic_recipe(
+        tmp_path,
+        references=(("POSCAR_original", reference, "alpha", "auto"),),
+        train=(("train.xyz", (_labeled(reference, -8.0),), "alpha"),),
+        validation=(("validation.xyz", (_labeled(reference, -7.9),), "alpha"),),
+    )
+    generated_payload = yaml.safe_load(recipe.read_text(encoding="utf-8"))
+    generated_payload["reference"]["sources"][0].pop("template_id")
+    generated_payload["data"] = {
+        "train": "train.xyz",
+        "validation": "validation.xyz",
+    }
+    recipe.write_text(
+        yaml.safe_dump(generated_payload, sort_keys=False), encoding="utf-8"
+    )
+    python_state = random.getstate()
+    numpy_state = np.random.get_state()
+    torch_state = torch.get_rng_state().clone()
+    default_dtype = torch.get_default_dtype()
+    grad_enabled = torch.is_grad_enabled()
+    first = resolve_training_recipe(recipe)
+    first_result = first.automatic_reference_preparation.results[0]
+
+    # Neither source filename nor labels participate in automatic reference
+    # identity.  The canonical training config still preserves the user's path
+    # expression under its established path contract.
+    renamed = tmp_path / "renamed-POSCAR"
+    renamed.write_bytes((tmp_path / "POSCAR_original").read_bytes())
+    write(tmp_path / "train.xyz", [_labeled(reference, 1234.5)], format="extxyz")
+    write(tmp_path / "validation.xyz", [_labeled(reference, -999.0)], format="extxyz")
+    payload = yaml.safe_load(recipe.read_text(encoding="utf-8"))
+    payload["reference"]["sources"][0]["poscar"] = renamed.name
+    moved_recipe = tmp_path / "moved.yaml"
+    moved_recipe.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+    second = resolve_training_recipe(moved_recipe)
+    second_result = second.automatic_reference_preparation.results[0]
+
+    assert first_result.template_id == second_result.template_id
+    assert first_result.template_id.startswith("ref_m8_")
+    assert first_result.specification.content_fingerprint == second_result.specification.content_fingerprint
+    assert first_result.to_dict()["artifact_sha256"] == second_result.to_dict()["artifact_sha256"]
+    assert first.automatic_reference_preparation.content_fingerprint == second.automatic_reference_preparation.content_fingerprint
+    assert first_result.specification.phase_specification.to_dict() == second_result.specification.phase_specification.to_dict()
+    assert random.getstate() == python_state
+    assert np.array_equal(np.random.get_state()[1], numpy_state[1])
+    assert torch.equal(torch.get_rng_state(), torch_state)
+    assert torch.get_default_dtype() == default_dtype
+    assert torch.is_grad_enabled() == grad_enabled
+
+
+def test_automatic_reference_strain_content_and_species_failures_are_structured(tmp_path):
+    reference = _atoms(1)
+    duplicate_recipe = _write_automatic_recipe(
+        tmp_path,
+        references=(
+            ("POSCAR_a", reference, "alpha", "auto"),
+            ("POSCAR_b", reference, "zeta", "auto"),
+        ),
+        train=(("train.xyz", (_labeled(reference, -8.0),), "alpha"),),
+        validation=(("validation.xyz", (_labeled(reference, -7.9),), "alpha"),),
+    )
+    with pytest.raises(Exception, match="DUPLICATE_REFERENCE_CONTENT"):
+        resolve_training_recipe(duplicate_recipe)
+
+    strained = reference.copy()
+    strained.set_cell(reference.cell.array * 1.046, scale_atoms=True)
+    ceiling_dir = tmp_path / "ceiling"
+    ceiling_dir.mkdir()
+    ceiling_recipe = _write_automatic_recipe(
+        ceiling_dir,
+        references=(("POSCAR", reference, "alpha", "auto"),),
+        train=(("train.xyz", (_labeled(strained, -8.0),), "alpha"),),
+        validation=(("validation.xyz", (_labeled(reference, -7.9),), "alpha"),),
+    )
+    with pytest.raises(Exception, match="AUTO_MAXIMUM_STRAIN_LIMIT_EXCEEDED"):
+        resolve_training_recipe(ceiling_recipe)
+
+    explicit_dir = tmp_path / "explicit"
+    explicit_dir.mkdir()
+    explicit_recipe = _write_automatic_recipe(
+        explicit_dir,
+        references=(("POSCAR", reference, "alpha", 0.01),),
+        train=(("train.xyz", (_labeled(strained, -8.0),), "alpha"),),
+        validation=(("validation.xyz", (_labeled(reference, -7.9),), "alpha"),),
+    )
+    with pytest.raises(Exception, match="EXPLICIT_MAXIMUM_STRAIN_TOO_SMALL"):
+        resolve_training_recipe(explicit_recipe)
+
+    unsupported = reference.copy()
+    unsupported.numbers[0] = 14
+    species_dir = tmp_path / "species"
+    species_dir.mkdir()
+    species_recipe = _write_automatic_recipe(
+        species_dir,
+        references=(("POSCAR", reference, "alpha", "auto"),),
+        train=(("train.xyz", (_labeled(reference, -8.0),), "alpha"),),
+        validation=(("validation.xyz", (_labeled(unsupported, -7.9),), "alpha"),),
+    )
+    with pytest.raises(Exception, match="VALIDATION_ONLY_SPECIES"):
+        resolve_training_recipe(species_recipe)
 
 
 def test_recipe_normal_train_is_rejected_after_preflight_without_side_effects(tmp_path, capsys):
