@@ -3,8 +3,9 @@
 # Required: this is the recipe file-format version, not a model version.
 schema_version: refsite_training_recipe_v1
 
-# Required: creates ./runs/my-first-run when training starts; create ./runs first.
-name: my-first-run
+# Required: the leaf run directory is created when training starts.
+# Its parent (this YAML directory) must be writable; an existing leaf is rejected.
+output_directory: ./my-first-run
 
 # Optional model settings. Defaults: symmetric correlation, 2 interaction
 # blocks, cumulative correlation order 3, 8 hidden channels, and max_L=2.

@@ -58,7 +58,6 @@ def _labeled(atoms, *, energy: float):
 def _copy_example(tmp_path: Path, filename: str) -> Path:
     (tmp_path / "references").mkdir()
     (tmp_path / "data").mkdir()
-    (tmp_path / "runs").mkdir()
     destination = tmp_path / filename
     shutil.copyfile(_EXAMPLES / filename, destination)
     return destination
@@ -113,6 +112,33 @@ def _run_read_only_cli(recipe: Path, capsys, *overrides: str):
     return resolution, validation
 
 
+def _assert_explicit_leaf_output(
+    recipe: Path,
+    resolution: dict,
+    *,
+    expected_leaf: str,
+) -> None:
+    authored = TrainingRecipeConfig.from_dict(
+        yaml.safe_load(recipe.read_text(encoding="utf-8"))
+    )
+    assert authored.name is None
+    assert authored.output_directory == f"./{expected_leaf}"
+    compiled = TrainingRunConfig.from_dict(resolution["compiled_config"])
+    assert compiled.output_directory == f"./{expected_leaf}"
+    output_path = next(
+        item
+        for item in resolution["resolution_manifest"]["paths"]
+        if item["field"] == "output_directory"
+    )
+    assert output_path == {
+        "field": "output_directory",
+        "original": f"./{expected_leaf}",
+        "resolved": str(recipe.parent / expected_leaf),
+    }
+    assert not (recipe.parent / "runs").exists()
+    assert not (recipe.parent / expected_leaf).exists()
+
+
 def test_minimal_example_uses_defaults_and_is_a_deterministic_read_only_dry_run(
     tmp_path, capsys
 ):
@@ -133,6 +159,9 @@ def test_minimal_example_uses_defaults_and_is_a_deterministic_read_only_dry_run(
     )
 
     resolution, validation = _run_read_only_cli(recipe, capsys)
+    _assert_explicit_leaf_output(
+        recipe, resolution, expected_leaf="my-first-run"
+    )
     compiled = TrainingRunConfig.from_dict(resolution["compiled_config"])
     higher = compiled.model_source.potential.higher_body
     assert compiled.model_source.potential.num_layers == 2
@@ -161,7 +190,7 @@ def test_minimal_example_uses_defaults_and_is_a_deterministic_read_only_dry_run(
         "training_batch_size": 4,
         "validation_batch_size": 4,
     }
-    assert not (tmp_path / "runs" / "my-first-run").exists()
+    assert not (tmp_path / "my-first-run").exists()
 
 
 def test_advanced_example_binds_files_to_aliases_and_qualifies_inference(
@@ -198,6 +227,9 @@ def test_advanced_example_binds_files_to_aliases_and_qualifies_inference(
     # The source example remains cuda/float32; CPU is a read-only test override.
     resolution, validation = _run_read_only_cli(
         recipe, capsys, "--device", "cpu"
+    )
+    _assert_explicit_leaf_output(
+        recipe, resolution, expected_leaf="advanced-run"
     )
     authored = TrainingRecipeConfig.from_dict(
         yaml.safe_load((_EXAMPLES / "advanced.yaml").read_text(encoding="utf-8"))
@@ -252,7 +284,7 @@ def test_advanced_example_binds_files_to_aliases_and_qualifies_inference(
     assert [item["num_sites"] for item in train["samples"]] == [8, 8, 16]
     assert validation["baseline_preflight"]["rank"] == 2
     assert validation["baseline_preflight"]["required_rank"] == 2
-    assert not (tmp_path / "runs" / "advanced-model").exists()
+    assert not (tmp_path / "advanced-run").exists()
 
 
 @pytest.mark.parametrize("filename", ["minimal.yaml", "advanced.yaml"])
@@ -260,7 +292,13 @@ def test_example_yaml_uses_only_live_public_recipe_vocabulary(filename):
     path = _EXAMPLES / filename
     text = path.read_text(encoding="utf-8")
     payload = yaml.safe_load(text)
+    assert "name" not in payload
+    assert set(payload) >= {"schema_version", "output_directory"}
     recipe = TrainingRecipeConfig.from_dict(payload)
+    assert recipe.name is None
+    assert recipe.output_directory == (
+        "./my-first-run" if filename == "minimal.yaml" else "./advanced-run"
+    )
     assert TrainingRecipeConfig.from_dict(recipe.to_dict()).to_dict() == recipe.to_dict()
 
     lower = text.lower()

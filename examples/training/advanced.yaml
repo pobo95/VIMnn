@@ -3,8 +3,9 @@
 # Required: this is the recipe file-format version, not a model version.
 schema_version: refsite_training_recipe_v1
 
-# Required: creates ./runs/advanced-model when training starts; create ./runs first.
-name: advanced-model
+# Required: the leaf run directory is created when training starts.
+# Its parent (this YAML directory) must be writable; an existing leaf is rejected.
+output_directory: ./advanced-run
 
 model:
   # Optional; symmetric is the default. Use sequential only for legacy compatibility.
