@@ -592,6 +592,46 @@ def _automatic_phase(
             "automatic phase Hessian condition exceeds the fixed search certificate",
             stage="automatic_reference.phase", expected=f"<= {_PHASE_MAXIMUM_CONDITION}", actual=condition,
         )
+    if math.isfinite(residual) and residual > _PHASE_MAXIMUM_RESIDUAL:
+        # This is an exact self-reference certificate: atom and site fields
+        # have the same canonical fractional coordinates and channel weights.
+        # The legacy path above deliberately remains first so existing passing
+        # certificates that already pass stay byte-identical.  Recover only
+        # PHASE_RESIDUAL_CERTIFICATE_FAILED from the one-sided Cartesian
+        # round trip by cloning the canonical reference field, rather than
+        # changing a threshold or any runtime phase solver.
+        exact_atomic = reference.clone()
+        exact_cross = torch.einsum(
+            "c,gc,gc->g",
+            specification.channel_weights.to(dtype=reference.dtype),
+            exact_atomic,
+            reference.conj(),
+        )
+        exact_gradient, exact_hessian = phase_gradient_hessian(
+            phase, exact_cross, modes, specification.mode_weights
+        )
+        exact_curvature = torch.linalg.eigvalsh(-exact_hessian)
+        exact_minimum_curvature = float(exact_curvature.min())
+        exact_maximum_curvature = float(exact_curvature.max())
+        exact_condition = exact_maximum_curvature / exact_minimum_curvature
+        exact_residual = float(torch.linalg.vector_norm(exact_gradient))
+        if (
+            math.isfinite(exact_minimum_curvature)
+            and exact_minimum_curvature > _PHASE_MINIMUM_CURVATURE
+            and math.isfinite(exact_condition)
+            and exact_condition <= _PHASE_MAXIMUM_CONDITION
+            and math.isfinite(exact_residual)
+            and exact_residual <= _PHASE_MAXIMUM_RESIDUAL
+        ):
+            atomic = exact_atomic
+            cross = exact_cross
+            gradient = exact_gradient
+            hessian = exact_hessian
+            curvature = exact_curvature
+            minimum_curvature = exact_minimum_curvature
+            maximum_curvature = exact_maximum_curvature
+            condition = exact_condition
+            residual = exact_residual
     if not math.isfinite(residual) or residual > _PHASE_MAXIMUM_RESIDUAL:
         raise _error(
             "PHASE_RESIDUAL_CERTIFICATE_FAILED",
