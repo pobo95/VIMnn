@@ -48,8 +48,12 @@ class ProbabilityMultipoleConfig:
             or self.n_radial <= 0
         ):
             raise ValueError("n_radial must be a positive integer")
-        if self.lmax != 2:
-            raise ValueError("feature layout v1 requires lmax=2")
+        if (
+            isinstance(self.lmax, bool)
+            or not isinstance(self.lmax, Integral)
+            or int(self.lmax) not in (0, 1, 2)
+        ):
+            raise ValueError("feature layout v1 requires lmax=0, 1, or 2")
         for name, value in (
             ("ell_feature", self.ell_feature),
             ("r_cut", self.r_cut),

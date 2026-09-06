@@ -145,6 +145,12 @@ class PotentialConfig:
             raise TypeError("transport_support must be TransportSupportConfig")
         self.feature.validate()
         self.higher_body.validate()
+        if (
+            self.higher_body.contract_version
+            == "central_conditioned_higher_body_v1"
+            and self.feature.lmax != 2
+        ):
+            raise ValueError("feature layout v1 requires lmax=2")
         if self.feature.species_vocabulary != self.species_vocabulary:
             raise ValueError("feature species mismatch")
         if self.higher_body.species_count != len(self.species_vocabulary):
@@ -213,8 +219,10 @@ class PotentialConfig:
         _, o3 = import_e3nn_0_4_4()
         species_count = len(self.species_vocabulary)
         radial_count = self.feature.n_radial
-        return o3.Irreps(
-            f"{species_count}x0e + {species_count * radial_count}x0e + "
-            f"{species_count * radial_count}x1o + "
-            f"{species_count * radial_count}x2e"
+        terms = [f"{species_count}x0e"]
+        terms.extend(
+            f"{species_count * radial_count}x{angular}"
+            f"{'e' if angular % 2 == 0 else 'o'}"
+            for angular in range(self.feature.lmax + 1)
         )
+        return o3.Irreps(" + ".join(terms))

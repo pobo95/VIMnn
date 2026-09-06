@@ -24,7 +24,10 @@ from refsite_mlip.config import (
     TrainingRunConfig,
     TrainingRunConfigOverrides,
     TrainingRunConfigError,
+    TrainingRecipeError,
+    TRAINING_RECIPE_SCHEMA_VERSION,
     load_effective_training_run_config,
+    resolve_training_recipe,
     resolve_training_run,
 )
 from refsite_mlip.config.training_run import _load_split, _split_digest
@@ -143,11 +146,35 @@ def _load_preflight(
 ) -> tuple[
     TrainingRunConfig,
     ResolvedTrainingRun | ResolvedScratchTrainingRun | ScratchTrainingPreparation,
+    bool,
 ]:
+    recipe_input = False
     try:
-        config = load_effective_training_run_config(
-            path, overrides, cli_cwd=cli_cwd
-        )
+        try:
+            config = load_effective_training_run_config(
+                path, overrides, cli_cwd=cli_cwd
+            )
+        except TrainingRunConfigError as canonical_error:
+            if not (
+                canonical_error.reason_code == "UNSUPPORTED_TRAINING_RUN_SCHEMA"
+                and canonical_error.actual == TRAINING_RECIPE_SCHEMA_VERSION
+            ):
+                raise
+            recipe_input = True
+            config = resolve_training_recipe(
+                path, overrides=overrides, cli_cwd=cli_cwd
+            ).config
+    except TrainingRecipeError as error:
+        raise CLIConfigPreflightError(
+            error.reason_code,
+            error.message,
+            stage=error.stage,
+            path=error.path or path,
+            config_field=error.field,
+            source_kind="recipe",
+            underlying_reason_code=error.reason_code,
+            original_error=error,
+        ) from error
     except TrainingRunConfigError as error:
         _raise_cli_preflight(error, path, error_type=CLIConfigPreflightError)
     if isinstance(config.model_source, ScratchModelSourceConfig):
@@ -169,7 +196,7 @@ def _load_preflight(
             resolved = resolve_training_run(config)
         except TrainingRunConfigError as error:
             _raise_cli_preflight(error, path)
-    return config, resolved
+    return config, resolved, recipe_input
 
 
 def _runtime_paths(
@@ -1407,7 +1434,7 @@ def _run_training_impl(
     if progress_renderer is not None:
         progress_renderer.render_stage("loading training configuration")
     effective_cli_cwd = Path.cwd() if cli_cwd is None else Path(cli_cwd)
-    config, resolved = _load_preflight(
+    preflight_result = _load_preflight(
         path,
         overrides=overrides,
         cli_cwd=effective_cli_cwd,
@@ -1417,8 +1444,25 @@ def _run_training_impl(
             else progress_renderer.render_stage
         ),
     )
+    # Preserve the long-standing two-item private seam used by focused
+    # orchestration tests while the production loader carries recipe origin.
+    if len(preflight_result) == 2:
+        config, resolved = preflight_result
+        recipe_input = False
+    else:
+        config, resolved, recipe_input = preflight_result
     if dry_run:
         return resolved
+    if recipe_input:
+        raise CLIError(
+            "RECIPE_EXECUTION_NOT_INTEGRATED",
+            "recipe execution is not integrated; execute the compiled canonical v2 config",
+            stage="recipe.execution",
+            path=config.source_path,
+            source_kind="recipe",
+            config_fingerprint=config.config_fingerprint,
+            underlying_reason_code="RECIPE_EXECUTION_NOT_INTEGRATED",
+        )
     if isinstance(resolved, ScratchTrainingPreparation):
         # Imported only on the execution branch so validate/dry-run retain their
         # strictly read-only dependency boundary.

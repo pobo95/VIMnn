@@ -352,6 +352,26 @@ def build_parser() -> argparse.ArgumentParser:
     _add_debug_argument(validate_train, hidden=True)
     validate_train.set_defaults(command_handler=_run_validate_train_config)
 
+    resolve_train = commands.add_parser(
+        "resolve-train-config",
+        help="compile a beginner recipe into canonical training-run schema v2",
+        description=(
+            "Safely resolve a versioned training recipe and write its complete "
+            "canonical v2 config plus an immutable resolution manifest."
+        ),
+    )
+    _add_training_config_arguments(resolve_train)
+    resolve_train.add_argument("--output", required=True, dest="output_path")
+    resolve_train.add_argument("--manifest", required=True, dest="manifest_path")
+    resolve_train.add_argument("--dry-run", action="store_true")
+    resolve_train.add_argument("--overwrite", action="store_true")
+    resolve_train.add_argument(
+        "--json", action="store_true", dest="json_output",
+        help="emit deterministic compact JSON resolution metadata",
+    )
+    _add_debug_argument(resolve_train, hidden=True)
+    resolve_train.set_defaults(command_handler=_run_resolve_train_config)
+
     train = commands.add_parser(
         "train",
         help="execute a validated fresh training run",
@@ -577,6 +597,29 @@ def _run_validate_train_config(args: argparse.Namespace) -> int:
         else render_train_config_human(resolved)
     )
     print(output)
+    return 0
+
+
+def _run_resolve_train_config(args: argparse.Namespace) -> int:
+    from .resolve_train_config import (
+        render_resolution_human,
+        render_resolution_json,
+        resolve_train_config,
+    )
+
+    resolved = resolve_train_config(
+        _training_config_path(args),
+        output_path=args.output_path,
+        manifest_path=args.manifest_path,
+        overrides=_training_config_overrides(args),
+        dry_run=args.dry_run,
+        overwrite=args.overwrite,
+    )
+    print(
+        render_resolution_json(resolved)
+        if args.json_output
+        else render_resolution_human(resolved)
+    )
     return 0
 
 

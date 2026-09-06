@@ -12,7 +12,10 @@ from refsite_mlip.config import (
     ScratchModelSourceConfig,
     TrainingRunConfigOverrides,
     TrainingRunConfigError,
+    TrainingRecipeError,
+    TRAINING_RECIPE_SCHEMA_VERSION,
     load_effective_training_run_config,
+    resolve_training_recipe,
     resolve_training_run,
 )
 from refsite_mlip.training import (
@@ -57,9 +60,29 @@ def validate_train_config(
     """Run the shared bundle or scratch preflight without creating a runtime."""
 
     try:
-        config = load_effective_training_run_config(
-            path, overrides, cli_cwd=cli_cwd
-        )
+        try:
+            config = load_effective_training_run_config(
+                path, overrides, cli_cwd=cli_cwd
+            )
+        except TrainingRunConfigError as canonical_error:
+            if not (
+                canonical_error.reason_code == "UNSUPPORTED_TRAINING_RUN_SCHEMA"
+                and canonical_error.actual == TRAINING_RECIPE_SCHEMA_VERSION
+            ):
+                raise
+            config = resolve_training_recipe(
+                path, overrides=overrides, cli_cwd=cli_cwd
+            ).config
+    except TrainingRecipeError as error:
+        raise CLIConfigPreflightError(
+            error.reason_code,
+            error.message,
+            stage=error.stage,
+            path=error.path or path,
+            config_field=error.field,
+            underlying_reason_code=error.reason_code,
+            original_error=error,
+        ) from error
     except TrainingRunConfigError as error:
         raise _cli_error(
             error,
