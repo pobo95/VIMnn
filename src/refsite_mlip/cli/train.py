@@ -479,7 +479,7 @@ def _status_base(
         "runtime": {
             "device": resolved.resolved_device,
             "dtype": resolved.resolved_dtype,
-            "solver_path": TRAIN_FIXED,
+            "solver_path": "sinkhorn",
         },
         "completed_epochs": 0,
         "global_step": config.fit.global_step_start,
@@ -1079,9 +1079,16 @@ def _start_summary(
         _baseline_presentation(config, baseline_metadata)
     )
     radii = config.radii.derived
+    symmetric = model.config.higher_body.symmetric_correlation
+    correlation_method = "symmetric" if symmetric is not None else "sequential"
+    maximum_correlation_order = (
+        symmetric.correlation_order if symmetric is not None else 3
+    )
     return TrainingStartSummary(
         run_name=Path(output_directory).name,
         source_kind=source_kind,
+        correlation_method=correlation_method,
+        maximum_correlation_order=maximum_correlation_order,
         device=device,
         dtype=dtype,
         training_seed=config.runtime.seed,
@@ -1105,7 +1112,7 @@ def _start_summary(
         r_candidate_ot=radii.r_candidate_ot,
         r_candidate_mp=radii.r_candidate_mp,
         ot_backend=model.config.transport_support.backend,
-        solver_path="TRAIN_FIXED",
+        solver_path="sinkhorn",
         baseline_enabled=baseline_enabled,
         baseline_values=baseline_values,
         baseline_rank_policy=rank_policy,
@@ -1458,26 +1465,10 @@ def _run_training_impl(
     # orchestration tests while the production loader carries recipe origin.
     if len(preflight_result) == 2:
         config, resolved = preflight_result
-        recipe_input = False
     else:
-        config, resolved, recipe_input = preflight_result
+        config, resolved, _recipe_input = preflight_result
     if dry_run:
         return resolved
-    automatic_recipe = (
-        recipe_input
-        and isinstance(resolved, ScratchTrainingPreparation)
-        and resolved.automatic_reference_preparation is not None
-    )
-    if recipe_input and not automatic_recipe:
-        raise CLIError(
-            "RECIPE_EXECUTION_NOT_INTEGRATED",
-            "recipe execution is not integrated; execute the compiled canonical v2 config",
-            stage="recipe.execution",
-            path=config.source_path,
-            source_kind="recipe",
-            config_fingerprint=config.config_fingerprint,
-            underlying_reason_code="RECIPE_EXECUTION_NOT_INTEGRATED",
-        )
     if isinstance(resolved, ScratchTrainingPreparation):
         # Imported only on the execution branch so validate/dry-run retain their
         # strictly read-only dependency boundary.
@@ -1743,6 +1734,11 @@ def render_training_human(report: Mapping[str, Any]) -> str:
     status = str(report["status"])
     fit = report["fit_result"]
     baseline = report["baseline"]
+    displayed_solver = {
+        "train_fixed": "sinkhorn",
+        "train-fixed": "sinkhorn",
+        "TRAIN_FIXED": "sinkhorn",
+    }.get(report["runtime"]["solver_path"], report["runtime"]["solver_path"])
     return "\n".join(
         (
             "Reference-site MLIP training run",
@@ -1753,7 +1749,7 @@ def render_training_human(report: Mapping[str, Any]) -> str:
             f"Validation semantic SHA-256: {report['validation_semantic_digest']}",
             f"Seed: {report['seed']}",
             f"Runtime: {report['runtime']['device']} / {report['runtime']['dtype']}",
-            f"Solver: {report['runtime']['solver_path']}",
+            f"Solver: {displayed_solver}",
             f"Epochs completed: {report['completed_epochs']}",
             f"Global step: {report['global_step']}",
             f"Stopped early: {'yes' if fit['stopped_early'] else 'no'}",

@@ -1238,7 +1238,7 @@ def _resume_preflight_report(
                 "runtime": {
                     "device": stored.resolved_device,
                     "dtype": stored.resolved_dtype,
-                    "solver_path": TRAIN_FIXED,
+                    "solver_path": "sinkhorn",
                 },
                 "checkpoint": {
                     "source": str(directory.checkpoints / "latest.pt"),
@@ -1497,7 +1497,7 @@ def _resume_status_base(
         "runtime": {
             "device": preflight.resolved.resolved_device,
             "dtype": preflight.resolved.resolved_dtype,
-            "solver_path": TRAIN_FIXED,
+            "solver_path": "sinkhorn",
         },
         "resume_source": str(preflight.directory.checkpoints / "latest.pt"),
         "resume_from_epoch": checkpoint.progress.next_epoch,

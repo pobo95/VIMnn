@@ -918,13 +918,16 @@ def _validate_stored_run(directory: TrainingRunDirectory) -> _StoredRun:
     status_runtime = _require_mapping(
         status.get("runtime"), field="run_status.runtime", path=directory.status_path
     )
+    stored_solver = status_runtime.get("solver_path")
     _require_equal(
         "run_status.runtime",
         status_runtime,
         {
             "device": config.runtime.device,
             "dtype": config.runtime.dtype,
-            "solver_path": TRAIN_FIXED,
+            "solver_path": (
+                "sinkhorn" if stored_solver == "sinkhorn" else TRAIN_FIXED
+            ),
         },
         path=directory.status_path,
         reason="RUN_STATUS_IDENTITY_MISMATCH",

@@ -174,6 +174,8 @@ class TrainingStartSummary:
     initial_bundle_fingerprint: str
     train_semantic_digest: str
     validation_semantic_digest: str
+    correlation_method: str = "sequential"
+    maximum_correlation_order: int = 3
     resumed: bool = False
     resume_checkpoint_epoch: int | None = None
     resume_global_step: int | None = None
@@ -185,6 +187,7 @@ class TrainingStartSummary:
         string_fields = (
             "run_name",
             "source_kind",
+            "correlation_method",
             "device",
             "dtype",
             "ot_backend",
@@ -207,8 +210,28 @@ class TrainingStartSummary:
             )
         if self.source_kind not in ("scratch", "bundle"):
             raise ValueError("source_kind must be 'scratch' or 'bundle'")
-        if self.solver_path not in ("train-fixed", "TRAIN_FIXED"):
-            raise ValueError("solver_path must be TRAIN_FIXED")
+        if self.correlation_method not in ("symmetric", "sequential"):
+            raise ValueError(
+                "correlation_method must be symmetric or sequential"
+            )
+        object.__setattr__(
+            self,
+            "maximum_correlation_order",
+            _integer(
+                "maximum_correlation_order",
+                self.maximum_correlation_order,
+                minimum=1,
+            ),
+        )
+        public_solver = {
+            "sinkhorn": "sinkhorn",
+            "train_fixed": "sinkhorn",
+            "train-fixed": "sinkhorn",
+            "TRAIN_FIXED": "sinkhorn",
+        }.get(self.solver_path)
+        if public_solver is None:
+            raise ValueError("training solver must be sinkhorn")
+        object.__setattr__(self, "solver_path", public_solver)
         if self.scheduler_mode not in ("min", "max"):
             raise ValueError("scheduler_mode must be 'min' or 'max'")
 
@@ -791,6 +814,9 @@ class TrainingProgressRenderer:
             f"  Seeds: training={summary.training_seed}, initialization={init_seed}",
             f"  Model: {summary.parameter_element_count} parameters "
             f"({summary.parameter_tensor_count} tensors)",
+            f"  Correlation method: {summary.correlation_method}",
+            "  Maximum correlation order: "
+            f"{summary.maximum_correlation_order}",
             f"  Species: {species}",
             f"  Templates: {templates}",
             f"  Data: train={summary.train_frame_count} frames/"

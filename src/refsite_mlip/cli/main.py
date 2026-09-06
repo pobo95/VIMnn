@@ -106,7 +106,7 @@ def _add_training_config_arguments(parser: argparse.ArgumentParser) -> None:
     source.add_argument(
         "config_path",
         nargs="?",
-        help="training-run JSON or YAML configuration path",
+        help="training recipe or canonical run-config JSON/YAML path",
     )
     source.add_argument(
         "--config",
@@ -356,10 +356,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     validate_train = commands.add_parser(
         "validate-train-config",
-        help="validate a canonical training-run config without training",
+        help="validate a training recipe or canonical run config without training",
         description=(
-            "Safely verify a portable initial bundle, extxyz data, radii, and "
-            "training controls without model execution or filesystem writes."
+            "Resolve a beginner recipe when needed, then safely verify references, "
+            "extxyz data, radii, and training controls without model execution or "
+            "filesystem writes."
         ),
     )
     _add_training_config_arguments(validate_train)
@@ -381,8 +382,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     _add_training_config_arguments(resolve_train)
-    resolve_train.add_argument("--output", required=True, dest="output_path")
-    resolve_train.add_argument("--manifest", required=True, dest="manifest_path")
+    resolve_train.add_argument(
+        "--output",
+        dest="output_path",
+        help="canonical config output (required unless --dry-run)",
+    )
+    resolve_train.add_argument(
+        "--manifest",
+        dest="manifest_path",
+        help="resolution manifest output (required unless --dry-run)",
+    )
     resolve_train.add_argument("--dry-run", action="store_true")
     resolve_train.add_argument("--overwrite", action="store_true")
     resolve_train.add_argument(
@@ -396,8 +405,9 @@ def build_parser() -> argparse.ArgumentParser:
         "train",
         help="execute a validated fresh training run",
         description=(
-            "Preflight a canonical training-run config and compose the existing "
-            "baseline, optimizer, scheduler, and checkpointed-fit engine."
+            "Resolve and preflight a beginner recipe or canonical training-run "
+            "config, then compose the existing baseline, optimizer, scheduler, "
+            "and checkpointed-fit engine."
         ),
     )
     _add_training_config_arguments(train)

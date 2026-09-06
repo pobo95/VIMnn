@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import copy
 import importlib
 import json
 from pathlib import Path
@@ -92,7 +93,17 @@ def _fake_bundle(*, reverse: bool):
         ),
         default_template_id="zeta",
         model_config=_mapping(
-            [("num_layers", 2), ("species_vocabulary", [6, 41])],
+            [
+                ("num_layers", 2),
+                ("species_vocabulary", [6, 41]),
+                (
+                    "higher_body",
+                    {
+                        "contract_version": "central_conditioned_higher_body_v1",
+                        "correlation_mode": "uuu",
+                    },
+                ),
+            ],
             reverse=reverse,
         ),
         model_floating_dtype="float64",
@@ -164,7 +175,39 @@ def test_inspection_json_is_plain_stable_and_mapping_order_independent():
         "tensor_count": 2,
         "total_bytes": 56,
     }
+    assert first["model"]["correlation_method"] == "sequential"
+    assert first["model"]["maximum_correlation_order"] == 3
+    assert first["inference"] == {
+        "default_solver": "sinkhorn",
+        "evaluation_policy_complete": False,
+        "evaluation_policy_present": True,
+        "supported_solvers": ["sinkhorn"],
+    }
+    assert "central_conditioned" not in encoded
     assert len(first["templates"]["alpha"]["phase_specification_fingerprint"]) == 64
+
+
+def test_inspection_projects_symmetric_contract_to_public_vocabulary():
+    bundle = copy(_fake_bundle(reverse=False))
+    config = dict(bundle.model_config)
+    config["higher_body"] = {
+        "contract_version": "central_conditioned_symmetric_power_v2",
+        "symmetric_correlation": {
+            "correlation_order": 2,
+            "basis_kind": "full_path",
+            "normalization": "component",
+            "basis_version": "full_path_real_cg_e3nn_0_4_4_v1",
+        },
+    }
+    bundle.model_config = config
+    report = summarize_bundle(bundle)
+    encoded = render_json(report)
+    assert report["model"]["correlation_method"] == "symmetric"
+    assert report["model"]["maximum_correlation_order"] == 2
+    assert report["model"]["config"]["higher_body"]["correlation_method"] == (
+        "symmetric"
+    )
+    assert "central_conditioned_symmetric_power_v2" not in encoded
 
 
 def test_human_output_sorts_templates_and_spells_out_conventions():
@@ -175,6 +218,9 @@ def test_human_output_sorts_templates_and_spells_out_conventions():
     assert "Stress sign: tensile_positive (no sign reversal)" in human
     assert 'Stress Voigt order: ["xx","yy","zz","yz","xz","xy"]' in human
     assert "Parameter/buffer state: 2 tensors, 7 elements, 56 bytes" in human
+    assert "Correlation method: sequential" in human
+    assert "Supported solvers: sinkhorn" in human
+    assert "Default solver: sinkhorn" in human
     assert "private.raw.weight" not in human
 
 
@@ -213,6 +259,16 @@ def test_render_json_rejects_nonfinite_and_nonplain_values():
         render_json({"value": float("nan")})
     with pytest.raises(TypeError, match="non-JSON metadata"):
         render_json({"value": torch.tensor(1.0)})
+
+
+def test_resolve_outputs_are_required_only_for_non_dry_run(tmp_path, capsys):
+    recipe = tmp_path / "recipe.yaml"
+    recipe.write_text("schema_version: refsite_training_recipe_v1\n", encoding="utf-8")
+
+    assert main(["resolve-train-config", str(recipe), "--json"]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "MISSING_RESOLUTION_OUTPUT" in captured.err
 
 
 @pytest.mark.parametrize(

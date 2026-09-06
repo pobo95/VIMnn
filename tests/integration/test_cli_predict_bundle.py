@@ -126,7 +126,11 @@ def _assert_output_matches_direct(input_frames, output_frames, direct, *, tolera
         np.testing.assert_array_equal(output.arrays["input_order"], source.arrays["input_order"])
         assert output.info["source_metadata"] == source.info["source_metadata"]
         assert output.info["refsite_template_id"] == prediction.template_id
-        assert output.info["refsite_solver_path"] in (TRAIN_FIXED, EVAL_ADAPTIVE)
+        assert output.info["refsite_solver"] in (
+            "sinkhorn",
+            "sinkhorn_newton_krylov",
+        )
+        assert "refsite_solver_path" not in output.info
         assert len(output.info["refsite_bundle_sha256"]) == 64
         assert output.get_potential_energy() == pytest.approx(
             float(prediction.energy), abs=tolerance, rel=tolerance

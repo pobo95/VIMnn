@@ -29,6 +29,8 @@ def _summary(**overrides: object) -> TrainingStartSummary:
     values: dict[str, object] = {
         "run_name": "synthetic-run",
         "source_kind": "scratch",
+        "correlation_method": "symmetric",
+        "maximum_correlation_order": 3,
         "device": "cpu",
         "dtype": "float64",
         "training_seed": -17,
@@ -239,6 +241,10 @@ def test_start_block_contains_runtime_snapshot_and_resume_context() -> None:
     assert "Reference-site MLIP training\n" in text
     assert "  Source: scratch (resumed)\n" in text
     assert "  Device: cpu, dtype=float64\n" in text
+    assert "  Correlation method: symmetric\n" in text
+    assert "  Maximum correlation order: 3\n" in text
+    assert "solver=sinkhorn" in text
+    assert "TRAIN_FIXED" not in text
     assert "  Species: C(6), Nb(41)\n" in text
     assert "a-template (M=4, default), z-template (M=8)" in text
     assert "E=train:yes/validation:yes" in text

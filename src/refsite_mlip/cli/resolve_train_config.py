@@ -94,14 +94,24 @@ def _atomic_text(target: Path, encoded: str, *, overwrite: bool) -> None:
 def resolve_train_config(
     recipe_path: str | os.PathLike[str],
     *,
-    output_path: str | os.PathLike[str],
-    manifest_path: str | os.PathLike[str],
+    output_path: str | os.PathLike[str] | None = None,
+    manifest_path: str | os.PathLike[str] | None = None,
     overrides: TrainingRunConfigOverrides | None = None,
     cli_cwd: str | os.PathLike[str] | None = None,
     dry_run: bool = False,
     overwrite: bool = False,
 ) -> ResolvedTrainingRecipe:
     """Compile and optionally save the canonical config plus resolution manifest."""
+
+    if type(dry_run) is not bool or type(overwrite) is not bool:
+        raise TypeError("dry_run and overwrite must be bool")
+    if not dry_run and (output_path is None or manifest_path is None):
+        raise CLIConfigPreflightError(
+            "MISSING_RESOLUTION_OUTPUT",
+            "--output and --manifest are required unless --dry-run is used",
+            stage="recipe.output",
+            path=recipe_path,
+        )
 
     try:
         effective_cli_cwd = Path.cwd() if cli_cwd is None else Path(cli_cwd)
@@ -134,6 +144,15 @@ def resolve_train_config(
             )
     except TrainingRecipeError as error:
         raise _cli_error(error, recipe_path) from error
+    if dry_run and output_path is None and manifest_path is None:
+        return resolved
+    if output_path is None or manifest_path is None:
+        raise CLIConfigPreflightError(
+            "MISSING_RESOLUTION_OUTPUT",
+            "--output and --manifest must be provided together",
+            stage="recipe.output",
+            path=recipe_path,
+        )
     output = Path(output_path)
     manifest = Path(manifest_path)
     recipe = Path(recipe_path)
@@ -185,8 +204,6 @@ def resolve_train_config(
                 stage="recipe.output",
                 path=target,
             )
-    if type(dry_run) is not bool or type(overwrite) is not bool:
-        raise TypeError("dry_run and overwrite must be bool")
     if not dry_run:
         _atomic_text(output, resolved.config.canonical_json(), overwrite=overwrite)
         try:

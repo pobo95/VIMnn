@@ -115,11 +115,52 @@ def _template_summary(binding: Any) -> dict[str, Any]:
     }
 
 
+def _public_model_config(value: Mapping[str, Any]) -> tuple[dict[str, Any], str, int]:
+    """Project canonical architecture names onto the public CLI vocabulary."""
+
+    config = _plain(value, field="model.config")
+    higher = config.get("higher_body")
+    if not isinstance(higher, Mapping):
+        # Test doubles and pre-architecture legacy metadata may omit the
+        # higher-body block. Validated production bundles always contain it.
+        return config, "sequential", 3
+    higher = dict(higher)
+    contract = higher.pop("contract_version", None)
+    if contract == "central_conditioned_symmetric_power_v2":
+        symmetric = higher.pop("symmetric_correlation")
+        if not isinstance(symmetric, Mapping):
+            raise TypeError("validated symmetric config is not a mapping")
+        symmetric = dict(symmetric)
+        order = int(symmetric.pop("correlation_order"))
+        higher["correlation_method"] = "symmetric"
+        higher["correlation"] = order
+        higher["symmetric_basis"] = symmetric
+        method = "symmetric"
+    elif contract in (None, "central_conditioned_higher_body_v1"):
+        method = "sequential"
+        order = 3
+        higher["correlation_method"] = method
+    else:  # pragma: no cover - rejected by the strict bundle loader
+        raise ValueError("validated bundle has an unsupported correlation contract")
+    config["higher_body"] = higher
+    return config, method, order
+
+
 def summarize_bundle(bundle: Any) -> dict[str, Any]:
     """Build the stable public metadata view of one validated bundle."""
 
     template_ids = sorted(binding.template_id for binding in bundle.template_bindings)
     bindings = {binding.template_id: binding for binding in bundle.template_bindings}
+    public_config, correlation_method, correlation_order = _public_model_config(
+        bundle.model_config
+    )
+    policy_presence = tuple(
+        binding.evaluation_policy is not None
+        for binding in bundle.template_bindings
+    )
+    supported_solvers = ["sinkhorn"]
+    if policy_presence and all(policy_presence):
+        supported_solvers.append("sinkhorn_newton_krylov")
     report = {
         "architecture_fingerprint": bundle.architecture_fingerprint,
         # bundle_fingerprint is the validated, mapping-order-independent SHA-256
@@ -130,8 +171,16 @@ def summarize_bundle(bundle: Any) -> dict[str, Any]:
         "conventions": _convention_summary(bundle),
         "default_template_id": bundle.default_template_id,
         "model": {
-            "config": _plain(bundle.model_config, field="model.config"),
+            "config": public_config,
+            "correlation_method": correlation_method,
+            "maximum_correlation_order": correlation_order,
             "state": _state_summary(bundle),
+        },
+        "inference": {
+            "default_solver": "sinkhorn",
+            "evaluation_policy_present": any(policy_presence),
+            "evaluation_policy_complete": bool(policy_presence) and all(policy_presence),
+            "supported_solvers": supported_solvers,
         },
         "provenance": _plain(bundle.provenance, field="provenance"),
         "schema_version": bundle.schema_version,
@@ -220,6 +269,7 @@ def render_human(report: Mapping[str, Any]) -> str:
 
     data = _plain(report, field="report")
     model = data["model"]
+    inference = data["inference"]
     state = model["state"]
     conventions = data["conventions"]
     template_ids = sorted(data["template_ids"])
@@ -233,12 +283,21 @@ def render_human(report: Mapping[str, Any]) -> str:
         f"Included template IDs: {', '.join(template_ids)}",
         "",
         "Model",
+        f"  Correlation method: {model['correlation_method']}",
+        "  Maximum correlation order: "
+        f"{model['maximum_correlation_order']}",
         f"  Floating dtype: {state['floating_dtype']}",
         f"  Species vocabulary: {_display(data['species_vocabulary'])}",
         "  Parameter/buffer state: "
         f"{state['tensor_count']} tensors, {state['element_count']} elements, "
         f"{state['total_bytes']} bytes",
         f"  Public config: {_display(model['config'])}",
+        "",
+        "Inference",
+        f"  Supported solvers: {', '.join(inference['supported_solvers'])}",
+        f"  Default solver: {inference['default_solver']}",
+        "  EvaluationPolicy present: "
+        f"{_display(inference['evaluation_policy_present'])}",
         "",
         "Conventions",
         f"  Convention version: {conventions['convention_version']}",

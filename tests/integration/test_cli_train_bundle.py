@@ -126,7 +126,7 @@ def test_synthetic_cpu_float64_one_epoch_writes_recoverable_state(
     assert report["runtime"] == {
         "device": "cpu",
         "dtype": "float64",
-        "solver_path": "train_fixed",
+        "solver_path": "sinkhorn",
     }
     assert report["completed_epochs"] == 1
     assert report["global_step"] == 1

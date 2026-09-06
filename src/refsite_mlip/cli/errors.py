@@ -12,6 +12,8 @@ def _public_solver_name(value: str | None) -> str | None:
         "eval_adaptive": "sinkhorn_newton_krylov",
         "train-fixed": "sinkhorn",
         "eval-adaptive": "sinkhorn_newton_krylov",
+        "TRAIN_FIXED": "sinkhorn",
+        "EVAL_ADAPTIVE": "sinkhorn_newton_krylov",
     }.get(value, value)
 
 

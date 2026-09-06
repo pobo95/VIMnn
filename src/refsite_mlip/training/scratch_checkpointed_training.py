@@ -717,7 +717,7 @@ def _status(
             "runtime": {
                 "device": preparation.resolved_device,
                 "dtype": preparation.resolved_dtype,
-                "solver_path": TRAIN_FIXED,
+                "solver_path": "sinkhorn",
             },
             "schema_version": RUN_STATUS_SCHEMA_VERSION,
             "seed": config.runtime.seed,

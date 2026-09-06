@@ -450,7 +450,7 @@ def _prediction_and_ase_parity(
             raise AssertionError("direct prediction changed template ordering")
         if output.info["refsite_template_id"] != expected.template_id:
             raise AssertionError("extxyz output changed template ordering")
-        if output.info["refsite_solver_path"] != TRAIN_FIXED:
+        if output.info["refsite_solver"] != "sinkhorn":
             raise AssertionError("extxyz output records the wrong solver")
         for left, right, name in (
             (output.numbers, original.numbers, "atomic numbers"),

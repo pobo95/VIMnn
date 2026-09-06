@@ -187,6 +187,12 @@ def test_human_json_single_mixed_and_policy_presence(bundle_files):
     assert not no_policy["templates"][no_policy["default_template_id"]][
         "evaluation_policy_present"
     ]
+    assert single["inference"]["default_solver"] == "sinkhorn"
+    assert single["inference"]["supported_solvers"] == [
+        "sinkhorn",
+        "sinkhorn_newton_krylov",
+    ]
+    assert no_policy["inference"]["supported_solvers"] == ["sinkhorn"]
     assert mixed["conventions"]["stress_voigt_order"] == [
         "xx",
         "yy",
@@ -197,6 +203,9 @@ def test_human_json_single_mixed_and_policy_presence(bundle_files):
     ]
     assert mixed["conventions"]["stress_sign"] == "tensile_positive"
     assert "Evaluation policy present: yes" in human.stdout
+    assert "Supported solvers: sinkhorn, sinkhorn_newton_krylov" in human.stdout
+    assert "Default solver: sinkhorn" in human.stdout
+    assert "central_conditioned_" not in human.stdout
     assert human.stdout.index("  alpha\n") < human.stdout.index("  zeta\n")
     assert str(bundle_files["mixed"].resolve()) not in mixed_json.stdout
     assert str(bundle_files["mixed"].resolve()) not in human.stdout

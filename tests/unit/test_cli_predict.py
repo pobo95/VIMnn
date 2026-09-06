@@ -274,7 +274,8 @@ def test_output_frames_replace_labels_preserve_geometry_metadata_and_inputs(tmp_
     assert output.info["keep"] == "metadata"
     assert "energy" not in output.info
     assert output.info["refsite_template_id"] == "zeta"
-    assert output.info["refsite_solver_path"] == TRAIN_FIXED
+    assert output.info["refsite_solver"] == "sinkhorn"
+    assert "refsite_solver_path" not in output.info
     assert output.info["refsite_bundle_sha256"] == "f" * 64
     assert output.calc.results["energy"] == float(prediction.energy)
     assert output.calc.results["free_energy"] == float(prediction.energy)

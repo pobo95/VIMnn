@@ -29,8 +29,11 @@ from refsite_mlip.config import (
     resolve_training_recipe,
 )
 from refsite_mlip.models import load_reference_site_model_bundle
-from refsite_mlip.training import canonical_runtime_json
-from refsite_mlip.training import load_training_checkpoint
+from refsite_mlip.training import (
+    canonical_runtime_json,
+    load_training_checkpoint,
+    prepare_scratch_training_run,
+)
 
 from test_scratch_training_preparation import _atoms, _labeled, _partially_labeled
 from test_training_recipe_cli import _write_automatic_recipe
@@ -169,6 +172,13 @@ def test_poscar_only_newton_krylov_policy_audit_is_deterministic_and_geometry_on
     ):
         assert expected in rendered
 
+    original_data = prepare_scratch_training_run(
+        first.config,
+        automatic_reference_preparation=(
+            first.automatic_reference_preparation.to_dict()
+        ),
+    )
+
     # Labels and masks are deliberately outside the automatic policy audit.
     from ase.io import read, write
 
@@ -183,6 +193,16 @@ def test_poscar_only_newton_krylov_policy_audit_is_deterministic_and_geometry_on
         result.specification.evaluation_policy.content_fingerprint
     )
     assert changed.evaluation_certificate == result.evaluation_certificate
+    changed_data = prepare_scratch_training_run(
+        changed_labels.config,
+        automatic_reference_preparation=(
+            changed_labels.automatic_reference_preparation.to_dict()
+        ),
+    )
+    assert changed_data.train_semantic_digest != original_data.train_semantic_digest
+    assert changed_data.validation_semantic_digest == (
+        original_data.validation_semantic_digest
+    )
 
     # Source locations and authored path spelling are provenance, not policy
     # semantics.  Move every audited input and resolve the same geometry again.

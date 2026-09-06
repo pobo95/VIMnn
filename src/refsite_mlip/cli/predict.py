@@ -968,7 +968,7 @@ def _prediction_frames(
         output.info.update(
             {
                 "refsite_template_id": prediction.template_id,
-                "refsite_solver_path": config.solver_path,
+                "refsite_solver": config.solver_name,
                 "refsite_bundle_sha256": bundle_fingerprint,
             }
         )
