@@ -51,6 +51,7 @@ from refsite_mlip.training import (
     canonical_runtime_json,
     load_runtime_json,
     validate_checkpoint_history,
+    validate_materialized_reference_files,
 )
 from refsite_mlip.training.checkpoint import (
     _plain as _checkpoint_plain,
@@ -596,6 +597,7 @@ def _validate_stored_run(directory: TrainingRunDirectory) -> _StoredRun:
         "exact_resume",
         "rollback_succeeded",
         "partial_update_retained",
+        "reference_materialization",
     } | scratch_status_fields | _METRICS_STATUS_FIELDS
     if not required_status.issubset(status) or not set(status).issubset(allowed_status):
         raise CLIError(
@@ -2154,6 +2156,25 @@ def _check_run_unchanged(prepared: _PreparedExport) -> None:
             source_kind=prepared.request.source,
             bundle_fingerprint=prepared.stored.bundle_fingerprint,
         )
+    try:
+        validate_materialized_reference_files(
+            directory,
+            config=prepared.stored.config,
+            status=current_status,
+            bundle=current_initial,
+        )
+    except Exception as error:
+        raise CLIError(
+            getattr(error, "reason_code", None)
+            or "MATERIALIZED_REFERENCE_VALIDATION_FAILED",
+            "materialized automatic references changed during export",
+            stage=getattr(error, "stage", None)
+            or "export.reference_materialization.toctou",
+            path=getattr(error, "path", None) or directory.references,
+            template_id=getattr(error, "template_id", None),
+            underlying_reason_code=getattr(error, "reason_code", None),
+            original_error=error,
+        ) from error
 
 
 def _prepare_export(request: ExportBundleConfig) -> _PreparedExport:
@@ -2203,6 +2224,25 @@ def _prepare_export(request: ExportBundleConfig) -> _PreparedExport:
     initial_path, initial = _load_initial_bundle(
         stored, request.initial_bundle_path, source=request.source
     )
+    try:
+        validate_materialized_reference_files(
+            stored.directory,
+            config=stored.config,
+            status=stored.status,
+            bundle=initial,
+        )
+    except Exception as error:
+        raise CLIError(
+            getattr(error, "reason_code", None)
+            or "MATERIALIZED_REFERENCE_VALIDATION_FAILED",
+            "materialized automatic references differ from the initial bundle",
+            stage=getattr(error, "stage", None)
+            or "export.reference_materialization",
+            path=getattr(error, "path", None) or stored.directory.references,
+            template_id=getattr(error, "template_id", None),
+            underlying_reason_code=getattr(error, "reason_code", None),
+            original_error=error,
+        ) from error
     metric = _validate_checkpoint_compatibility(
         stored,
         checkpoint,

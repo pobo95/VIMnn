@@ -14,6 +14,9 @@ import yaml
 pytest.importorskip("ase")
 
 from refsite_mlip.cli.main import main
+from refsite_mlip.cli.errors import CLIError
+from refsite_mlip.cli.export_bundle import export_bundle
+from refsite_mlip.cli.resume import resume_training
 from refsite_mlip.config import (
     ReferenceSpecificationConfig,
     load_training_run_config,
@@ -26,7 +29,16 @@ from refsite_mlip.data import (
     build_reference_template_from_poscar,
 )
 from refsite_mlip.models import EvaluationPolicy
-from refsite_mlip.training import prepare_scratch_training_run
+from refsite_mlip.models import load_reference_site_model_bundle
+from refsite_mlip.training import (
+    ScratchCheckpointedTrainingError,
+    TrainingRunDirectory,
+    canonical_runtime_json,
+    load_training_checkpoint,
+    materialize_automatic_references,
+    prepare_scratch_training_run,
+    run_scratch_checkpointed_training,
+)
 
 from test_scratch_training_preparation import _atoms, _case, _labeled
 
@@ -283,6 +295,132 @@ def test_poscar_only_recipe_resolves_and_full_preflight_is_shared(tmp_path, caps
     assert not (tmp_path / "runs" / "recipe-run").exists()
 
 
+def test_poscar_only_recipe_materializes_trains_resumes_and_exports_without_rebuild(
+    tmp_path, capsys, monkeypatch
+):
+    reference = _atoms(1)
+    vacancy = reference.copy()
+    del vacancy[0]
+    recipe_path = _write_automatic_recipe(
+        tmp_path,
+        references=(("POSCAR", reference, "alpha", "auto"),),
+        train=((
+            "train.xyz",
+            (_labeled(reference, -8.0), _labeled(vacancy, -6.5)),
+            "alpha",
+        ),),
+        validation=(("validation.xyz", (_labeled(vacancy, -6.4),), "alpha"),),
+    )
+    payload = yaml.safe_load(recipe_path.read_text(encoding="utf-8"))
+    payload["baseline"] = "minimum_norm"
+    recipe_path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+    resolved = resolve_training_recipe(recipe_path)
+    automatic = resolved.automatic_reference_preparation
+    assert automatic is not None
+
+    assert main(["train", str(recipe_path), "--json", "--quiet"]) == 0
+    terminal = json.loads(capsys.readouterr().out)
+    assert terminal["status"] == "completed"
+    output = tmp_path / "runs" / "automatic-run"
+    expected = {
+        "resolved_config.json",
+        "preflight.json",
+        "data_manifest.json",
+        "run_status.json",
+        "initial_bundle.pt",
+        "metrics.jsonl",
+        "references",
+        "checkpoints",
+        "training.log",
+    }
+    assert {path.name for path in output.iterdir()} == expected
+    references = output / "references"
+    assert {path.name for path in references.iterdir()} == {
+        "alpha.reference.json",
+        "alpha.certificate.json",
+    }
+    saved_specification = load_reference_specification(
+        references / "alpha.reference.json"
+    )
+    generated = automatic.results[0]
+    assert saved_specification.to_dict() == generated.specification.to_dict()
+    saved_certificate = json.loads(
+        (references / "alpha.certificate.json").read_text(encoding="utf-8")
+    )
+    expected_certificate = generated.to_dict()
+    expected_certificate.pop("poscar")
+    assert saved_certificate == expected_certificate
+
+    initial = load_reference_site_model_bundle(output / "initial_bundle.pt")
+    latest = load_training_checkpoint(output / "checkpoints" / "latest.pt")
+    assert int(torch.count_nonzero(initial.model_state["atomic_baseline"])) == 0
+    assert bool(torch.any(latest.model_state_dict["atomic_baseline"] != 0.0))
+    binding = initial.template_bindings[0]
+    assert binding.structural_artifact.structural_fingerprint == saved_certificate[
+        "artifact_sha256"
+    ]
+    assert binding.full_template_fingerprint == saved_certificate["template_sha256"]
+    status = json.loads((output / "run_status.json").read_text(encoding="utf-8"))
+    materialized = status["reference_materialization"]
+    assert materialized["reference_resolution_mode"] == "materialized"
+    assert materialized["default_template_id"] == "alpha"
+    assert materialized["templates"]["alpha"]["specification_fingerprint"] == (
+        saved_specification.content_fingerprint
+    )
+    assert len((output / "metrics.jsonl").read_bytes().splitlines()) == 1
+
+    # Once initial_bundle.pt exists, continuation and export must not invoke
+    # any POSCAR/builder/automatic-search path.  Removing the source provides
+    # a black-box guard in addition to the call traps.
+    (tmp_path / "POSCAR").unlink()
+    import refsite_mlip.config.automatic_reference as automatic_module
+    import refsite_mlip.training.scratch_preparation as preparation_module
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("automatic reference rebuild is forbidden")
+
+    monkeypatch.setattr(automatic_module, "prepare_automatic_references", forbidden)
+    monkeypatch.setattr(
+        preparation_module, "build_reference_template_from_poscar", forbidden
+    )
+    resumed = resume_training(output, max_epochs=2)
+    assert resumed["status"] == "completed"
+    assert (output / "checkpoints" / "epoch_000001.pt").is_file()
+    assert len((output / "metrics.jsonl").read_bytes().splitlines()) == 2
+    exported_path = tmp_path / "exported.pt"
+    report = export_bundle(
+        output, source="latest", output_path=exported_path
+    )
+    assert report["status"] == "completed"
+    exported = load_reference_site_model_bundle(exported_path)
+    resumed_latest = load_training_checkpoint(output / "checkpoints" / "latest.pt")
+    assert set(exported.model_state) == set(resumed_latest.model_state_dict)
+    assert all(
+        torch.equal(exported.model_state[key], resumed_latest.model_state_dict[key])
+        for key in exported.model_state
+    )
+
+    # Even if an attacker recomputes the certificate's own outer hash, the
+    # persisted bundle/status binding must reject changed artifact semantics
+    # without modifying the last committed checkpoint or journal.
+    checkpoint_bytes = (output / "checkpoints" / "latest.pt").read_bytes()
+    journal_bytes = (output / "metrics.jsonl").read_bytes()
+    corrupted = dict(saved_certificate)
+    corrupted["artifact_sha256"] = "0" * 64
+    corrupted.pop("certificate_sha256")
+    corrupted["certificate_sha256"] = hashlib.sha256(
+        canonical_runtime_json(corrupted).encode("utf-8")
+    ).hexdigest()
+    (references / "alpha.certificate.json").write_text(
+        canonical_runtime_json(corrupted) + "\n", encoding="utf-8"
+    )
+    with pytest.raises(CLIError) as mismatch:
+        resume_training(output, max_epochs=3)
+    assert mismatch.value.reason_code == "MATERIALIZED_REFERENCE_FINGERPRINT_MISMATCH"
+    assert (output / "checkpoints" / "latest.pt").read_bytes() == checkpoint_bytes
+    assert (output / "metrics.jsonl").read_bytes() == journal_bytes
+
+
 def test_automatic_mixed_templates_assignment_manifest_and_order_are_deterministic(tmp_path):
     reference_a = _atoms(1)
     reference_b = _atoms(1).repeat((2, 1, 1))
@@ -341,6 +479,351 @@ def test_automatic_mixed_templates_assignment_manifest_and_order_are_determinist
     assert all(result.template_id.startswith("ref_m") for result in shorthand_auto.results)
     assert len(shorthand_auto.train_assignments) == 4
     assert len({template_id for _, template_id in shorthand_auto.train_assignments}) == 2
+
+
+def test_automatic_mixed_templates_train_with_k0_k1_and_k2(tmp_path, capsys):
+    reference_a = _atoms(1)
+    reference_b = _atoms(1).repeat((2, 1, 1))
+    vacancy_a = reference_a.copy()
+    del vacancy_a[0]
+    vacancy_b = reference_b.copy()
+    del vacancy_b[:2]
+    recipe = _write_automatic_recipe(
+        tmp_path,
+        references=(
+            ("POSCAR_a", reference_a, "alpha", "auto"),
+            ("POSCAR_b", reference_b, "zeta", "auto"),
+        ),
+        train=(
+            (
+                "train_a.xyz",
+                (_labeled(reference_a, -8.0), _labeled(vacancy_a, -7.0)),
+                "alpha",
+            ),
+            (
+                "train_b.xyz",
+                (_labeled(reference_b, -16.0), _labeled(vacancy_b, -14.0)),
+                "zeta",
+            ),
+        ),
+        validation=(
+            ("validation_a.xyz", (_labeled(vacancy_a, -7.1),), "alpha"),
+            ("validation_b.xyz", (_labeled(reference_b, -15.8),), "zeta"),
+        ),
+    )
+    assert main(["train", str(recipe), "--json", "--quiet"]) == 0
+    assert json.loads(capsys.readouterr().out)["status"] == "completed"
+    output = tmp_path / "runs" / "automatic-run"
+    bundle = load_reference_site_model_bundle(output / "initial_bundle.pt")
+    checkpoint = load_training_checkpoint(output / "checkpoints" / "latest.pt")
+    assert bundle.binding_ids == ("alpha", "zeta")
+    assert {
+        binding.template_id: binding.structural_artifact.diagnostics.num_sites
+        for binding in bundle.template_bindings
+    } == {"alpha": 8, "zeta": 16}
+    certificate_a = json.loads(
+        (output / "references" / "alpha.certificate.json").read_text()
+    )
+    certificate_b = json.loads(
+        (output / "references" / "zeta.certificate.json").read_text()
+    )
+    assert certificate_a["vacancies"]["train"]["observed_K_values"] == [0, 1]
+    assert certificate_b["vacancies"]["train"]["observed_K_values"] == [0, 2]
+    manifest = json.loads((output / "data_manifest.json").read_text())
+    assert [
+        template_id
+        for batch in manifest["train"]["batches"]
+        for template_id in batch["template_ids"]
+    ] == ["alpha", "alpha", "zeta", "zeta"]
+    assert set(checkpoint.metadata.template_fingerprints) == {"alpha", "zeta"}
+    assert checkpoint.progress.completed_epochs == 1
+    assert checkpoint.progress.global_step == 2
+
+
+def test_automatic_reference_continuous_and_resumed_trajectory_are_exact(tmp_path):
+    continuous_root = tmp_path / "continuous"
+    split_root = tmp_path / "split"
+    continuous_root.mkdir()
+    split_root.mkdir()
+    reference = _atoms(1)
+    vacancy = reference.copy()
+    del vacancy[0]
+
+    def prepare(root: Path, *, max_epochs: int):
+        recipe = _write_automatic_recipe(
+            root,
+            references=(("POSCAR", reference, "alpha", "auto"),),
+            train=((
+                "train.xyz",
+                (_labeled(reference, -8.0), _labeled(vacancy, -6.5)),
+                "alpha",
+            ),),
+            validation=((
+                "validation.xyz",
+                (_labeled(vacancy, -6.4),),
+                "alpha",
+            ),),
+        )
+        payload = yaml.safe_load(recipe.read_text(encoding="utf-8"))
+        payload["baseline"] = "minimum_norm"
+        payload["training"]["max_epochs"] = max_epochs
+        recipe.write_text(
+            yaml.safe_dump(payload, sort_keys=False), encoding="utf-8"
+        )
+        resolution = resolve_training_recipe(recipe)
+        prepared = prepare_scratch_training_run(
+            resolution.config,
+            automatic_reference_preparation=(
+                resolution.automatic_reference_preparation.to_dict()
+            ),
+        )
+        return resolution.config, prepared
+
+    continuous_config, continuous_preparation = prepare(
+        continuous_root, max_epochs=2
+    )
+    split_config, split_preparation = prepare(split_root, max_epochs=1)
+    continuous = run_scratch_checkpointed_training(
+        continuous_config, continuous_preparation
+    )
+    continuous_checkpoint = load_training_checkpoint(continuous.latest_path)
+    continuous_draws = (
+        random.random(),
+        float(np.random.random()),
+        torch.rand(4),
+    )
+
+    first = run_scratch_checkpointed_training(split_config, split_preparation)
+    epoch_zero = Path(first.latest_path).with_name("epoch_000000.pt")
+    epoch_zero_bytes = epoch_zero.read_bytes()
+    resumed = resume_training(first.run_directory, max_epochs=2)
+    resumed_checkpoint = load_training_checkpoint(resumed["latest_checkpoint"])
+    resumed_draws = (
+        random.random(),
+        float(np.random.random()),
+        torch.rand(4),
+    )
+
+    def assert_tree_equal(left, right):
+        if isinstance(left, torch.Tensor):
+            assert isinstance(right, torch.Tensor)
+            assert torch.equal(left, right)
+        elif isinstance(left, dict):
+            assert isinstance(right, dict)
+            assert tuple(left) == tuple(right)
+            for key in left:
+                assert_tree_equal(left[key], right[key])
+        elif isinstance(left, (tuple, list)):
+            assert type(left) is type(right)
+            assert len(left) == len(right)
+            for left_item, right_item in zip(left, right):
+                assert_tree_equal(left_item, right_item)
+        else:
+            assert left == right
+
+    assert_tree_equal(
+        continuous_checkpoint.model_state_dict,
+        resumed_checkpoint.model_state_dict,
+    )
+    assert_tree_equal(
+        continuous_checkpoint.optimizer_state_dict,
+        resumed_checkpoint.optimizer_state_dict,
+    )
+    assert_tree_equal(
+        continuous_checkpoint.scheduler_state_dict,
+        resumed_checkpoint.scheduler_state_dict,
+    )
+    assert continuous_checkpoint.selection_state == resumed_checkpoint.selection_state
+    assert continuous_checkpoint.progress == resumed_checkpoint.progress
+    assert continuous_checkpoint.fit_history == resumed_checkpoint.fit_history
+    assert continuous_draws[0] == resumed_draws[0]
+    assert continuous_draws[1] == resumed_draws[1]
+    assert torch.equal(continuous_draws[2], resumed_draws[2])
+    assert epoch_zero.read_bytes() == epoch_zero_bytes
+    assert (Path(continuous.run_directory) / "metrics.jsonl").read_bytes() == (
+        Path(first.run_directory) / "metrics.jsonl"
+    ).read_bytes()
+    assert (
+        continuous.startup.initial_bundle_fingerprint
+        == first.startup.initial_bundle_fingerprint
+    )
+
+
+def test_materialized_automatic_and_equivalent_explicit_source_are_exact(tmp_path):
+    reference = _atoms(1)
+    vacancy = reference.copy()
+    del vacancy[0]
+    recipe = _write_automatic_recipe(
+        tmp_path,
+        references=(("POSCAR", reference, "alpha", "auto"),),
+        train=((
+            "train.xyz",
+            (_labeled(reference, -8.0), _labeled(vacancy, -6.5)),
+            "alpha",
+        ),),
+        validation=((
+            "validation.xyz",
+            (_labeled(vacancy, -6.4),),
+            "alpha",
+        ),),
+    )
+    resolution = resolve_training_recipe(recipe)
+    automatic_preparation = prepare_scratch_training_run(
+        resolution.config,
+        automatic_reference_preparation=(
+            resolution.automatic_reference_preparation.to_dict()
+        ),
+    )
+    explicit_config = replace(
+        resolution.config, output_directory="runs/explicit-run"
+    )
+    explicit_preparation = prepare_scratch_training_run(explicit_config)
+
+    automatic = run_scratch_checkpointed_training(
+        resolution.config, automatic_preparation
+    )
+    explicit = run_scratch_checkpointed_training(
+        explicit_config, explicit_preparation
+    )
+    automatic_checkpoint = load_training_checkpoint(automatic.latest_path)
+    explicit_checkpoint = load_training_checkpoint(explicit.latest_path)
+    assert (
+        automatic.startup.initial_bundle_fingerprint
+        == explicit.startup.initial_bundle_fingerprint
+    )
+    assert automatic_checkpoint.progress == explicit_checkpoint.progress
+    assert automatic_checkpoint.selection_state == explicit_checkpoint.selection_state
+    assert automatic_checkpoint.fit_history == explicit_checkpoint.fit_history
+    for key in automatic_checkpoint.model_state_dict:
+        assert torch.equal(
+            automatic_checkpoint.model_state_dict[key],
+            explicit_checkpoint.model_state_dict[key],
+        )
+    assert automatic_checkpoint.optimizer_state_dict.keys() == (
+        explicit_checkpoint.optimizer_state_dict.keys()
+    )
+    for left_group, right_group in zip(
+        automatic_checkpoint.optimizer_state_dict["param_groups"],
+        explicit_checkpoint.optimizer_state_dict["param_groups"],
+    ):
+        assert left_group == right_group
+    for parameter_id, left_state in automatic_checkpoint.optimizer_state_dict[
+        "state"
+    ].items():
+        right_state = explicit_checkpoint.optimizer_state_dict["state"][parameter_id]
+        for name, left_value in left_state.items():
+            right_value = right_state[name]
+            if isinstance(left_value, torch.Tensor):
+                assert torch.equal(left_value, right_value)
+            else:
+                assert left_value == right_value
+
+
+def test_automatic_reference_persistence_failures_preserve_committed_files(
+    tmp_path, monkeypatch
+):
+    reference_a = _atoms(1)
+    reference_b = _atoms(1).repeat((2, 1, 1))
+    recipe = _write_automatic_recipe(
+        tmp_path,
+        references=(
+            ("POSCAR_a", reference_a, "alpha", "auto"),
+            ("POSCAR_b", reference_b, "zeta", "auto"),
+        ),
+        train=(
+            ("train_a.xyz", (_labeled(reference_a, -8.0),), "alpha"),
+            ("train_b.xyz", (_labeled(reference_b, -16.0),), "zeta"),
+        ),
+        validation=(
+            ("validation_a.xyz", (_labeled(reference_a, -7.9),), "alpha"),
+            ("validation_b.xyz", (_labeled(reference_b, -15.9),), "zeta"),
+        ),
+    )
+    resolution = resolve_training_recipe(recipe)
+    preparation = prepare_scratch_training_run(
+        resolution.config,
+        automatic_reference_preparation=(
+            resolution.automatic_reference_preparation.to_dict()
+        ),
+    )
+    import refsite_mlip.training.automatic_reference_materialization as module
+
+    original_write = module._write_json
+    expected_committed = {
+        1: set(),
+        2: {"alpha.reference.json"},
+        4: {
+            "alpha.reference.json",
+            "alpha.certificate.json",
+            "zeta.reference.json",
+        },
+    }
+    for fail_at in (1, 2, 4):
+        call_count = 0
+
+        def injected(path, value, *, stage):
+            nonlocal call_count
+            call_count += 1
+            if call_count == fail_at:
+                raise OSError(f"injected reference write {fail_at}")
+            return original_write(path, value, stage=stage)
+
+        monkeypatch.setattr(module, "_write_json", injected)
+        directory = TrainingRunDirectory.create(tmp_path / f"failure-{fail_at}")
+        lock = directory.acquire_resume_lock()
+        with pytest.raises(Exception) as caught:
+            materialize_automatic_references(preparation, directory, lock)
+        assert getattr(caught.value, "rollback_performed", None) is False
+        assert set(path.name for path in directory.references.iterdir()) == (
+            expected_committed[fail_at]
+        )
+        assert not list(directory.references.glob("*.tmp"))
+        lock.release()
+
+
+def test_automatic_reference_reload_failure_records_no_update_status(
+    tmp_path, monkeypatch
+):
+    reference = _atoms(1)
+    recipe = _write_automatic_recipe(
+        tmp_path,
+        references=(("POSCAR", reference, "alpha", "auto"),),
+        train=(("train.xyz", (_labeled(reference, -8.0),), "alpha"),),
+        validation=(("validation.xyz", (_labeled(reference, -7.9),), "alpha"),),
+    )
+    resolution = resolve_training_recipe(recipe)
+    preparation = prepare_scratch_training_run(
+        resolution.config,
+        automatic_reference_preparation=(
+            resolution.automatic_reference_preparation.to_dict()
+        ),
+    )
+    import refsite_mlip.training.automatic_reference_materialization as module
+
+    def fail_reload(path):
+        raise OSError("injected strict reference reload failure")
+
+    monkeypatch.setattr(module, "_load_reference", fail_reload)
+    with pytest.raises(ScratchCheckpointedTrainingError) as caught:
+        run_scratch_checkpointed_training(resolution.config, preparation)
+    output = tmp_path / "runs" / "automatic-run"
+    status = json.loads((output / "run_status.json").read_text())
+    assert caught.value.reason_code == "AUTOMATIC_REFERENCE_MATERIALIZATION_FAILED"
+    assert status["status"] == "failed"
+    assert status["first_optimizer_update_executed"] is False
+    assert status["global_step"] == 0
+    assert not (output / "initial_bundle.pt").exists()
+    assert not (output / "checkpoints").exists()
+    assert not (output / ".resume.lock").exists()
+    assert {path.name for path in (output / "references").iterdir()} == {
+        "alpha.reference.json",
+        "alpha.certificate.json",
+    }
+    assert status["error"]["completed_persistence_stages"] == [
+        "references/",
+        "references/alpha.reference.json",
+        "references/alpha.certificate.json",
+    ]
 
 
 def test_automatic_reference_rejects_ambiguity_unused_and_newton_policy(tmp_path):

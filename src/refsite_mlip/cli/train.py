@@ -1463,7 +1463,12 @@ def _run_training_impl(
         config, resolved, recipe_input = preflight_result
     if dry_run:
         return resolved
-    if recipe_input:
+    automatic_recipe = (
+        recipe_input
+        and isinstance(resolved, ScratchTrainingPreparation)
+        and resolved.automatic_reference_preparation is not None
+    )
+    if recipe_input and not automatic_recipe:
         raise CLIError(
             "RECIPE_EXECUTION_NOT_INTEGRATED",
             "recipe execution is not integrated; execute the compiled canonical v2 config",

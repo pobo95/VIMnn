@@ -334,6 +334,12 @@ class TrainingRunDirectory:
         return self.root / "metrics.jsonl"
 
     @property
+    def references(self) -> Path:
+        """Immutable materialized-reference directory for POSCAR-first runs."""
+
+        return self.root / "references"
+
+    @property
     def training_log_path(self) -> Path:
         """Non-semantic human-readable CLI progress transcript."""
 
@@ -429,6 +435,67 @@ class TrainingRunDirectory:
                 "CHECKPOINT_DIRECTORY_VALIDATE_FAILED",
                 "new checkpoint directory could not be validated",
                 stage="run_directory.checkpoints.validate",
+                path=target,
+                original_error=error,
+            ) from error
+        return target
+
+    def create_references_directory(self) -> Path:
+        """Exclusively create the automatic-reference persistence root."""
+
+        target = self.references
+        if target.is_symlink():
+            raise RunDirectoryError(
+                "REFERENCE_DIRECTORY_SYMLINK_REJECTED",
+                "reference directory must not be a symbolic link",
+                stage="run_directory.references.create",
+                path=target,
+            )
+        try:
+            target.mkdir(parents=False, exist_ok=False)
+        except FileExistsError as error:
+            reason = (
+                "REFERENCE_DIRECTORY_SYMLINK_REJECTED"
+                if target.is_symlink()
+                else "REFERENCE_DIRECTORY_ALREADY_EXISTS"
+            )
+            raise RunDirectoryError(
+                reason,
+                "reference directory path already exists and is not reused",
+                stage="run_directory.references.create",
+                path=target,
+                original_error=error,
+            ) from error
+        except OSError as error:
+            raise RunDirectoryError(
+                "REFERENCE_DIRECTORY_CREATE_FAILED",
+                "reference directory could not be created exclusively",
+                stage="run_directory.references.create",
+                path=target,
+                original_error=error,
+            ) from error
+        if target.is_symlink() or not target.is_dir():
+            raise RunDirectoryError(
+                "INVALID_REFERENCE_DIRECTORY",
+                "new reference path is not an owned regular directory",
+                stage="run_directory.references.validate",
+                path=target,
+            )
+        try:
+            if any(target.iterdir()):
+                raise RunDirectoryError(
+                    "REFERENCE_DIRECTORY_NOT_EMPTY",
+                    "new reference directory must be empty",
+                    stage="run_directory.references.validate",
+                    path=target,
+                )
+        except RunDirectoryError:
+            raise
+        except OSError as error:
+            raise RunDirectoryError(
+                "REFERENCE_DIRECTORY_VALIDATE_FAILED",
+                "new reference directory could not be validated",
+                stage="run_directory.references.validate",
                 path=target,
                 original_error=error,
             ) from error

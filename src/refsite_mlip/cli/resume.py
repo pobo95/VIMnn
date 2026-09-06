@@ -62,6 +62,7 @@ from refsite_mlip.training import (
     load_runtime_json,
     run_checkpointed_resumed_fit,
     validate_checkpoint_history,
+    validate_materialized_reference_files,
     validate_managed_checkpoint_history,
 )
 from refsite_mlip.training.checkpoint import (
@@ -726,6 +727,30 @@ def _validate_bundle_and_checkpoint(
     return bundle, registry, templates
 
 
+def _validate_materialized_references(
+    directory: TrainingRunDirectory,
+    config: TrainingRunConfig,
+    status: Mapping[str, Any],
+    bundle: Any,
+) -> None:
+    try:
+        validate_materialized_reference_files(
+            directory, config=config, status=status, bundle=bundle
+        )
+    except Exception as error:
+        raise CLIError(
+            getattr(error, "reason_code", None)
+            or "MATERIALIZED_REFERENCE_VALIDATION_FAILED",
+            "materialized automatic references differ from the initial bundle",
+            stage=getattr(error, "stage", None)
+            or "resume.reference_materialization",
+            path=getattr(error, "path", None) or directory.references,
+            template_id=getattr(error, "template_id", None),
+            underlying_reason_code=getattr(error, "reason_code", None),
+            original_error=error,
+        ) from error
+
+
 def _validate_data(
     config: TrainingRunConfig,
     stored: _StoredResolvedRun,
@@ -1387,8 +1412,11 @@ def _prepare_resume(
             data_manifest,
             journal_summary,
         )
-        _, registry, templates = _validate_bundle_and_checkpoint(
+        initial_bundle, registry, templates = _validate_bundle_and_checkpoint(
             config, stored, preflight, checkpoint, bundle_path
+        )
+        _validate_materialized_references(
+            directory, config, status, initial_bundle
         )
         _validate_data(
             config,
@@ -1529,6 +1557,10 @@ def _resume_status_base(
                 ],
             }
         )
+        if previous.get("reference_materialization") is not None:
+            result["reference_materialization"] = previous[
+                "reference_materialization"
+            ]
     try:
         journal_status = journal.summary().to_dict()
     except MetricsJournalError as summary_error:
@@ -1986,6 +2018,25 @@ def _recheck_resume_sources(
                 stage="resume.data_manifest.toctou",
                 path=preflight.directory.data_manifest_path,
             )
+    if preflight.stored_status.get("reference_materialization") is not None:
+        try:
+            current_initial = load_reference_site_model_bundle(
+                preflight.resolved.runtime_paths["initial_bundle"],
+                map_location="cpu",
+            )
+        except Exception as error:
+            raise CLIError(
+                "INITIAL_BUNDLE_TOCTOU_LOAD_FAILED",
+                "initial bundle could not be reloaded for materialized reference validation",
+                stage="resume.reference_materialization.toctou",
+                original_error=error,
+            ) from error
+        _validate_materialized_references(
+            preflight.directory,
+            preflight.config,
+            current_status,
+            current_initial,
+        )
     try:
         current = preflight.manager.load_latest()
     except Exception as error:

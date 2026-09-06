@@ -138,7 +138,7 @@ def _input_digest_error(
 
 def _regular_file_sha256(
     entry: Mapping[str, Any], *, config_path: Path | str | None
-) -> str:
+) -> tuple[str, int, int]:
     """Hash one pinned regular file without following a replacement symlink."""
 
     path = Path(str(entry["runtime_path"]))
@@ -263,7 +263,28 @@ def _regular_file_sha256(
             config_path=config_path,
             actual=str(path),
         )
-    return digest.hexdigest()
+    expected_device = entry.get("device")
+    expected_inode = entry.get("inode")
+    if (expected_device is None) != (expected_inode is None):
+        raise _input_digest_error(
+            "INVALID_INPUT_DIGEST_METADATA",
+            "scratch input identity must contain both device and inode",
+            entry=entry,
+            config_path=config_path,
+        )
+    if expected_device is not None and identity != (
+        expected_device,
+        expected_inode,
+    ):
+        raise _input_digest_error(
+            "INPUT_FILE_IDENTITY_MISMATCH",
+            "scratch input inode changed after full preflight",
+            entry=entry,
+            config_path=config_path,
+            expected=(expected_device, expected_inode),
+            actual=identity,
+        )
+    return digest.hexdigest(), int(identity[0]), int(identity[1])
 
 
 def _input_file_specs(
@@ -342,9 +363,12 @@ def _capture_input_file_digests(
     files: dict[str, Any] = {}
     for label, spec in sorted(specs.items()):
         entry = dict(spec)
-        entry["sha256"] = _regular_file_sha256(
+        digest, device, inode = _regular_file_sha256(
             entry, config_path=config_path
         )
+        entry["sha256"] = digest
+        entry["device"] = device
+        entry["inode"] = inode
         files[label] = entry
     return {
         "convention_version": SCRATCH_INPUT_FILE_DIGEST_CONVENTION_VERSION,
@@ -782,6 +806,8 @@ def verify_scratch_preparation_input_digests(
         "configured_path",
         "runtime_path",
         "sha256",
+        "device",
+        "inode",
     }
     for label, expected_spec in sorted(expected_specs.items()):
         entry = files[label]
@@ -821,7 +847,9 @@ def verify_scratch_preparation_input_digests(
                 config_path=config_path,
                 actual=expected_digest,
             )
-        actual_digest = _regular_file_sha256(entry, config_path=config_path)
+        actual_digest, _, _ = _regular_file_sha256(
+            entry, config_path=config_path
+        )
         if actual_digest != expected_digest:
             raise _input_digest_error(
                 "INPUT_DIGEST_MISMATCH",

@@ -176,6 +176,8 @@ class ScratchCheckpointedTrainingError(RuntimeError):
         original_error: BaseException | None = None,
         status_write_error: BaseException | None = None,
         lock_release_error: BaseException | None = None,
+        completed_persistence_stages: tuple[str, ...] = (),
+        recoverable_artifacts: tuple[str, ...] = (),
     ) -> None:
         if type(reason_code) is not str or not reason_code:
             raise ValueError("reason_code must be a nonempty string")
@@ -211,6 +213,8 @@ class ScratchCheckpointedTrainingError(RuntimeError):
         self.recoverable_initial_bundle = recoverable_initial_bundle
         self.interrupted = interrupted
         self.rollback_performed = rollback_performed
+        self.completed_persistence_stages = tuple(completed_persistence_stages)
+        self.recoverable_artifacts = tuple(recoverable_artifacts)
         self.original_reason_code = original_reason_code
         self.original_error = original_error
         self.original_exception_type = (
@@ -257,40 +261,46 @@ class ScratchCheckpointedTrainingError(RuntimeError):
         self.lock_release_exception_message = str(error)
 
     def to_dict(self) -> dict[str, Any]:
-        return _canonical_mapping(
-            {
-                "best_checkpoint": self.best_checkpoint,
-                "bundle_fingerprint": self.bundle_fingerprint,
-                "completed_epochs": self.completed_epochs,
-                "config_fingerprint": self.config_fingerprint,
-                "global_step": self.global_step,
-                "initial_bundle_fingerprint": self.initial_bundle_fingerprint,
-                "interrupted": self.interrupted,
-                "latest_checkpoint": self.latest_checkpoint,
-                "lock_release_exception_message": (
-                    self.lock_release_exception_message
-                ),
-                "lock_release_exception_type": self.lock_release_exception_type,
-                "message": self.message,
-                "original_exception_message": self.original_exception_message,
-                "original_exception_type": self.original_exception_type,
-                "original_reason_code": self.original_reason_code,
-                "output_path": self.output_path,
-                "preparation_fingerprint": self.preparation_fingerprint,
-                "reason_code": self.reason_code,
-                "recoverable_checkpoint": self.recoverable_checkpoint,
-                "recoverable_initial_bundle": self.recoverable_initial_bundle,
-                "rollback_performed": self.rollback_performed,
-                "stage": self.stage,
-                "status_write_exception_message": (
-                    self.status_write_exception_message
-                ),
-                "status_write_exception_type": self.status_write_exception_type,
-                "template_fingerprints": _plain(self.template_fingerprints),
-                "train_semantic_digest": self.train_semantic_digest,
-                "validation_semantic_digest": self.validation_semantic_digest,
-            }
-        )
+        result = {
+            "best_checkpoint": self.best_checkpoint,
+            "bundle_fingerprint": self.bundle_fingerprint,
+            "completed_epochs": self.completed_epochs,
+            "config_fingerprint": self.config_fingerprint,
+            "global_step": self.global_step,
+            "initial_bundle_fingerprint": self.initial_bundle_fingerprint,
+            "interrupted": self.interrupted,
+            "latest_checkpoint": self.latest_checkpoint,
+            "lock_release_exception_message": (
+                self.lock_release_exception_message
+            ),
+            "lock_release_exception_type": self.lock_release_exception_type,
+            "message": self.message,
+            "original_exception_message": self.original_exception_message,
+            "original_exception_type": self.original_exception_type,
+            "original_reason_code": self.original_reason_code,
+            "output_path": self.output_path,
+            "preparation_fingerprint": self.preparation_fingerprint,
+            "reason_code": self.reason_code,
+            "recoverable_checkpoint": self.recoverable_checkpoint,
+            "recoverable_initial_bundle": self.recoverable_initial_bundle,
+            "rollback_performed": self.rollback_performed,
+            "stage": self.stage,
+            "status_write_exception_message": (
+                self.status_write_exception_message
+            ),
+            "status_write_exception_type": self.status_write_exception_type,
+            "template_fingerprints": _plain(self.template_fingerprints),
+            "train_semantic_digest": self.train_semantic_digest,
+            "validation_semantic_digest": self.validation_semantic_digest,
+        }
+        if self.completed_persistence_stages or self.recoverable_artifacts:
+            result["completed_persistence_stages"] = list(
+                self.completed_persistence_stages
+            )
+            result["recoverable_artifacts"] = list(
+                self.recoverable_artifacts
+            )
+        return _canonical_mapping(result)
 
 
 @dataclass(frozen=True)
@@ -607,6 +617,12 @@ def _error_from(
         original_error=error,
         status_write_error=status_write_error,
         lock_release_error=lock_release_error,
+        completed_persistence_stages=tuple(
+            _nested_attribute(error, "completed_persistence_stages") or ()
+        ),
+        recoverable_artifacts=tuple(
+            _nested_attribute(error, "recoverable_artifacts") or ()
+        ),
     )
 
 
@@ -743,6 +759,10 @@ def _status(
                     "metrics_semantic_sha256": semantic_sha,
                 }
             )
+    if startup is not None and startup.reference_materialization is not None:
+        payload["reference_materialization"] = _plain(
+            startup.reference_materialization
+        )
     return _canonical_mapping(payload)
 
 

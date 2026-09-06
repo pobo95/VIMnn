@@ -414,6 +414,8 @@ def test_raw_input_file_digests_cover_inputs_are_immutable_and_verify(tmp_path):
         assert entry["label"] == label
         assert entry["runtime_path"] == str(path)
         assert entry["sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
+        assert type(entry["device"]) is int
+        assert type(entry["inode"]) is int
     assert files["reference_poscar[000000]"]["template_id"] == (
         "scratch-111-a"
     )
@@ -456,6 +458,29 @@ def test_raw_input_digest_detects_byte_mutation_with_structured_context(tmp_path
     assert caught.value.source_path == str(train_path.resolve())
     assert len(caught.value.expected) == len(caught.value.actual) == 64
     assert prepared.preparation_fingerprint == semantic_fingerprint
+
+
+def test_raw_input_digest_detects_same_bytes_inode_replacement(tmp_path):
+    reference = _atoms(1)
+    config_path, _, train_path, _ = _case(
+        tmp_path,
+        train_frames=(_labeled(reference, -8.0),),
+        validation_frames=(_labeled(reference, -7.75),),
+        selector={"template_id": "scratch-111-a"},
+    )
+    prepared = prepare_scratch_training_run(
+        load_training_run_config(config_path)
+    )
+    original_bytes = train_path.read_bytes()
+    replacement = tmp_path / "same-bytes-replacement.xyz"
+    replacement.write_bytes(original_bytes)
+    replacement.replace(train_path)
+
+    with pytest.raises(TrainingRunConfigError) as caught:
+        verify_scratch_preparation_input_digests(prepared)
+    assert caught.value.reason_code == "INPUT_FILE_IDENTITY_MISMATCH"
+    assert caught.value.field == "data.train[0].path"
+    assert caught.value.expected != caught.value.actual
 
 
 @pytest.mark.parametrize(

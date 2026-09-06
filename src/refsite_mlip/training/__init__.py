@@ -114,6 +114,13 @@ from .scratch_startup import (
     ScratchTrainingStartupError,
     initialize_scratch_training_startup,
 )
+from .automatic_reference_materialization import (
+    AUTOMATIC_REFERENCE_MATERIALIZATION_VERSION,
+    AutomaticReferenceMaterializationError,
+    MaterializedAutomaticReferences,
+    materialize_automatic_references,
+    validate_materialized_reference_files,
+)
 from .scratch_checkpointed_training import (
     SCRATCH_CHECKPOINTED_TRAINING_RESULT_SCHEMA_VERSION,
     ScratchCheckpointedTrainingError,
@@ -210,6 +217,9 @@ __all__ = [
     "ScratchModelInitializationError",
     "ScratchTrainingStartup",
     "ScratchTrainingStartupError",
+    "AUTOMATIC_REFERENCE_MATERIALIZATION_VERSION",
+    "AutomaticReferenceMaterializationError",
+    "MaterializedAutomaticReferences",
     "ScratchTrainingPreparation",
     "RunDirectoryError",
     "TrainStepConfig",
@@ -239,9 +249,11 @@ __all__ = [
     "verify_scratch_preparation_input_digests",
     "initialize_scratch_model",
     "initialize_scratch_training_startup",
+    "materialize_automatic_references",
     "run_fit",
     "run_checkpointed_fit",
     "run_scratch_checkpointed_training",
+    "validate_materialized_reference_files",
     "run_checkpointed_resumed_fit",
     "run_training_epoch",
     "run_validation_epoch",

@@ -39,6 +39,10 @@ from refsite_mlip.models import (
 )
 
 from .baseline import AtomicBaselineFit, apply_atomic_baseline_, fit_atomic_baseline
+from .automatic_reference_materialization import (
+    materialize_automatic_references,
+    validate_materialized_reference_files,
+)
 from ._scratch_run_metadata import scratch_runtime_preflight_metadata
 from .checkpoint import FitProgress
 from .optimizer import build_optimizer, optimizer_parameters, validate_optimizer_binding
@@ -138,6 +142,8 @@ class ScratchTrainingStartupError(RuntimeError):
         original_reason_code: str | None = None,
         original_error: BaseException | None = None,
         recoverable_initial_bundle: str | None = None,
+        completed_persistence_stages: Sequence[str] = (),
+        recoverable_artifacts: Sequence[str] = (),
         status_write_error: BaseException | None = None,
     ) -> None:
         if type(reason_code) is not str or not reason_code:
@@ -165,6 +171,8 @@ class ScratchTrainingStartupError(RuntimeError):
             None if original_error is None else str(original_error)
         )
         self.recoverable_initial_bundle = recoverable_initial_bundle
+        self.completed_persistence_stages = tuple(completed_persistence_stages)
+        self.recoverable_artifacts = tuple(recoverable_artifacts)
         self.first_optimizer_update_executed = False
         self.status_write_exception_type = (
             None if status_write_error is None else type(status_write_error).__name__
@@ -190,7 +198,7 @@ class ScratchTrainingStartupError(RuntimeError):
         super().__init__(f"[{reason_code}] stage={stage!r}{suffix} {message}")
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        result = {
             "bundle_fingerprint": self.bundle_fingerprint,
             "config_fingerprint": self.config_fingerprint,
             "first_optimizer_update_executed": False,
@@ -209,6 +217,14 @@ class ScratchTrainingStartupError(RuntimeError):
             "template_id": self.template_id,
             "training_seed": self.training_seed,
         }
+        if self.completed_persistence_stages or self.recoverable_artifacts:
+            result["completed_persistence_stages"] = list(
+                self.completed_persistence_stages
+            )
+            result["recoverable_artifacts"] = list(
+                self.recoverable_artifacts
+            )
+        return result
 
 
 @dataclass(frozen=True)
@@ -376,7 +392,13 @@ def _revalidate_preparation(
     if type(base_directory) is not str or not base_directory:
         raise ValueError("prepared runtime base_directory is missing or invalid")
     refreshed = prepare_scratch_training_run(
-        config, base_directory=base_directory
+        config,
+        base_directory=base_directory,
+        automatic_reference_preparation=(
+            None
+            if preparation.automatic_reference_preparation is None
+            else preparation.automatic_reference_preparation
+        ),
     )
     comparisons = (
         (
@@ -710,7 +732,7 @@ def _status(
     error: ScratchTrainingStartupError | None = None,
     rng_restored: bool | None = None,
 ) -> dict[str, Any]:
-    return {
+    payload = {
         "schema_version": SCRATCH_TRAINING_STARTUP_STATUS_SCHEMA_VERSION,
         "status": status,
         "startup_convention_version": SCRATCH_TRAINING_STARTUP_CONVENTION_VERSION,
@@ -749,6 +771,14 @@ def _status(
         "rng_restored_to_entry": rng_restored,
         "rollback_performed": False,
     }
+    automatic = preparation.automatic_reference_preparation
+    if isinstance(automatic, Mapping) and isinstance(
+        automatic.get("materialization"), Mapping
+    ):
+        payload["reference_materialization"] = _plain(
+            automatic["materialization"]
+        )
+    return payload
 
 
 @dataclass(frozen=True)
@@ -778,6 +808,7 @@ class ScratchTrainingStartup:
     data_manifest: Mapping[str, Any]
     initialization_seed: int
     training_seed: int
+    reference_materialization: Mapping[str, Any] | None = None
     fit_history: tuple[Any, ...] = ()
 
     def __post_init__(self) -> None:
@@ -855,6 +886,12 @@ class ScratchTrainingStartup:
             self, "run_directory_paths", _freeze_plain(self.run_directory_paths)
         )
         object.__setattr__(self, "data_manifest", _freeze_plain(self.data_manifest))
+        if self.reference_materialization is not None:
+            object.__setattr__(
+                self,
+                "reference_materialization",
+                _freeze_plain(self.reference_materialization),
+            )
         object.__setattr__(self, "fit_history", tuple(self.fit_history))
         if self.fit_history:
             raise ValueError("scratch startup history must be empty")
@@ -889,6 +926,8 @@ def _startup_error(
     bundle_fingerprint: str | None,
     recoverable: bool,
     status_write_error: BaseException | None = None,
+    completed_persistence_stages: Sequence[str] = (),
+    recoverable_artifacts: Sequence[str] = (),
 ) -> ScratchTrainingStartupError:
     reason = _nested_attribute(error, "reason_code")
     if type(reason) is not str or not reason:
@@ -922,6 +961,14 @@ def _startup_error(
             if recoverable and directory is not None
             else None
         ),
+        completed_persistence_stages=(
+            _nested_attribute(error, "completed_persistence_stages")
+            or completed_persistence_stages
+        ),
+        recoverable_artifacts=(
+            _nested_attribute(error, "recoverable_artifacts")
+            or recoverable_artifacts
+        ),
         status_write_error=status_write_error,
     )
 
@@ -941,6 +988,9 @@ def _initialize_scratch_training_startup(
     verified_bundle: ReferenceSiteModelBundle | None = None
     initial_bundle_verified = False
     baseline_metadata: Mapping[str, Any] | None = None
+    reference_materialization: Mapping[str, Any] | None = None
+    completed_reference_files: tuple[str, ...] = ()
+    owned_lock = False
     phase = "preflight"
     try:
         supplied_run = run_directory is not None or run_lock is not None
@@ -964,25 +1014,53 @@ def _initialize_scratch_training_startup(
                 preparation, refresh_from_files=False
             )
         else:
-            verified = _revalidate_preparation(preparation)
+            verified = _revalidate_preparation(
+                preparation,
+                refresh_from_files=(
+                    preparation.automatic_reference_preparation is None
+                ),
+            )
         if not _process_state_equal(entry_state, _capture_process_state()):
             raise RuntimeError("scratch preflight changed process RNG or execution state")
+
+        if (
+            verified.automatic_reference_preparation is not None
+            and directory is None
+        ):
+            phase = "run_directory_create"
+            output = Path(str(verified.runtime_paths["output_directory"]))
+            directory = TrainingRunDirectory.create(output)
+            phase = "lock.acquire"
+            run_lock = directory.acquire_resume_lock()
+            owned_lock = True
+
+        if verified.automatic_reference_preparation is not None:
+            assert directory is not None and run_lock is not None
+            phase = "reference_materialization"
+            run_lock.validate_owned(directory.resume_lock_path)
+            verify_scratch_preparation_input_digests(verified)
+            materialized = materialize_automatic_references(
+                verified, directory, run_lock
+            )
+            verified = materialized.preparation
+            reference_materialization = materialized.manifest
+            completed_reference_files = materialized.completed_files
+            run_lock.validate_owned(directory.resume_lock_path)
 
         phase = "initialization"
         initialization = initialize_scratch_model(verified)
         if not _process_state_equal(entry_state, _capture_process_state()):
             raise RuntimeError("scratch model initialization leaked process state")
 
-        if supplied_run:
+        if directory is not None and run_lock is not None:
             phase = "run_directory_validate"
-            assert run_directory is not None and run_lock is not None
             _validate_supplied_run_ownership(
-                verified, run_directory, run_lock
+                verified, directory, run_lock
             )
             # Close the initialization-time TOCTOU window without invoking
             # the output-collision gate against our already-owned root.
             verify_scratch_preparation_input_digests(verified)
-        else:
+        elif directory is None:
             phase = "run_directory_create"
             output = Path(str(verified.runtime_paths["output_directory"]))
             directory = TrainingRunDirectory.create(output)
@@ -1012,6 +1090,15 @@ def _initialize_scratch_training_startup(
             directory.initial_bundle_path, map_location="cpu"
         )
         _validate_runtime_bundle(verified, initialization, verified_bundle)
+        if reference_materialization is not None:
+            validate_materialized_reference_files(
+                directory,
+                config=verified.config,
+                status={
+                    "reference_materialization": reference_materialization
+                },
+                bundle=verified_bundle,
+            )
         initial_bundle_verified = True
 
         phase = "runtime_materialization"
@@ -1102,10 +1189,11 @@ def _initialize_scratch_training_startup(
             data_manifest=verified.data_manifest,
             initialization_seed=initialization.initialization_seed,
             training_seed=verified.runtime.seed,
+            reference_materialization=reference_materialization,
         )
 
         phase = "status_save"
-        if supplied_run:
+        if run_lock is not None:
             assert run_lock is not None
             run_lock.validate_owned(directory.resume_lock_path)
         directory.write_status(
@@ -1117,10 +1205,14 @@ def _initialize_scratch_training_startup(
                 directory=directory,
             )
         )
-        if supplied_run:
+        if run_lock is not None:
             run_lock.validate_owned(directory.resume_lock_path)
         if not _process_state_equal(entry_state, _capture_process_state()):
             raise RuntimeError("startup changed process state before training seeding")
+        if owned_lock:
+            assert run_lock is not None
+            run_lock.release()
+            owned_lock = False
         _seed_training_runtime(verified.runtime.seed)
         return result
     except BaseException as original:
@@ -1141,10 +1233,12 @@ def _initialize_scratch_training_startup(
                 else initialization.bundle_fingerprint
             ),
             recoverable=recoverable,
+            completed_persistence_stages=completed_reference_files,
+            recoverable_artifacts=completed_reference_files,
         )
         if directory is not None:
             try:
-                if supplied_run:
+                if run_lock is not None:
                     assert run_lock is not None
                     run_lock.validate_owned(directory.resume_lock_path)
                 status_preparation = verified or preparation
@@ -1177,11 +1271,22 @@ def _initialize_scratch_training_startup(
                     ),
                     recoverable=recoverable,
                     status_write_error=status_error,
+                    completed_persistence_stages=completed_reference_files,
+                    recoverable_artifacts=completed_reference_files,
                 )
             finally:
                 # A test hook or failing filesystem wrapper must not be able to
                 # leak RNG/process-state changes from failure reporting itself.
                 _restore_process_state(entry_state)
+        if owned_lock and run_lock is not None:
+            try:
+                run_lock.release()
+            except BaseException as release_error:
+                if structured.status_write_exception_type is None:
+                    structured.status_write_exception_type = type(
+                        release_error
+                    ).__name__
+                    structured.status_write_exception_message = str(release_error)
         raise structured from original
 
 
