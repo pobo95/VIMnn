@@ -308,6 +308,7 @@ def _input_file_specs(
         source_index: int | None = None,
         split: str | None = None,
         template_id: str | None = None,
+        reference_alias: str | None = None,
     ) -> None:
         specs[label] = {
             "label": label,
@@ -319,6 +320,8 @@ def _input_file_specs(
             "configured_path": configured_path,
             "runtime_path": str(runtime_path),
         }
+        if reference_alias is not None:
+            specs[label]["reference_alias"] = reference_alias
 
     if config_path is not None:
         add(
@@ -353,6 +356,12 @@ def _input_file_specs(
                 field=f"data.{split}[{index}].path",
                 source_index=index,
                 split=split,
+                template_id=(
+                    source_config.template_id
+                    if source_config.reference_alias is not None
+                    else None
+                ),
+                reference_alias=source_config.reference_alias,
             )
     return dict(sorted(specs.items()))
 
@@ -440,7 +449,12 @@ def _split_manifest(
     *,
     split: str,
     batch_size: int,
+    sources: tuple[Any, ...],
+    paths: tuple[Path, ...],
+    input_file_digests: Mapping[str, Any],
 ) -> dict[str, Any]:
+    from refsite_mlip.config import training_run as run_config
+
     by_sample = {assignment.sample_id: assignment for assignment in assignments}
     entries: list[dict[str, Any]] = []
     for index, sample in enumerate(samples):
@@ -478,13 +492,56 @@ def _split_manifest(
                 },
             }
         )
-    return {
+    result = {
         "split": split,
         "frame_count": len(samples),
         "batch_count": math.ceil(len(samples) / batch_size),
         "samples": entries,
         "batches": _batch_plan(samples, batch_size),
     }
+    if any(source.reference_alias is not None for source in sources):
+        source_entries = []
+        for source_index, (source, path) in enumerate(zip(sources, paths)):
+            indices = [
+                index
+                for index, assignment in enumerate(assignments)
+                if assignment.source_index == source_index
+            ]
+            if not indices:
+                raise ValueError("bound data source contains no loaded frames")
+            if indices != list(range(indices[0], indices[-1] + 1)):
+                raise ValueError("bound data source frames are not contiguous")
+            source_samples = tuple(samples[index] for index in indices)
+            template_ids = tuple(
+                dict.fromkeys(sample.template_id for sample in source_samples)
+            )
+            if len(template_ids) != 1 or template_ids[0] != source.template_id:
+                raise ValueError("bound data source changed its exact template identity")
+            raw_entry = input_file_digests["files"][
+                f"{split}[{source_index:06d}]"
+            ]
+            source_entries.append(
+                {
+                    "split": split,
+                    "source_index": source_index,
+                    "reference_alias": source.reference_alias,
+                    "original_path": source.path,
+                    "resolved_path": str(path),
+                    "raw_sha256": raw_entry["sha256"],
+                    "semantic_digest": run_config._split_digest(
+                        source_samples, templates, split=split
+                    ),
+                    "frame_count": len(source_samples),
+                    "global_frame_start": indices[0],
+                    "global_frame_end_exclusive": indices[-1] + 1,
+                    "template_id": template_ids[0],
+                    "template_fingerprint": templates[
+                        template_ids[0]
+                    ].fingerprint,
+                }
+            )
+        result["sources"] = source_entries
+    return result
 
 
 def _observed_species(samples: tuple[StructureSample, ...]) -> tuple[int, ...]:
@@ -811,13 +868,16 @@ def verify_scratch_preparation_input_digests(
     }
     for label, expected_spec in sorted(expected_specs.items()):
         entry = files[label]
-        if not isinstance(entry, Mapping) or set(entry) != expected_entry_keys:
+        entry_keys = set(expected_entry_keys)
+        if "reference_alias" in expected_spec:
+            entry_keys.add("reference_alias")
+        if not isinstance(entry, Mapping) or set(entry) != entry_keys:
             raise _input_digest_error(
                 "INVALID_INPUT_DIGEST_METADATA",
                 "scratch input digest entry has invalid keys",
                 entry=(entry if isinstance(entry, Mapping) else generic),
                 config_path=config_path,
-                expected=tuple(sorted(expected_entry_keys)),
+                expected=tuple(sorted(entry_keys)),
                 actual=(
                     type(entry).__name__
                     if not isinstance(entry, Mapping)
@@ -1268,6 +1328,9 @@ def prepare_scratch_training_run(
         templates,
         split="train",
         batch_size=config.data.batch_size,
+        sources=config.data.train,
+        paths=train_paths,
+        input_file_digests=input_file_digests,
     )
     validation_manifest = _split_manifest(
         validation_samples,
@@ -1275,6 +1338,9 @@ def prepare_scratch_training_run(
         templates,
         split="validation",
         batch_size=config.data.effective_validation_batch_size,
+        sources=config.data.validation,
+        paths=validation_paths,
+        input_file_digests=input_file_digests,
     )
     manifest_payload = {
         "convention_version": SCRATCH_DATA_MANIFEST_CONVENTION_VERSION,

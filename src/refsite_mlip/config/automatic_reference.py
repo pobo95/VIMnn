@@ -687,6 +687,7 @@ def _load_geometries(
     *,
     base: Path,
     read_file: Callable[..., tuple[Path, bytes]],
+    reference_aliases: Mapping[str, str] | None = None,
 ) -> tuple[tuple[_Geometry, ...], tuple[_Geometry, ...]]:
     output = []
     for split, sources in (("train", data.train), ("validation", data.validation)):
@@ -704,7 +705,11 @@ def _load_geometries(
                     split=split,
                     source_index=source_index,
                     frame_index=frame_index,
-                    exact=source.template_id,
+                    exact=(
+                        reference_aliases[source.reference_alias]
+                        if source.reference_alias is not None
+                        else source.template_id
+                    ),
                 )
                 for frame_index, atoms in enumerate(atoms_values)
             )
@@ -762,7 +767,17 @@ def prepare_automatic_references(
         )
     reference_inputs.sort(key=lambda item: (item["template_id"], item["semantic_sha"]))
 
-    train, validation = _load_geometries(recipe.data, base=base, read_file=read_file)
+    reference_aliases = {
+        item["source"].authoring_alias: item["template_id"]
+        for item in reference_inputs
+        if item["source"].authoring_alias is not None
+    }
+    train, validation = _load_geometries(
+        recipe.data,
+        base=base,
+        read_file=read_file,
+        reference_aliases=reference_aliases,
+    )
     reference_species = {
         int(value) for item in reference_inputs for value in item["numbers"].tolist()
     }
@@ -834,7 +849,13 @@ def prepare_automatic_references(
                     )
                 reasons.append(f"row-vector cell strain {observed:.17g} exceeds {limit:.17g}")
             diagnostics.append(
-                {"template_id": template_id, "approved": not reasons, "reasons": reasons, "observed_strain": observed}
+                {
+                    "template_id": template_id,
+                    "reference_alias": item["source"].authoring_alias,
+                    "approved": not reasons,
+                    "reasons": reasons,
+                    "observed_strain": observed,
+                }
             )
             if not reasons:
                 candidates.append(template_id)

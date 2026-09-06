@@ -255,6 +255,7 @@ class TrainingDataSourceConfig:
     template_id: str | None = None
     template_key: str | None = None
     automatic_template_assignment: bool = False
+    reference_alias: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "path", _path_text(self.path, field_name="path"))
@@ -267,6 +268,23 @@ class TrainingDataSourceConfig:
                     stage="config.validation",
                     field=name,
                     actual=value,
+                )
+        if self.reference_alias is not None:
+            alias = self.reference_alias
+            if (
+                type(alias) is not str
+                or not alias
+                or alias in (".", "..")
+                or ".." in alias
+                or any(ord(character) < 32 for character in alias)
+                or any(character in "/\\" for character in alias)
+            ):
+                raise _error(
+                    "INVALID_REFERENCE_ALIAS",
+                    "reference_alias must be a nonempty safe authoring name",
+                    stage="config.validation",
+                    field="reference_alias",
+                    actual=alias,
                 )
         if type(self.automatic_template_assignment) is not bool:
             raise _error(
@@ -293,6 +311,13 @@ class TrainingDataSourceConfig:
                     "template_id,template_key,automatic_template_assignment"
                 ),
             )
+        if self.reference_alias is not None and self.template_id is None:
+            raise _error(
+                "CONFLICTING_TEMPLATE_SELECTOR",
+                "reference_alias is provenance for an exact template_id binding",
+                stage="config.validation",
+                field="reference_alias,template_id",
+            )
 
     def to_dict(self) -> dict[str, Any]:
         result = {"path": self.path}
@@ -302,6 +327,8 @@ class TrainingDataSourceConfig:
             result["template_key"] = self.template_key
         else:
             result["automatic_template_assignment"] = True
+        if self.reference_alias is not None:
+            result["reference_alias"] = self.reference_alias
         return result
 
     @classmethod
@@ -320,6 +347,7 @@ class TrainingDataSourceConfig:
                 "template_id",
                 "template_key",
                 "automatic_template_assignment",
+                "reference_alias",
             }
         )
         unknown = keys - allowed
@@ -367,6 +395,7 @@ class TrainingDataSourceConfig:
             template_id=value.get("template_id"),
             template_key=value.get("template_key"),
             automatic_template_assignment=automatic,
+            reference_alias=value.get("reference_alias"),
         )
 
 
@@ -935,6 +964,17 @@ class TrainingRunConfig:
                                     f"data.{split}[{index}]."
                                     "automatic_template_assignment"
                                 ),
+                                split=split,
+                            )
+                        if (
+                            isinstance(entry, Mapping)
+                            and "reference_alias" in entry
+                        ):
+                            raise _error(
+                                "UNKNOWN_CONFIG_KEY",
+                                "schema v1 does not define recipe reference aliases",
+                                stage="config.schema",
+                                field=f"data.{split}[{index}].reference_alias",
                                 split=split,
                             )
         else:

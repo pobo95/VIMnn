@@ -171,6 +171,23 @@ def _path(value: Any, *, field_name: str) -> str:
     return value
 
 
+def _reference_alias(value: Any, *, field_name: str) -> str:
+    if (
+        type(value) is not str
+        or _NAME.fullmatch(value) is None
+        or value in (".", "..")
+        or ".." in value
+    ):
+        raise _error(
+            "INVALID_REFERENCE_ALIAS",
+            "reference alias must be a nonempty filesystem-safe name, not a path",
+            stage="recipe.reference",
+            field=field_name,
+            actual=value,
+        )
+    return value
+
+
 def _positive_int(value: Any, *, field_name: str) -> int:
     if isinstance(value, bool) or not isinstance(value, Integral):
         raise _error(
@@ -573,6 +590,7 @@ class RecipeReferenceSourceConfig:
     allow_provisional_phase: bool = False
     template_id: str | None = None
     maximum_strain: str | float | None = None
+    authoring_alias: str | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if self.specification is not None:
@@ -582,6 +600,14 @@ class RecipeReferenceSourceConfig:
                 _path(self.specification, field_name="reference.specification"),
             )
         object.__setattr__(self, "poscar", _path(self.poscar, field_name="reference.poscar"))
+        if self.authoring_alias is not None:
+            object.__setattr__(
+                self,
+                "authoring_alias",
+                _reference_alias(
+                    self.authoring_alias, field_name="reference.sources"
+                ),
+            )
         if type(self.allow_provisional_phase) is not bool:
             raise _error(
                 "INVALID_PROVISIONAL_PHASE_FLAG",
@@ -714,6 +740,25 @@ class RecipeReferenceConfig:
                 field="reference",
             )
         object.__setattr__(self, "sources", sources)
+        aliases = tuple(source.authoring_alias for source in sources)
+        if any(alias is not None for alias in aliases) and not all(
+            alias is not None for alias in aliases
+        ):
+            raise _error(
+                "CONFLICTING_REFERENCE_ALIAS_MODE",
+                "aliased and unaliased reference sources cannot be mixed",
+                stage="recipe.reference",
+                field="reference.sources",
+            )
+        present_aliases = tuple(alias for alias in aliases if alias is not None)
+        if len(present_aliases) != len(set(present_aliases)):
+            raise _error(
+                "DUPLICATE_REFERENCE_ALIAS",
+                "reference aliases must be unique",
+                stage="recipe.reference",
+                field="reference.sources",
+                actual=present_aliases,
+            )
         automatic_count = sum(source.is_automatic for source in sources)
         if automatic_count not in (0, len(sources)):
             raise _error(
@@ -733,6 +778,16 @@ class RecipeReferenceConfig:
             )
 
     def to_dict(self) -> dict[str, Any]:
+        if all(source.authoring_alias is not None for source in self.sources):
+            result: dict[str, Any] = {
+                "sources": {
+                    source.authoring_alias: source.to_dict()
+                    for source in self.sources
+                }
+            }
+            if self.default_template_id is not None:
+                result["default_template_id"] = self.default_template_id
+            return result
         if all(source.is_automatic for source in self.sources):
             simple = all(
                 source.template_id is None and source.maximum_strain == "auto"
@@ -785,6 +840,32 @@ class RecipeReferenceConfig:
                 field_name="reference",
             )
             raw = payload["sources"]
+            if isinstance(raw, Mapping):
+                if not raw:
+                    raise _error(
+                        "EMPTY_REFERENCE_SEQUENCE",
+                        "reference.sources must be a nonempty alias mapping",
+                        stage="recipe.reference",
+                        field="reference.sources",
+                    )
+                if payload.get("default_template_id") is not None:
+                    raise _error(
+                        "CONFLICTING_REFERENCE_ALIAS_MODE",
+                        "aliased references use deterministic content-derived defaults",
+                        stage="recipe.reference",
+                        field="reference.default_template_id",
+                    )
+                sources = []
+                for alias, item in raw.items():
+                    canonical_alias = _reference_alias(
+                        alias, field_name="reference.sources"
+                    )
+                    source = RecipeReferenceSourceConfig.from_dict(
+                        item,
+                        field_name=f"reference.sources[{canonical_alias!r}]",
+                    )
+                    sources.append(replace(source, authoring_alias=canonical_alias))
+                return cls(tuple(sources))
             if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes, bytearray)) or not raw:
                 raise _error(
                     "EMPTY_REFERENCE_SEQUENCE", "reference.sources must be a nonempty sequence",
@@ -826,6 +907,7 @@ class RecipeDataSourceConfig:
     path: str
     template_id: str | None = None
     automatic_template_assignment: bool = False
+    reference_alias: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "path", _path(self.path, field_name="data.path"))
@@ -834,18 +916,37 @@ class RecipeDataSourceConfig:
                 "INVALID_TEMPLATE_SELECTOR", "template_id must be a nonempty string",
                 stage="recipe.data", field="data.template_id"
             )
+        if self.reference_alias is not None:
+            object.__setattr__(
+                self,
+                "reference_alias",
+                _reference_alias(
+                    self.reference_alias, field_name="data.reference"
+                ),
+            )
         if type(self.automatic_template_assignment) is not bool:
             raise _error(
                 "INVALID_TEMPLATE_SELECTOR", "automatic_template_assignment must be a bool",
                 stage="recipe.data", field="data.automatic_template_assignment"
             )
-        if self.template_id is not None and self.automatic_template_assignment:
+        active = sum(
+            (
+                self.template_id is not None,
+                self.automatic_template_assignment,
+                self.reference_alias is not None,
+            )
+        )
+        if active > 1:
             raise _error(
-                "CONFLICTING_TEMPLATE_SELECTOR", "exact and automatic template selection conflict",
-                stage="recipe.data", field="data.template_id,automatic_template_assignment"
+                "CONFLICTING_TEMPLATE_SELECTOR",
+                "reference alias, exact template, and automatic selection conflict",
+                stage="recipe.data",
+                field="data.reference,template_id,automatic_template_assignment",
             )
 
     def to_dict(self) -> dict[str, Any]:
+        if self.reference_alias is not None:
+            return {"file": self.path, "reference": self.reference_alias}
         result: dict[str, Any] = {"path": self.path}
         if self.template_id is not None:
             result["template_id"] = self.template_id
@@ -857,6 +958,18 @@ class RecipeDataSourceConfig:
     def from_value(cls, value: Any, *, field_name: str) -> "RecipeDataSourceConfig":
         if type(value) is str:
             return cls(value)
+        if isinstance(value, Mapping) and (
+            "file" in value or "reference" in value
+        ):
+            payload = _strict_mapping(
+                value,
+                allowed=frozenset({"file", "reference"}),
+                required=frozenset({"file", "reference"}),
+                field_name=field_name,
+            )
+            return cls(
+                path=payload["file"], reference_alias=payload["reference"]
+            )
         payload = _strict_mapping(
             value,
             allowed=frozenset({"path", "template_id", "automatic_template_assignment"}),
@@ -899,10 +1012,24 @@ class RecipeDataConfig:
                 "EMPTY_DATA_SPLIT", "train and validation must be nonempty",
                 stage="recipe.data", field="data"
             )
+        for split, sources in (("train", self.train), ("validation", self.validation)):
+            aliased = tuple(source.reference_alias is not None for source in sources)
+            if any(aliased) and not all(aliased):
+                raise _error(
+                    "MIXED_DATA_BINDING_MODE",
+                    "one split cannot mix explicit alias bindings with legacy or automatic entries",
+                    stage="recipe.data",
+                    field=f"data.{split}",
+                )
 
     def to_dict(self) -> dict[str, Any]:
         def encode(items: tuple[RecipeDataSourceConfig, ...]) -> Any:
-            if len(items) == 1 and items[0].template_id is None and not items[0].automatic_template_assignment:
+            if (
+                len(items) == 1
+                and items[0].template_id is None
+                and items[0].reference_alias is None
+                and not items[0].automatic_template_assignment
+            ):
                 return items[0].path
             return [item.to_dict() for item in items]
         return {"train": encode(self.train), "validation": encode(self.validation)}
@@ -1085,6 +1212,51 @@ class TrainingRecipeConfig:
                 "UNSUPPORTED_BASELINE_POLICY",
                 "baseline must be zero, fit_full_rank, or minimum_norm",
                 stage="recipe.baseline", field="baseline", actual=self.baseline
+            )
+        reference_aliases = tuple(
+            source.authoring_alias
+            for source in self.reference.sources
+            if source.authoring_alias is not None
+        )
+        data_sources = self.data.train + self.data.validation
+        data_aliases = tuple(
+            source.reference_alias
+            for source in data_sources
+            if source.reference_alias is not None
+        )
+        if reference_aliases:
+            if len(data_aliases) != len(data_sources):
+                raise _error(
+                    "MISSING_EXPLICIT_REFERENCE_BINDING",
+                    "aliased references require every train and validation source to name a reference alias",
+                    stage="recipe.data",
+                    field="data",
+                )
+            unknown = tuple(sorted(set(data_aliases) - set(reference_aliases)))
+            if unknown:
+                raise _error(
+                    "UNKNOWN_REFERENCE_ALIAS",
+                    "data source names an unknown reference alias",
+                    stage="recipe.data",
+                    field="data.reference",
+                    actual=unknown,
+                )
+            unused = tuple(sorted(set(reference_aliases) - set(data_aliases)))
+            if unused:
+                raise _error(
+                    "UNUSED_REFERENCE_ALIAS",
+                    "every declared reference alias must be used by data",
+                    stage="recipe.data",
+                    field="reference.sources",
+                    actual=unused,
+                )
+        elif data_aliases:
+            raise _error(
+                "UNKNOWN_REFERENCE_ALIAS",
+                "data reference aliases require reference.sources to be an alias mapping",
+                stage="recipe.data",
+                field="data.reference",
+                actual=tuple(sorted(set(data_aliases))),
             )
         if self.source_path is not None:
             object.__setattr__(self, "source_path", str(self.source_path))
@@ -1502,8 +1674,23 @@ def _compile_data_source(
     source: RecipeDataSourceConfig,
     *,
     template_ids: tuple[str, ...],
+    reference_aliases: Mapping[str, str] | None = None,
     automatic_reference_mode: bool = False,
 ) -> TrainingDataSourceConfig:
+    if source.reference_alias is not None:
+        if reference_aliases is None or source.reference_alias not in reference_aliases:
+            raise _error(
+                "UNKNOWN_REFERENCE_ALIAS",
+                "data source names an unknown reference alias",
+                stage="recipe.compile",
+                field="data.reference",
+                actual=source.reference_alias,
+            )
+        return TrainingDataSourceConfig(
+            path=source.path,
+            template_id=reference_aliases[source.reference_alias],
+            reference_alias=source.reference_alias,
+        )
     if source.template_id is not None:
         if source.template_id not in template_ids:
             raise _error(
@@ -1566,6 +1753,11 @@ def _compile_training_recipe_impl(
             "DUPLICATE_TEMPLATE_ID", "reference specifications contain duplicate template IDs",
             stage="recipe.compile", field="reference"
         )
+    reference_aliases = {
+        source.authoring_alias: specification.builder.template_id
+        for source, specification in zip(recipe.reference.sources, specifications)
+        if source.authoring_alias is not None
+    }
     default_template = recipe.reference.default_template_id
     if default_template is None:
         if len(template_ids) != 1 and not all(
@@ -1741,6 +1933,7 @@ def _compile_training_recipe_impl(
             _compile_data_source(
                 item,
                 template_ids=template_ids,
+                reference_aliases=reference_aliases,
                 automatic_reference_mode=all(
                     source.is_automatic for source in recipe.reference.sources
                 ),
@@ -1751,6 +1944,7 @@ def _compile_training_recipe_impl(
             _compile_data_source(
                 item,
                 template_ids=template_ids,
+                reference_aliases=reference_aliases,
                 automatic_reference_mode=all(
                     source.is_automatic for source in recipe.reference.sources
                 ),
@@ -2102,6 +2296,72 @@ def load_reference_specification(path: str | os.PathLike[str]) -> ReferenceSpeci
         raise
 
 
+def _validate_aliased_data_paths(
+    recipe: TrainingRecipeConfig, *, base: Path
+) -> None:
+    if not any(
+        source.reference_alias is not None
+        for source in recipe.data.train + recipe.data.validation
+    ):
+        return
+    identities: dict[str, tuple[str, int, str]] = {}
+    for split, sources in (
+        ("train", recipe.data.train),
+        ("validation", recipe.data.validation),
+    ):
+        split_identities: dict[str, tuple[int, str]] = {}
+        for index, source in enumerate(sources):
+            original = source.path
+            candidate = Path(original)
+            unresolved = candidate if candidate.is_absolute() else base / candidate
+            try:
+                resolved = str(unresolved.resolve(strict=False))
+            except (OSError, RuntimeError) as error:
+                raise _error(
+                    "RECIPE_DATA_PATH_ERROR",
+                    "bound extxyz path could not be resolved",
+                    stage="recipe.data",
+                    field=f"data.{split}[{index}].file",
+                    path=original,
+                    original_error=error,
+                ) from error
+            if resolved in split_identities:
+                first_index, first_original = split_identities[resolved]
+                raise _error(
+                    "DUPLICATE_DATA_SOURCE",
+                    "the same resolved extxyz file is registered twice in one split",
+                    stage="recipe.data",
+                    field=f"data.{split}[{index}].file",
+                    path=original,
+                    expected={
+                        "source_index": first_index,
+                        "original_path": first_original,
+                    },
+                    actual={"source_index": index, "resolved_path": resolved},
+                )
+            split_identities[resolved] = (index, original)
+            if resolved in identities and identities[resolved][0] != split:
+                other_split, other_index, other_original = identities[resolved]
+                raise _error(
+                    "TRAIN_VALIDATION_DATA_LEAKAGE",
+                    "the same resolved extxyz file cannot be used for train and validation",
+                    stage="recipe.data",
+                    field=f"data.{split}[{index}].file",
+                    path=original,
+                    expected={
+                        "split": other_split,
+                        "source_index": other_index,
+                        "original_path": other_original,
+                    },
+                    actual={
+                        "split": split,
+                        "source_index": index,
+                        "resolved_path": resolved,
+                    },
+                )
+            identities[resolved] = (split, index, original)
+
+
 def resolve_training_recipe(
     path: str | os.PathLike[str],
     *,
@@ -2113,6 +2373,7 @@ def resolve_training_recipe(
     recipe = load_training_recipe(path)
     assert recipe.source_path is not None
     base = Path(recipe.source_path).parent
+    _validate_aliased_data_paths(recipe, base=base)
     automatic_mode = all(
         source.is_automatic for source in recipe.reference.sources
     )
