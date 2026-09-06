@@ -234,6 +234,29 @@ def render_train_config_human(
                         f"{certificate['artifact_sha256']}",
                     )
                 )
+                evaluation = certificate.get("evaluation_certificate")
+                if evaluation is not None:
+                    split_counts = evaluation["audit_input"]["split_counts"]
+                    probes = evaluation["derivative_probes"]
+                    lines.extend(
+                        (
+                            "    Evaluation solver: sinkhorn_newton_krylov",
+                            f"    Policy status: {evaluation['status']}",
+                            f"    Scope: {evaluation['scope']}",
+                            f"    Phase approval: {evaluation['phase_approval']}",
+                            "    Audited train/validation frames: "
+                            f"{split_counts['train']}/{split_counts['validation']}",
+                            "    Position/strain probes: "
+                            f"{sum(item['position_directions'] for item in probes)}/"
+                            f"{sum(item['strain_directions'] for item in probes)}",
+                            f"    Fallback count: {evaluation['fallback_count']}",
+                            "    Policy SHA-256: "
+                            f"{evaluation['policy_fingerprint']}",
+                            "    Evaluation certificate SHA-256: "
+                            f"{evaluation['evaluation_certificate_sha256']}",
+                            "    Production/MD guarantee: no",
+                        )
+                    )
         lines.extend(["", "Labels"])
         _label_lines(lines, split="train", statistics=train["label_statistics"])
         _label_lines(

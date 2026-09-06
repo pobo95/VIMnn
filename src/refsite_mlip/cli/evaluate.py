@@ -240,7 +240,7 @@ def _evaluation_error(
         sample_id=sample_id,
         template_id=template_id,
         term=term,
-        solver_path=config.solver_path,
+        solver_path=config.solver_name,
         prediction_stage=stage,
         predictor_reason_code=reason_code,
         original_error=original_error,

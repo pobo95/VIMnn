@@ -197,7 +197,11 @@ def _automatic_payload(preparation: ScratchTrainingPreparation) -> dict[str, Any
 
 def _certificates(
     preparation: ScratchTrainingPreparation,
-) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
+) -> tuple[
+    dict[str, Any],
+    dict[str, dict[str, Any]],
+    dict[str, dict[str, Any]],
+]:
     payload = _automatic_payload(preparation)
     references = payload["references"]
     if not isinstance(references, list) or not references:
@@ -207,6 +211,7 @@ def _certificates(
             stage="reference_materialization.preflight",
         )
     certificates: dict[str, dict[str, Any]] = {}
+    evaluation_certificates: dict[str, dict[str, Any]] = {}
     for item in references:
         if not isinstance(item, Mapping):
             raise AutomaticReferenceMaterializationError(
@@ -215,6 +220,7 @@ def _certificates(
                 stage="reference_materialization.certificate",
             )
         certificate = _plain(item)
+        evaluation_certificate = certificate.pop("evaluation_certificate", None)
         template_id = certificate.get("template_id")
         if type(template_id) is not str:
             raise AutomaticReferenceMaterializationError(
@@ -241,8 +247,30 @@ def _certificates(
                 template_id=template_id,
             )
         certificates[template_id] = certificate
+        if evaluation_certificate is not None:
+            if not isinstance(evaluation_certificate, Mapping):
+                raise AutomaticReferenceMaterializationError(
+                    "INVALID_AUTOMATIC_EVALUATION_CERTIFICATE",
+                    "automatic evaluation certificate must be a mapping",
+                    stage="reference_materialization.evaluation_certificate",
+                    template_id=template_id,
+                )
+            evaluation = _plain(evaluation_certificate)
+            declared_evaluation = evaluation.get(
+                "evaluation_certificate_sha256"
+            )
+            evaluation_content = dict(evaluation)
+            evaluation_content.pop("evaluation_certificate_sha256", None)
+            if declared_evaluation != _fingerprint(evaluation_content):
+                raise AutomaticReferenceMaterializationError(
+                    "EVALUATION_CERTIFICATE_FINGERPRINT_MISMATCH",
+                    "automatic evaluation certificate fingerprint differs from content",
+                    stage="reference_materialization.evaluation_certificate",
+                    template_id=template_id,
+                )
+            evaluation_certificates[template_id] = evaluation
     _safe_template_ids(tuple(certificates))
-    return payload, certificates
+    return payload, certificates, evaluation_certificates
 
 
 def _expected_specification(
@@ -281,6 +309,7 @@ def _validate_preparation_binding(
     artifact = preparation.structural_artifacts.get(template_id)
     context = preparation.template_contexts.get(template_id)
     policy = preparation.evaluation_policies.get(template_id)
+    evaluation_metadata = certificate.get("evaluation_policy")
     if not isinstance(metadata, Mapping) or artifact is None or context is None:
         raise AutomaticReferenceMaterializationError(
             "REFERENCE_BINDING_MISSING",
@@ -318,13 +347,33 @@ def _validate_preparation_binding(
             stage="reference_materialization.binding",
             template_id=template_id,
         )
-    if specification.evaluation_policy is not None or policy is not None:
-        raise AutomaticReferenceMaterializationError(
-            "AUTOMATIC_EVALUATION_POLICY_PRESENT",
-            "automatic references must not create an EvaluationPolicy",
-            stage="reference_materialization.binding",
-            template_id=template_id,
-        )
+    if evaluation_metadata is None:
+        if specification.evaluation_policy is not None or policy is not None:
+            raise AutomaticReferenceMaterializationError(
+                "AUTOMATIC_EVALUATION_POLICY_PRESENT",
+                "sinkhorn-only automatic references must not create an EvaluationPolicy",
+                stage="reference_materialization.binding",
+                template_id=template_id,
+            )
+    else:
+        if (
+            not isinstance(evaluation_metadata, Mapping)
+            or evaluation_metadata.get("status") != "qualified"
+            or specification.evaluation_policy is None
+            or policy is None
+            or specification.evaluation_policy.content_fingerprint
+            != evaluation_metadata.get("content_fingerprint")
+            or policy.content_fingerprint
+            != specification.evaluation_policy.content_fingerprint
+            or certificate.get("radius_fingerprint")
+            != preparation.radius_config.content_fingerprint
+        ):
+            raise AutomaticReferenceMaterializationError(
+                "AUTOMATIC_EVALUATION_POLICY_MISMATCH",
+                "qualified automatic EvaluationPolicy binding differs from preparation",
+                stage="reference_materialization.binding",
+                template_id=template_id,
+            )
     if certificate.get("num_reference_sites") != artifact.diagnostics.num_sites:
         raise AutomaticReferenceMaterializationError(
             "REFERENCE_SITE_COUNT_MISMATCH",
@@ -427,7 +476,7 @@ def materialize_automatic_references(
         if not isinstance(preparation.model_source, ScratchModelSourceConfig):
             raise TypeError("automatic materialization requires scratch model source")
         lock.validate_owned(directory.resume_lock_path)
-        payload, certificates = _certificates(preparation)
+        payload, certificates, evaluation_certificates = _certificates(preparation)
         sources = {
             source.template_id: source
             for source in preparation.model_source.reference_templates
@@ -437,6 +486,12 @@ def materialize_automatic_references(
             raise AutomaticReferenceMaterializationError(
                 "REFERENCE_TEMPLATE_SET_MISMATCH",
                 "compiled sources and automatic certificates name different templates",
+                stage="reference_materialization.preflight",
+            )
+        if not set(evaluation_certificates).issubset(set(ids)):
+            raise AutomaticReferenceMaterializationError(
+                "REFERENCE_TEMPLATE_SET_MISMATCH",
+                "evaluation certificates name an unknown template",
                 stage="reference_materialization.preflight",
             )
         if preparation.model_source.default_template_id not in set(ids):
@@ -466,8 +521,18 @@ def materialize_automatic_references(
             lock.validate_owned(directory.resume_lock_path)
             reference_relative = f"references/{template_id}.reference.json"
             certificate_relative = f"references/{template_id}.certificate.json"
+            evaluation_relative = (
+                f"references/{template_id}.evaluation-certificate.json"
+                if template_id in evaluation_certificates
+                else None
+            )
             reference_path = directory.root / reference_relative
             certificate_path = directory.root / certificate_relative
+            evaluation_path = (
+                None
+                if evaluation_relative is None
+                else directory.root / evaluation_relative
+            )
             current_template = template_id
             current_path = reference_path
             _write_json(
@@ -483,6 +548,14 @@ def materialize_automatic_references(
                 stage="reference_materialization.certificate_save",
             )
             completed.append(certificate_relative)
+            if evaluation_path is not None:
+                current_path = evaluation_path
+                _write_json(
+                    evaluation_path,
+                    evaluation_certificates[template_id],
+                    stage="reference_materialization.evaluation_certificate_save",
+                )
+                completed.append(str(evaluation_relative))
 
             current_path = reference_path
             loaded = _load_reference(reference_path)
@@ -491,6 +564,13 @@ def materialize_automatic_references(
                 certificate_path,
                 stage="reference_materialization.certificate_reload",
             )
+            loaded_evaluation = None
+            if evaluation_path is not None:
+                current_path = evaluation_path
+                loaded_evaluation = _load_certificate(
+                    evaluation_path,
+                    stage="reference_materialization.evaluation_certificate_reload",
+                )
             if loaded.to_dict() != specifications[template_id].to_dict():
                 raise AutomaticReferenceMaterializationError(
                     "REFERENCE_RELOAD_CONTENT_MISMATCH",
@@ -509,6 +589,39 @@ def materialize_automatic_references(
                     path=certificate_path,
                     completed_files=completed,
                 )
+            if loaded_evaluation != evaluation_certificates.get(template_id):
+                raise AutomaticReferenceMaterializationError(
+                    "EVALUATION_CERTIFICATE_RELOAD_CONTENT_MISMATCH",
+                    "reloaded evaluation certificate differs from committed content",
+                    stage="reference_materialization.evaluation_certificate_reload",
+                    template_id=template_id,
+                    path=evaluation_path,
+                    completed_files=completed,
+                )
+            if loaded_evaluation is not None:
+                policy = loaded.evaluation_policy
+                if (
+                    policy is None
+                    or loaded_evaluation.get("status") != "qualified"
+                    or loaded_evaluation.get("scope")
+                    != "assigned_dataset_local_neighborhood"
+                    or loaded_evaluation.get("structural_certificate_sha256")
+                    != loaded_certificate["certificate_sha256"]
+                    or loaded_evaluation.get("specification_sha256")
+                    != loaded.content_fingerprint
+                    or loaded_evaluation.get("policy_fingerprint")
+                    != policy.content_fingerprint
+                    or loaded_evaluation.get("radius_fingerprint")
+                    != preparation.radius_config.content_fingerprint
+                ):
+                    raise AutomaticReferenceMaterializationError(
+                        "EVALUATION_CERTIFICATE_BINDING_MISMATCH",
+                        "evaluation certificate hash chain differs from persisted reference",
+                        stage="reference_materialization.evaluation_certificate_reload",
+                        template_id=template_id,
+                        path=evaluation_path,
+                        completed_files=completed,
+                    )
             _validate_preparation_binding(
                 preparation, template_id, loaded, loaded_certificate
             )
@@ -529,6 +642,18 @@ def materialize_automatic_references(
                 "approval_status": "provisional",
                 "evaluation_policy": None,
             }
+            if loaded.evaluation_policy is not None:
+                entries[template_id]["evaluation_policy"] = {
+                    "content_fingerprint": loaded.evaluation_policy.content_fingerprint,
+                    "status": "qualified",
+                    "scope": "assigned_dataset_local_neighborhood",
+                }
+                entries[template_id]["evaluation_certificate_path"] = (
+                    evaluation_relative
+                )
+                entries[template_id]["evaluation_certificate_fingerprint"] = (
+                    loaded_evaluation["evaluation_certificate_sha256"]
+                )
 
         rebound_sources = tuple(
             replace(
@@ -696,9 +821,22 @@ def validate_materialized_reference_files(
             )
         reference_path = directory.root / str(entry.get("reference_path"))
         certificate_path = directory.root / str(entry.get("certificate_path"))
+        evaluation_relative = entry.get("evaluation_certificate_path")
+        evaluation_path = (
+            None
+            if evaluation_relative is None
+            else directory.root / str(evaluation_relative)
+        )
         expected_reference = directory.references / f"{template_id}.reference.json"
         expected_certificate = directory.references / f"{template_id}.certificate.json"
-        if reference_path != expected_reference or certificate_path != expected_certificate:
+        expected_evaluation = (
+            directory.references / f"{template_id}.evaluation-certificate.json"
+        )
+        if (
+            reference_path != expected_reference
+            or certificate_path != expected_certificate
+            or (evaluation_path is not None and evaluation_path != expected_evaluation)
+        ):
             raise AutomaticReferenceMaterializationError(
                 "REFERENCE_PATH_MISMATCH",
                 "materialized reference path is not the canonical run-relative path",
@@ -709,6 +847,14 @@ def validate_materialized_reference_files(
         certificate = _load_certificate(
             certificate_path,
             stage="reference_materialization.certificate_validate",
+        )
+        evaluation_certificate = (
+            None
+            if evaluation_path is None
+            else _load_certificate(
+                evaluation_path,
+                stage="reference_materialization.evaluation_certificate_validate",
+            )
         )
         declared_certificate = certificate.get("certificate_sha256")
         certificate_content = dict(certificate)
@@ -758,17 +904,55 @@ def validate_materialized_reference_files(
                 stage="reference_materialization.validate",
                 template_id=template_id,
             )
-        if (
-            specification.phase_specification.approval_status != "provisional"
-            or specification.evaluation_policy is not None
-            or binding.evaluation_policy is not None
-        ):
+        if specification.phase_specification.approval_status != "provisional":
             raise AutomaticReferenceMaterializationError(
                 "AUTOMATIC_REFERENCE_POLICY_MISMATCH",
                 "automatic reference phase/policy contract changed",
                 stage="reference_materialization.validate",
                 template_id=template_id,
             )
+        policy = specification.evaluation_policy
+        if evaluation_certificate is None:
+            if policy is not None or binding.evaluation_policy is not None:
+                raise AutomaticReferenceMaterializationError(
+                    "AUTOMATIC_REFERENCE_POLICY_MISMATCH",
+                    "sinkhorn-only materialized reference acquired an EvaluationPolicy",
+                    stage="reference_materialization.validate",
+                    template_id=template_id,
+                )
+        else:
+            declared_evaluation = evaluation_certificate.get(
+                "evaluation_certificate_sha256"
+            )
+            evaluation_content = dict(evaluation_certificate)
+            evaluation_content.pop("evaluation_certificate_sha256", None)
+            if (
+                declared_evaluation != _fingerprint(evaluation_content)
+                or policy is None
+                or binding.evaluation_policy is None
+                or policy.content_fingerprint
+                != binding.evaluation_policy.content_fingerprint
+                or entry.get("evaluation_certificate_fingerprint")
+                != declared_evaluation
+                or evaluation_certificate.get("status") != "qualified"
+                or evaluation_certificate.get("scope")
+                != "assigned_dataset_local_neighborhood"
+                or evaluation_certificate.get("structural_certificate_sha256")
+                != declared_certificate
+                or evaluation_certificate.get("specification_sha256")
+                != specification.content_fingerprint
+                or evaluation_certificate.get("policy_fingerprint")
+                != policy.content_fingerprint
+                or evaluation_certificate.get("radius_fingerprint")
+                != config.radii.content_fingerprint
+            ):
+                raise AutomaticReferenceMaterializationError(
+                    "EVALUATION_CERTIFICATE_BINDING_MISMATCH",
+                    "persisted evaluation certificate differs from reference/bundle binding",
+                    stage="reference_materialization.validate",
+                    template_id=template_id,
+                    path=evaluation_path,
+                )
 
 
 __all__ = [

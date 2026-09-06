@@ -1,6 +1,10 @@
 from .batch_executor import evaluate_structure_batch
 from .config import PotentialConfig
-from .evaluation_policy import EvaluationPolicy
+from .evaluation_policy import (
+    PRODUCTION_EVALUATION_POLICY_ACCEPTANCE_V1,
+    EvaluationPolicy,
+    EvaluationPolicyAcceptanceProfile,
+)
 from .outputs import BatchedPotentialOutput, EvaluationDiagnostics, PotentialOutput
 from .potential import ReferenceSitePotential
 from .template_context import TemplateExecutionContext
@@ -26,12 +30,14 @@ __all__ = [
     'BatchedPotentialOutput',
     'EvaluationDiagnostics',
     'EvaluationPolicy',
+    'EvaluationPolicyAcceptanceProfile',
     'LoadedReferenceSiteModel',
     'MODEL_BUNDLE_CONVENTION_VERSION',
     'ModelBundleError',
     'ModelBundleTemplateBinding',
     'PotentialConfig',
     'PotentialOutput',
+    'PRODUCTION_EVALUATION_POLICY_ACCEPTANCE_V1',
     'ReferenceSitePotential',
     'ReferenceSiteModelBundle',
     'REFERENCE_SITE_MODEL_BUNDLE_SCHEMA_VERSION',

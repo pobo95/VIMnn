@@ -2117,14 +2117,6 @@ def resolve_training_recipe(
         source.is_automatic for source in recipe.reference.sources
     )
     if automatic_mode:
-        if recipe.ot_solver.inference == SINKHORN_NEWTON_KRYLOV_OT_SOLVER:
-            raise _error(
-                "AUTOMATIC_EVALUATION_POLICY_NOT_AVAILABLE",
-                "POSCAR-only references are provisional and do not create an EvaluationPolicy; use inference: sinkhorn or provide an explicit reference specification",
-                stage="recipe.ot_solver",
-                field="ot_solver.inference",
-                actual=recipe.ot_solver.inference,
-            )
         from .automatic_reference import (
             AutomaticReferenceError,
             prepare_automatic_references,
@@ -2136,6 +2128,10 @@ def resolve_training_recipe(
                 base=base,
                 read_file=_read_regular_file,
                 specification_factory=ReferenceSpecificationConfig,
+                evaluation_policy_requested=(
+                    recipe.ot_solver.inference
+                    == SINKHORN_NEWTON_KRYLOV_OT_SOLVER
+                ),
             )
         except AutomaticReferenceError as error:
             context = " ".join(
@@ -2170,6 +2166,36 @@ def resolve_training_recipe(
             overrides=overrides,
             cli_cwd=cli_cwd,
         )
+        if recipe.ot_solver.inference == SINKHORN_NEWTON_KRYLOV_OT_SOLVER:
+            from .automatic_evaluation import (
+                AutomaticEvaluationPolicyAuditError,
+                qualify_automatic_evaluation_policies,
+            )
+
+            try:
+                automatic = qualify_automatic_evaluation_policies(
+                    automatic, compiled.config.model_source.potential
+                )
+            except AutomaticEvaluationPolicyAuditError as error:
+                raise _error(
+                    "AUTOMATIC_EVALUATION_POLICY_AUDIT_FAILED",
+                    error.message,
+                    stage=error.stage,
+                    field="ot_solver.inference",
+                    expected=error.required,
+                    actual={
+                        "reason_code": error.reason_code,
+                        "template_id": error.template_id,
+                        "sample_id": error.sample_id,
+                        "geometry_digest": error.geometry_digest,
+                        "probe": error.probe,
+                        "dtype": error.dtype,
+                        "backend": error.backend,
+                        "observed": error.observed,
+                        "diagnostics": error.diagnostics,
+                    },
+                    original_error=error,
+                ) from error
         manifest = replace(
             compiled.manifest,
             automatic_reference_fingerprint=automatic.content_fingerprint,

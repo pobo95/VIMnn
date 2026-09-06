@@ -122,7 +122,7 @@ def test_config_parser_terms_scales_weights_and_usage(tmp_path, capsys):
         ["evaluate", "--bundle", "m.pt", "--input", "v.xyz"]
     )
     assert args.index == ":"
-    assert args.solver == "train-fixed"
+    assert args.solver == "sinkhorn"
     assert args.terms == ("energy", "forces")
     assert args.energy_mode == "per-structure"
     assert args.batch_size == 8
@@ -305,7 +305,7 @@ def test_all_missing_or_all_masked_requested_term_fails_with_context(tmp_path):
     assert caught.value.term == "forces"
     assert caught.value.sample_id == "evaluate:000000"
     assert caught.value.template_id == "zeta"
-    assert caught.value.solver_path == TRAIN_FIXED
+    assert caught.value.solver_path == "sinkhorn"
 
     masked = _labeled_atoms()
     masked.arrays["force_mask"][:] = False
@@ -420,7 +420,7 @@ def _report():
         },
         "requested_terms": ["energy", "forces", "stress"],
         "scales": {"energy": 1.0, "forces": 1.0, "stress": 1.0},
-        "solver": "train-fixed",
+        "solver": "sinkhorn",
         "template_frame_counts": {"alpha": 1},
         "weights": {"energy": 1.0, "forces": 1.0, "stress": 1.0},
     }
@@ -536,7 +536,7 @@ def test_term_error_context_is_concise():
         "sample_id='evaluate:000002'",
         "template_id='zeta'",
         "term='stress'",
-        "solver_path='eval_adaptive'",
+        "solver_path='sinkhorn_newton_krylov'",
         "predictor_reason_code='NO_VALID_LABELS'",
     ):
         assert value in rendered

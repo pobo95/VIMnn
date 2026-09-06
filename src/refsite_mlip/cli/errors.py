@@ -6,6 +6,15 @@ from os import PathLike
 from typing import Any
 
 
+def _public_solver_name(value: str | None) -> str | None:
+    return {
+        "train_fixed": "sinkhorn",
+        "eval_adaptive": "sinkhorn_newton_krylov",
+        "train-fixed": "sinkhorn",
+        "eval-adaptive": "sinkhorn_newton_krylov",
+    }.get(value, value)
+
+
 class CLIError(RuntimeError):
     """A concise user-facing error with stable machine-readable context."""
 
@@ -75,7 +84,7 @@ class CLIError(RuntimeError):
         self.bundle_fingerprint = bundle_fingerprint
         self.config_fingerprint = config_fingerprint
         self.template_fingerprint = template_fingerprint
-        self.solver_path = solver_path
+        self.solver_path = _public_solver_name(solver_path)
         self.prediction_stage = prediction_stage
         self.predictor_reason_code = predictor_reason_code
         self.underlying_reason_code = underlying_reason_code

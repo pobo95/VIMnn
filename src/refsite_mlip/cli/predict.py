@@ -62,21 +62,27 @@ def normalize_properties(values: str | Sequence[str]) -> tuple[str, ...]:
 
 def solver_path_from_name(value: str) -> str:
     paths = {
+        "sinkhorn": TRAIN_FIXED,
+        "sinkhorn_newton_krylov": EVAL_ADAPTIVE,
+        # Deprecated public aliases remain accepted for compatibility.  They
+        # are canonicalized immediately and never appear in provenance.
         "train-fixed": TRAIN_FIXED,
         "eval-adaptive": EVAL_ADAPTIVE,
         TRAIN_FIXED: TRAIN_FIXED,
         EVAL_ADAPTIVE: EVAL_ADAPTIVE,
     }
     if value not in paths:
-        raise ValueError("solver must be train-fixed or eval-adaptive")
+        raise ValueError(
+            "solver must be sinkhorn or sinkhorn_newton_krylov"
+        )
     return paths[value]
 
 
 def solver_name(path: str) -> str:
     if path == TRAIN_FIXED:
-        return "train-fixed"
+        return "sinkhorn"
     if path == EVAL_ADAPTIVE:
-        return "eval-adaptive"
+        return "sinkhorn_newton_krylov"
     raise ValueError("unsupported solver path")
 
 
@@ -218,7 +224,7 @@ def _prediction_error(
         sample_id=sample_id,
         template_id=template_id,
         term=_term_context(config),
-        solver_path=config.solver_path,
+        solver_path=config.solver_name,
         prediction_stage=prediction_stage,
         predictor_reason_code=reason_code,
         original_error=original_error,
@@ -238,7 +244,7 @@ def _preflight_device(config: ExtXYZPredictionConfig) -> torch.device:
             "CUDA availability could not be established",
             stage=_operation_stage(config, "device_preflight"),
             term=_term_context(config),
-            solver_path=config.solver_path,
+            solver_path=config.solver_name,
             prediction_stage="device_preflight",
             predictor_reason_code="UNAVAILABLE_CUDA_DEVICE",
             original_error=error,
@@ -250,7 +256,7 @@ def _preflight_device(config: ExtXYZPredictionConfig) -> torch.device:
             f"requested CUDA device {config.device!r} is unavailable",
             stage=_operation_stage(config, "device_preflight"),
             term=_term_context(config),
-            solver_path=config.solver_path,
+            solver_path=config.solver_name,
             prediction_stage="device_preflight",
             predictor_reason_code="UNAVAILABLE_CUDA_DEVICE",
         )
@@ -403,7 +409,7 @@ def _load_predictor(config: ExtXYZPredictionConfig):
             stage=error.validation_stage or _operation_stage(config, "predictor_load"),
             bundle_path=error.bundle_path or config.bundle_path,
             term=_term_context(config),
-            solver_path=config.solver_path,
+            solver_path=config.solver_name,
             prediction_stage="predictor_load",
             predictor_reason_code=error.reason_code,
             original_error=error,
@@ -415,7 +421,7 @@ def _load_predictor(config: ExtXYZPredictionConfig):
             stage=_operation_stage(config, "predictor_load"),
             bundle_path=config.bundle_path,
             term=_term_context(config),
-            solver_path=config.solver_path,
+            solver_path=config.solver_name,
             prediction_stage="predictor_load",
             predictor_reason_code="BUNDLE_NOT_FOUND",
             original_error=error,
@@ -431,7 +437,7 @@ def _load_predictor(config: ExtXYZPredictionConfig):
             ),
             bundle_path=config.bundle_path,
             term=_term_context(config),
-            solver_path=config.solver_path,
+            solver_path=config.solver_name,
             prediction_stage="predictor_load",
             predictor_reason_code=reason,
             original_error=error,
@@ -473,7 +479,7 @@ def _read_frames(
                     frame_index=frame_index,
                     sample_id=_sample_id(config, frame_index),
                     term=_term_context(config),
-                    solver_path=config.solver_path,
+                    solver_path=config.solver_name,
                     prediction_stage="input_parse",
                     original_error=error,
                 ) from error
@@ -732,7 +738,7 @@ def _prepare_samples(
             if template_id not in predictor.runtime.evaluation_policies:
                 raise _prediction_error(
                     "POLICY_CONTEXT_MISMATCH",
-                    "eval-adaptive requires a policy for every used template",
+                    "sinkhorn_newton_krylov requires a policy for every used template",
                     config=config,
                     input_path=source,
                     frame_index=frame_index,

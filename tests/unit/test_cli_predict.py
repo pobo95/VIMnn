@@ -159,11 +159,19 @@ def test_predict_parser_defaults_choices_and_usage_errors(capsys):
         ]
     )
     assert args.index == ":"
-    assert args.solver == "train-fixed"
+    assert args.solver == "sinkhorn"
     assert args.properties == ("energy", "forces")
     assert args.device == "cpu"
     assert args.dtype == "float64"
     assert args.batch_size == 8
+
+    with pytest.raises(SystemExit) as help_exit:
+        main(["predict", "--help"])
+    assert help_exit.value.code == 0
+    help_text = capsys.readouterr().out
+    assert "sinkhorn_newton_krylov" in help_text
+    assert "train-fixed" not in help_text
+    assert "eval-adaptive" not in help_text
 
     invalid = (
         ["--template-id", "zeta", "--template-key", "template"],
@@ -171,6 +179,7 @@ def test_predict_parser_defaults_choices_and_usage_errors(capsys):
         ["--batch-size", "0"],
         ["--device", "cuda:x"],
         ["--dtype", "float16"],
+        ["--solver", "eval_adaptive"],
     )
     base = [
         "predict",
@@ -428,7 +437,7 @@ def test_predictor_error_context_is_rendered_concisely(tmp_path):
         "frame_index=3",
         "sample_id='predict:000003'",
         "template_id='zeta'",
-        "solver_path='eval_adaptive'",
+        "solver_path='sinkhorn_newton_krylov'",
         "prediction_stage='structure_domain_preflight'",
         "predictor_reason_code='UNSUPPORTED_SPECIES'",
     ):

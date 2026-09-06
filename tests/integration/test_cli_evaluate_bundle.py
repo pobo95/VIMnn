@@ -256,7 +256,7 @@ def test_adaptive_all_terms_and_energy_modes(evaluation_bundle, tmp_path):
             batch_size=2,
         )
         reports[mode] = evaluate_extxyz(config)
-    assert reports["per-structure"]["solver"] == "eval-adaptive"
+    assert reports["per-structure"]["solver"] == "sinkhorn_newton_krylov"
     assert reports["per-atom"]["energy_mode"] == "per-atom"
     assert (
         reports["per-structure"]["loss"]["terms"]["energy"]["numerator"]

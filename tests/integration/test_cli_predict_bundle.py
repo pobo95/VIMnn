@@ -524,7 +524,7 @@ def test_geometry_template_and_composition_fail_fast(
     assert caught.value.reason_code == expected_reason
     assert caught.value.frame_index == 0
     assert caught.value.sample_id == "predict:000000"
-    assert caught.value.solver_path == TRAIN_FIXED
+    assert caught.value.solver_path == "sinkhorn"
     assert not target.exists()
 
 

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 import io
 import itertools
@@ -144,6 +144,7 @@ class _Geometry:
     source_index: int
     frame_index: int
     atomic_numbers: tuple[int, ...]
+    positions: tuple[tuple[float, float, float], ...]
     cell: tuple[tuple[float, float, float], ...]
     pbc: tuple[bool, bool, bool]
     exact_template_id: str | None
@@ -155,6 +156,49 @@ class _Geometry:
     def cell_tensor(self) -> torch.Tensor:
         return torch.tensor(self.cell, dtype=torch.float64)
 
+    def positions_tensor(self) -> torch.Tensor:
+        return torch.tensor(self.positions, dtype=torch.float64)
+
+    @property
+    def semantic_digest(self) -> str:
+        cell = self.cell_tensor()
+        positions = self.positions_tensor()
+        fractional = torch.linalg.solve(cell.T, positions.T).T
+        fractional = fractional - torch.floor(fractional)
+        records = sorted(
+            (int(number), *(float(value) for value in row))
+            for number, row in zip(self.atomic_numbers, fractional.tolist())
+        )
+        return _fingerprint(
+            {
+                "atomic_numbers_and_fractional_positions": records,
+                "cell": [list(row) for row in self.cell],
+                "pbc": list(self.pbc),
+            }
+        )
+
+
+@dataclass(frozen=True)
+class _AutomaticReferenceAuditInput:
+    """Non-serialized geometry/runtime snapshot used only by NK qualification."""
+
+    template_id: str
+    context: Any
+    species_alignment_weights: tuple[tuple[float, ...], ...]
+    reference_geometry: _Geometry
+    train_geometries: tuple[_Geometry, ...]
+    validation_geometries: tuple[_Geometry, ...]
+    ideal_k1_geometries: tuple[_Geometry, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "train_geometries", tuple(self.train_geometries))
+        object.__setattr__(
+            self, "validation_geometries", tuple(self.validation_geometries)
+        )
+        object.__setattr__(
+            self, "ideal_k1_geometries", tuple(self.ideal_k1_geometries)
+        )
+
 
 @dataclass(frozen=True)
 class AutomaticReferenceResult:
@@ -165,9 +209,16 @@ class AutomaticReferenceResult:
     resolved_poscar: str
     specification: Any
     certificate: Mapping[str, Any]
+    evaluation_certificate: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "certificate", _freeze(self.certificate))
+        if self.evaluation_certificate is not None:
+            object.__setattr__(
+                self,
+                "evaluation_certificate",
+                _freeze(self.evaluation_certificate),
+            )
 
     @property
     def template_id(self) -> str:
@@ -176,12 +227,21 @@ class AutomaticReferenceResult:
     def to_dict(self) -> dict[str, Any]:
         result = _plain(self.certificate)
         result["poscar"] = self.original_poscar
+        if self.evaluation_certificate is not None:
+            result["evaluation_certificate"] = _plain(
+                self.evaluation_certificate
+            )
         return result
 
     def semantic_dict(self) -> dict[str, Any]:
         """Return path-free content used by reference fingerprints."""
 
-        return _plain(self.certificate)
+        result = _plain(self.certificate)
+        if self.evaluation_certificate is not None:
+            result["evaluation_certificate"] = _plain(
+                self.evaluation_certificate
+            )
+        return result
 
 
 @dataclass(frozen=True)
@@ -192,12 +252,16 @@ class AutomaticReferencePreparation:
     species_vocabulary: tuple[int, ...]
     content_fingerprint: str
     convention_version: str = AUTO_REFERENCE_CONVENTION_VERSION
+    _audit_inputs: tuple[_AutomaticReferenceAuditInput, ...] = field(
+        default=(), repr=False, compare=False
+    )
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "results", tuple(self.results))
         object.__setattr__(self, "train_assignments", tuple(self.train_assignments))
         object.__setattr__(self, "validation_assignments", tuple(self.validation_assignments))
         object.__setattr__(self, "species_vocabulary", tuple(self.species_vocabulary))
+        object.__setattr__(self, "_audit_inputs", tuple(self._audit_inputs))
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -303,6 +367,9 @@ def _geometry(atoms: Any, *, path: Path, split: str, source_index: int, frame_in
         source_index=source_index,
         frame_index=frame_index,
         atomic_numbers=tuple(int(value) for value in atoms.get_atomic_numbers().tolist()),
+        positions=tuple(
+            tuple(float(value) for value in row) for row in atoms.positions.tolist()
+        ),
         cell=tuple(tuple(float(value) for value in row) for row in atoms.cell.array.tolist()),
         pbc=(True, True, True),
         exact_template_id=exact,
@@ -611,6 +678,7 @@ def prepare_automatic_references(
     base: Path,
     read_file: Callable[..., tuple[Path, bytes]],
     specification_factory: Callable[..., Any],
+    evaluation_policy_requested: bool = False,
 ) -> AutomaticReferencePreparation:
     """Generate canonical references from automatic recipe sources."""
 
@@ -750,6 +818,7 @@ def prepare_automatic_references(
     validation_selected = tuple((frame, *assign(frame)) for frame in validation)
     derived = recipe.radii.derived
     results = []
+    audit_inputs = []
     for item in reference_inputs:
         template_id = item["template_id"]
         assigned_train = [entry for entry in train_selected if entry[1] == template_id]
@@ -884,10 +953,17 @@ def prepare_automatic_references(
                 stage="automatic_reference.build", source_path=str(item["path"]),
                 template_id=template_id, original_error=error,
             ) from error
+        policy = None
+        if evaluation_policy_requested:
+            from .automatic_evaluation import (
+                build_automatic_evaluation_policy,
+            )
+
+            policy = build_automatic_evaluation_policy(built.template)
         specification = specification_factory(
             builder=builder,
             phase_specification=phase,
-            evaluation_policy=None,
+            evaluation_policy=policy,
             species_alignment_weights=tuple(
                 tuple(float(value) for value in row)
                 for row in torch.eye(len(species), dtype=torch.float64).tolist()
@@ -970,9 +1046,20 @@ def prepare_automatic_references(
             },
             "vacancies": {"train": train_vacancy, "validation": validation_vacancy},
             "phase": phase_certificate,
-            "evaluation_policy": None,
+            "evaluation_policy": (
+                None
+                if policy is None
+                else {
+                    "audit_profile": "automatic_evaluation_policy_audit_v1",
+                    "status": "pending_numerical_audit",
+                    "content_fingerprint": policy.content_fingerprint,
+                    "convention_version": policy.convention_version,
+                }
+            ),
             "future_configuration_guarantee": False,
         }
+        if evaluation_policy_requested:
+            certificate["radius_fingerprint"] = recipe.radii.content_fingerprint
         certificate["certificate_sha256"] = _fingerprint(certificate)
         results.append(
             AutomaticReferenceResult(
@@ -983,6 +1070,111 @@ def prepare_automatic_references(
                 certificate=certificate,
             )
         )
+        if evaluation_policy_requested:
+            from refsite_mlip.models import TemplateExecutionContext
+
+            context = TemplateExecutionContext.from_reference_template(
+                built.template, avg_num_neighbors=builder.avg_num_neighbors
+            )
+            reference_numbers = tuple(
+                species[int(value)]
+                for value in context.topology.site_types.tolist()
+            )
+            reference_positions = (
+                context.topology.reference_fractional
+                @ context.topology.reference_cell
+            )
+            reference_geometry = _Geometry(
+                sample_id=f"ideal_pristine:{template_id}",
+                split="reference",
+                source_index=item["source_index"],
+                frame_index=0,
+                atomic_numbers=reference_numbers,
+                positions=tuple(
+                    tuple(float(value) for value in row)
+                    for row in reference_positions.tolist()
+                ),
+                cell=tuple(
+                    tuple(float(value) for value in row)
+                    for row in context.topology.reference_cell.tolist()
+                ),
+                pbc=(True, True, True),
+                exact_template_id=template_id,
+            )
+            observed_deficit_species = {
+                species[index]
+                for entry in assigned_train + assigned_validation
+                for index, deficit in enumerate(
+                    tuple(
+                        reference - actual
+                        for reference, actual in zip(
+                            item["reference_composition"],
+                            _composition(entry[0].atomic_numbers, species),
+                        )
+                    )
+                )
+                if deficit > 0
+            }
+            ideal_k1 = []
+            permutations = context.stabilizer.permutations.detach().cpu()
+            remaining_by_species = {
+                value: {
+                    index
+                    for index, number in enumerate(reference_numbers)
+                    if number == value
+                }
+                for value in observed_deficit_species
+            }
+            for species_value in sorted(remaining_by_species):
+                remaining = remaining_by_species[species_value]
+                while remaining:
+                    representative = min(remaining)
+                    orbit = {int(row[representative]) for row in permutations}
+                    remaining.difference_update(orbit)
+                    kept = [
+                        index
+                        for index in range(len(reference_numbers))
+                        if index != representative
+                    ]
+                    ideal_k1.append(
+                        _Geometry(
+                            sample_id=(
+                                f"ideal_k1:{template_id}:z{species_value}:"
+                                f"site{representative}"
+                            ),
+                            split="ideal_k1",
+                            source_index=item["source_index"],
+                            frame_index=representative,
+                            atomic_numbers=tuple(
+                                reference_numbers[index] for index in kept
+                            ),
+                            positions=tuple(
+                                tuple(float(value) for value in reference_positions[index].tolist())
+                                for index in kept
+                            ),
+                            cell=reference_geometry.cell,
+                            pbc=(True, True, True),
+                            exact_template_id=template_id,
+                        )
+                    )
+            audit_inputs.append(
+                _AutomaticReferenceAuditInput(
+                    template_id=template_id,
+                    context=context,
+                    species_alignment_weights=tuple(
+                        tuple(float(value) for value in row)
+                        for row in torch.eye(
+                            len(species), dtype=torch.float64
+                        ).tolist()
+                    ),
+                    reference_geometry=reference_geometry,
+                    train_geometries=tuple(entry[0] for entry in assigned_train),
+                    validation_geometries=tuple(
+                        entry[0] for entry in assigned_validation
+                    ),
+                    ideal_k1_geometries=tuple(ideal_k1),
+                )
+            )
     results.sort(key=lambda result: result.template_id)
     semantic = {
         "convention_version": AUTO_REFERENCE_CONVENTION_VERSION,
@@ -998,6 +1190,7 @@ def prepare_automatic_references(
         validation_assignments=tuple((entry[0].sample_id, entry[1]) for entry in validation_selected),
         species_vocabulary=species,
         content_fingerprint=_fingerprint(semantic),
+        _audit_inputs=tuple(sorted(audit_inputs, key=lambda value: value.template_id)),
     )
 
 

@@ -4,7 +4,10 @@ import pytest
 import torch
 
 from refsite_mlip.data import ReferenceTemplate
-from refsite_mlip.models import EvaluationPolicy
+from refsite_mlip.models import (
+    PRODUCTION_EVALUATION_POLICY_ACCEPTANCE_V1,
+    EvaluationPolicy,
+)
 from refsite_mlip.phase.types import EvaluationPhaseError, TypedStabilizer
 from refsite_mlip.transport import EVAL_ADAPTIVE, TRAIN_FIXED
 
@@ -12,6 +15,7 @@ from test_runtime_template_context import make_context, make_model_and_template,
 
 
 def _policy(template, **changes):
+    acceptance = PRODUCTION_EVALUATION_POLICY_ACCEPTANCE_V1
     values = dict(
         template_id=template.template_id,
         template_fingerprint=template.fingerprint,
@@ -19,16 +23,24 @@ def _policy(template, **changes):
             [[0.0, 0.0, 0.0], [0.5, 0.0, 0.0], [0.0, 0.5, 0.0]],
             dtype=torch.float64,
         ),
-        phase_step_schedule=(0.7, 0.8, 0.9, 1.0),
-        phase_damping_schedule=(2.0, 1.0, 0.5, 0.2),
-        minimum_objective_gap_absolute=1.0e-2,
-        minimum_cross_amplitude_absolute=1.0e-12,
-        minimum_atomic_amplitude_absolute=1.0e-12,
-        minimum_reference_amplitude_absolute=1.0e-12,
-        minimum_curvature=1.0e-2,
-        maximum_condition=1.0e8,
-        maximum_gradient_norm=2.0e-4,
-        equivalence_tolerance=1.0e-8,
+        phase_step_schedule=acceptance.phase_step_schedule,
+        phase_damping_schedule=acceptance.phase_damping_schedule,
+        minimum_objective_gap_absolute=(
+            acceptance.minimum_objective_gap_absolute
+        ),
+        minimum_cross_amplitude_absolute=(
+            acceptance.minimum_cross_amplitude_absolute
+        ),
+        minimum_atomic_amplitude_absolute=(
+            acceptance.minimum_atomic_amplitude_absolute
+        ),
+        minimum_reference_amplitude_absolute=(
+            acceptance.minimum_reference_amplitude_absolute
+        ),
+        minimum_curvature=acceptance.minimum_curvature,
+        maximum_condition=acceptance.maximum_condition,
+        maximum_gradient_norm=acceptance.maximum_gradient_norm,
+        equivalence_tolerance=acceptance.equivalence_tolerance,
     )
     values.update(changes)
     return EvaluationPolicy(**values)
@@ -52,6 +64,9 @@ def test_evaluation_policy_snapshot_serialization_and_fingerprint(typed_crystal)
     _, template = make_model_and_template(typed_crystal)
     source = torch.tensor([[0.0, 0.0, 0.0], [0.5, 0.0, 0.0]], dtype=torch.float64)
     policy = _policy(template, candidate_offsets=source)
+    assert policy.content_fingerprint == (
+        "7119b75294bd2c7a0626128d704be4b55ef23fb065fb93208bca3beae2929cb2"
+    )
     snapshot = policy.candidate_offsets.clone()
     source[0, 0] = 3.0
     assert torch.equal(policy.candidate_offsets, snapshot)

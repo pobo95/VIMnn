@@ -75,6 +75,15 @@ from .automatic_reference import (
     prepare_automatic_references,
     resolve_auto_maximum_strain,
 )
+from .automatic_evaluation import (
+    AUTOMATIC_EVALUATION_CERTIFICATE_SCHEMA_VERSION,
+    AUTOMATIC_EVALUATION_POLICY_AUDIT_VERSION,
+    AUTOMATIC_EVALUATION_SCOPE,
+    AutomaticEvaluationPolicyAuditError,
+    automatic_evaluation_policy_profile,
+    build_automatic_evaluation_policy,
+    qualify_automatic_evaluation_policies,
+)
 
 __all__ = [
     "INTERACTION_RADIUS_CONFIG_SCHEMA_VERSION",
@@ -88,6 +97,10 @@ __all__ = [
     "AUTO_PHASE_SEARCH_VERSION",
     "AUTO_REFERENCE_CONVENTION_VERSION",
     "AUTO_STRAIN_POLICY_VERSION",
+    "AUTOMATIC_EVALUATION_CERTIFICATE_SCHEMA_VERSION",
+    "AUTOMATIC_EVALUATION_POLICY_AUDIT_VERSION",
+    "AUTOMATIC_EVALUATION_SCOPE",
+    "AutomaticEvaluationPolicyAuditError",
     "AutomaticReferenceError",
     "AutomaticReferencePreparation",
     "AutomaticReferenceResult",
@@ -125,6 +138,8 @@ __all__ = [
     "TrainingRunConfigError",
     "derive_interaction_radii",
     "apply_training_run_overrides",
+    "automatic_evaluation_policy_profile",
+    "build_automatic_evaluation_policy",
     "compile_training_recipe",
     "is_training_recipe",
     "load_reference_specification",
@@ -134,6 +149,7 @@ __all__ = [
     "resolve_training_run",
     "resolve_training_recipe",
     "prepare_automatic_references",
+    "qualify_automatic_evaluation_policies",
     "resolve_auto_maximum_strain",
     "SYMMETRIC_MODEL_DEFAULTS_VERSION",
     "TRAINING_DEFAULTS_VERSION",

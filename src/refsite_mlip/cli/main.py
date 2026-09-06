@@ -55,6 +55,24 @@ def _terms_argument(value: str) -> tuple[str, ...]:
         raise argparse.ArgumentTypeError(str(error)) from error
 
 
+def _solver_argument(value: str) -> str:
+    from .predict import solver_name, solver_path_from_name
+
+    if value not in (
+        "sinkhorn",
+        "sinkhorn_newton_krylov",
+        "train-fixed",
+        "eval-adaptive",
+    ):
+        raise argparse.ArgumentTypeError(
+            "solver must be sinkhorn or sinkhorn_newton_krylov"
+        )
+    try:
+        return solver_name(solver_path_from_name(value))
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from error
+
+
 def _finite_float(value: str, *, positive: bool) -> float:
     try:
         result = float(value)
@@ -213,8 +231,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     predict.add_argument(
         "--solver",
-        choices=("train-fixed", "eval-adaptive"),
-        default="train-fixed",
+        type=_solver_argument,
+        choices=("sinkhorn", "sinkhorn_newton_krylov"),
+        default="sinkhorn",
     )
     predict.add_argument(
         "--properties",
@@ -278,8 +297,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     evaluate.add_argument(
         "--solver",
-        choices=("train-fixed", "eval-adaptive"),
-        default="train-fixed",
+        type=_solver_argument,
+        choices=("sinkhorn", "sinkhorn_newton_krylov"),
+        default="sinkhorn",
     )
     evaluate.add_argument(
         "--terms",

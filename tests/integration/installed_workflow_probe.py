@@ -732,7 +732,7 @@ def _run(arguments: argparse.Namespace) -> dict[str, Any]:
             "predictor_ase_max_abs_error": parity[
                 "adaptive_predictor_ase_max"
             ],
-            "solver": "eval-adaptive",
+            "solver": "sinkhorn_newton_krylov",
         },
         "continuous_vs_resumed": {
             "exact": True,

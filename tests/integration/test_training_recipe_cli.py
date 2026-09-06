@@ -826,7 +826,7 @@ def test_automatic_reference_reload_failure_records_no_update_status(
     ]
 
 
-def test_automatic_reference_rejects_ambiguity_unused_and_newton_policy(tmp_path):
+def test_automatic_reference_rejects_ambiguity_unused_source_and_unstable_newton_policy(tmp_path):
     reference = _atoms(1)
     shifted = reference.copy()
     shifted.positions[0, 0] += 0.01
@@ -859,8 +859,10 @@ def test_automatic_reference_rejects_ambiguity_unused_and_newton_policy(tmp_path
     payload["reference"]["sources"] = [payload["reference"]["sources"][0]]
     payload["ot_solver"]["inference"] = "sinkhorn_newton_krylov"
     recipe.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
-    with pytest.raises(Exception, match="AUTOMATIC_EVALUATION_POLICY_NOT_AVAILABLE"):
+    with pytest.raises(Exception, match="AUTOMATIC_EVALUATION_POLICY_AUDIT_FAILED") as caught:
         resolve_training_recipe(recipe)
+    assert "SUPPORT_BRANCH_UNSTABLE" in str(caught.value)
+    assert not (tmp_path / "runs" / "automatic-run").exists()
 
 
 def test_automatic_reference_is_geometry_only_path_independent_and_rng_free(tmp_path):

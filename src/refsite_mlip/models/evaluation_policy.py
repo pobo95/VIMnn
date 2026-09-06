@@ -19,6 +19,56 @@ from refsite_mlip.transport import EVAL_ADAPTIVE
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
+@dataclass(frozen=True)
+class EvaluationPolicyAcceptanceProfile:
+    """Versioned production phase-branch acceptance thresholds.
+
+    This metadata is deliberately separate from :class:`EvaluationPolicy` so
+    existing explicit policy serialization and fingerprints remain unchanged.
+    """
+
+    convention_version: str
+    minimum_objective_gap_absolute: float
+    minimum_atomic_amplitude_absolute: float
+    minimum_reference_amplitude_absolute: float
+    minimum_cross_amplitude_absolute: float
+    minimum_curvature: float
+    maximum_condition: float
+    maximum_gradient_norm: float
+    equivalence_tolerance: float
+    phase_step_schedule: tuple[float, ...]
+    phase_damping_schedule: tuple[float, ...]
+
+    @property
+    def minimum_amplitude_absolute(self) -> float:
+        """Compatibility alias while all three production minima are equal."""
+
+        minima = {
+            self.minimum_atomic_amplitude_absolute,
+            self.minimum_reference_amplitude_absolute,
+            self.minimum_cross_amplitude_absolute,
+        }
+        if len(minima) != 1:
+            raise ValueError("production amplitude minima are not uniform")
+        return next(iter(minima))
+
+
+# Source of truth established by the 9D production evaluation certificate.
+PRODUCTION_EVALUATION_POLICY_ACCEPTANCE_V1 = EvaluationPolicyAcceptanceProfile(
+    convention_version="production_evaluation_policy_acceptance_v1",
+    minimum_objective_gap_absolute=1.0e-2,
+    minimum_atomic_amplitude_absolute=1.0e-12,
+    minimum_reference_amplitude_absolute=1.0e-12,
+    minimum_cross_amplitude_absolute=1.0e-12,
+    minimum_curvature=1.0e-2,
+    maximum_condition=1.0e8,
+    maximum_gradient_norm=2.0e-4,
+    equivalence_tolerance=1.0e-8,
+    phase_step_schedule=(0.7, 0.8, 0.9, 1.0),
+    phase_damping_schedule=(2.0, 1.0, 0.5, 0.2),
+)
+
+
 def _positive(value: Real, name: str, *, greater_than_one: bool = False) -> float:
     if isinstance(value, bool) or not isinstance(value, Real):
         raise TypeError(f"{name} must be a finite positive real")
