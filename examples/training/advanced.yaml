@@ -1,0 +1,98 @@
+# Advanced reference-site MLIP training recipe.
+# All paths are resolved relative to this YAML file.
+# Required: this is the recipe file-format version, not a model version.
+schema_version: refsite_training_recipe_v1
+
+# Required: creates ./runs/advanced-model when training starts; create ./runs first.
+name: advanced-model
+
+model:
+  # Optional; symmetric is the default. Use sequential only for legacy compatibility.
+  correlation_method: symmetric
+  # Number of residual interaction blocks.
+  num_interactions: 2
+  # Maximum cumulative order: 3 includes orders 1, 2, and 3 exactly once.
+  correlation: 3
+  # No general hard upper bound; choose this for available memory and compute.
+  hidden_channels: 64
+  # Maximum angular degree; supported values are 0, 1, and 2.
+  max_L: 2
+  # Controls initial parameters, independently of runtime.seed below.
+  initialization_seed: 123
+  # hidden_irreps is an alternative to hidden_channels + max_L; do not specify both.
+
+reference:
+  sources:
+    # These keys are user-chosen authoring aliases. Runtime template identity is
+    # generated from POSCAR content, not from the alias, filename, or path.
+    POSCAR_222:
+      poscar: ./references/POSCAR_222
+      # Recommended default. A manual value is a validated domain certificate,
+      # not a performance knob to make arbitrarily large.
+      maximum_strain: auto
+
+    POSCAR_333:
+      poscar: ./references/POSCAR_333
+      maximum_strain: auto
+
+data:
+  train:
+    # Several pristine/vacancy files may share one reference alias. Each frame's
+    # vacancy count K=M-N is calculated independently.
+    - file: ./data/train_pristine_222.xyz
+      reference: POSCAR_222
+    - file: ./data/train_vacancy_222.xyz
+      reference: POSCAR_222
+    - file: ./data/train_333.xyz
+      reference: POSCAR_333
+
+  validation:
+    - file: ./data/validation_222.xyz
+      reference: POSCAR_222
+    - file: ./data/validation_333.xyz
+      reference: POSCAR_333
+
+  # Every declared reference must be used. Each file is fully validated against
+  # its declared POSCAR; an incompatible binding never falls back to another one.
+  # Different supercell sizes therefore require their corresponding POSCAR.
+
+ot_solver:
+  # Training always uses differentiable fixed-iteration Sinkhorn.
+  training: sinkhorn
+  # Inference-only Newton-Krylov requires automatic dataset-local qualification.
+  # Re-qualify after changing final train/validation geometry. Failure or fallback
+  # is never silently changed to Sinkhorn and does not certify arbitrary MD/NPT.
+  # Choose sinkhorn here instead when stable fixed-iteration inference is preferred.
+  inference: sinkhorn_newton_krylov
+
+loss:
+  # Relative loss weights, not physical units. Zero disables that supervision.
+  energy_weight: 1.0
+  forces_weight: 100.0
+  # A positive value requires valid stress labels in the extended-XYZ files.
+  stress_weight: 10.0
+
+radii:
+  # Angstrom. OT atom-to-reference support cutoff.
+  r_ot: 4.0
+  # Angstrom. Message-passing graph cutoff. Switch/skin radii are derived.
+  r_mp: 3.0
+
+# Recommended for production. Train compositions must have full rank so each
+# species baseline is identifiable; there is no silent rank-deficiency fallback.
+baseline: fit_full_rank
+
+training:
+  # Training and validation batch sizes are independent positive integers.
+  batch_size: 5
+  validation_batch_size: 5
+  max_epochs: 500
+  # Current public optimizer knob; training uses AdamW with zero weight decay.
+  learning_rate: 1.0e-3
+
+runtime:
+  # Use cuda only on a CUDA-capable system; cpu remains supported.
+  device: cuda
+  dtype: float32
+  # Controls training RNG/data ordering, independently of initialization_seed.
+  seed: 123

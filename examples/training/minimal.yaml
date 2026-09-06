@@ -1,0 +1,44 @@
+# Minimal reference-site MLIP training recipe.
+# All paths are resolved relative to this YAML file.
+# Required: this is the recipe file-format version, not a model version.
+schema_version: refsite_training_recipe_v1
+
+# Required: creates ./runs/my-first-run when training starts; create ./runs first.
+name: my-first-run
+
+# Optional model settings. Defaults: symmetric correlation, 2 interaction
+# blocks, cumulative correlation order 3, 8 hidden channels, and max_L=2.
+model: {}
+
+# Required: a periodic POSCAR. The reference and maximum strain are prepared
+# automatically; no separate reference file needs to be authored.
+reference: ./references/POSCAR
+
+# Required: labeled extended-XYZ training and validation files.
+data:
+  train: ./data/train.xyz
+  validation: ./data/validation.xyz
+
+ot_solver:
+  # Training always uses differentiable fixed-iteration Sinkhorn.
+  training: sinkhorn
+  # Sinkhorn is the hardware-independent inference default.
+  inference: sinkhorn
+
+# Optional loss settings. Defaults: energy=1, forces=100, stress=0.
+loss: {}
+
+# Recommended for production: the train composition matrix must be full-rank
+# so every species baseline is identifiable. Use zero only for plumbing smokes;
+# minimum_norm is an explicit opt-in when accepting rank deficiency.
+baseline: fit_full_rank
+
+training:
+  # Required: maximum number of epochs. Other defaults include batch size 4,
+  # validation batch size 4, and learning rate 1e-3.
+  max_epochs: 100
+
+runtime:
+  # Required training RNG seed. Defaults are device=cpu and dtype=float64;
+  # use the advanced example to select a GPU and float32 explicitly.
+  seed: 123
