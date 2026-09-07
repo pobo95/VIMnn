@@ -1090,6 +1090,7 @@ class RecipeTrainingConfig:
     batch_size: int = 4
     validation_batch_size: int | None = None
     learning_rate: float = 1.0e-3
+    early_stopping_patience: int | None = field(default=None, kw_only=True)
     _provided_fields: tuple[str, ...] = field(default=(), repr=False, compare=False)
 
     def __post_init__(self) -> None:
@@ -1100,21 +1101,50 @@ class RecipeTrainingConfig:
         )
         object.__setattr__(self, "validation_batch_size", validation)
         object.__setattr__(self, "learning_rate", _positive_real(self.learning_rate, field_name="training.learning_rate"))
+        patience = self.early_stopping_patience
+        if patience is not None:
+            if isinstance(patience, bool) or not isinstance(patience, Integral):
+                raise _error(
+                    "INVALID_RECIPE_INTEGER",
+                    "value must be an integer and bool is forbidden",
+                    stage="recipe.validation",
+                    field="training.early_stopping_patience",
+                    actual=patience,
+                )
+            patience = int(patience)
+            if patience < 0:
+                raise _error(
+                    "INVALID_RECIPE_INTEGER",
+                    "value must be nonnegative",
+                    stage="recipe.validation",
+                    field="training.early_stopping_patience",
+                    actual=patience,
+                )
+        object.__setattr__(self, "early_stopping_patience", patience)
         object.__setattr__(self, "_provided_fields", tuple(sorted(self._provided_fields)))
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        result = {
             "batch_size": self.batch_size,
             "validation_batch_size": self.validation_batch_size,
             "max_epochs": self.max_epochs,
             "learning_rate": self.learning_rate,
         }
+        if self.early_stopping_patience is not None:
+            result["early_stopping_patience"] = self.early_stopping_patience
+        return result
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "RecipeTrainingConfig":
         payload = _strict_mapping(
             value,
-            allowed=frozenset({"batch_size", "validation_batch_size", "max_epochs", "learning_rate"}),
+            allowed=frozenset({
+                "batch_size",
+                "validation_batch_size",
+                "max_epochs",
+                "learning_rate",
+                "early_stopping_patience",
+            }),
             required=frozenset({"max_epochs"}),
             field_name="training",
         )
@@ -1978,7 +2008,11 @@ def _compile_training_recipe_impl(
         train_step=TrainStepConfig(solver_path=TRAIN_FIXED),
         validation_step=ValidationStepConfig(solver_path=TRAIN_FIXED),
         scheduler=SchedulerConfig(kind="none", monitor="total_loss", mode="min"),
-        selection=ModelSelectionConfig(monitor="total_loss", mode="min"),
+        selection=ModelSelectionConfig(
+            monitor="total_loss",
+            mode="min",
+            early_stopping_patience=recipe.training.early_stopping_patience,
+        ),
         fit=FitConfig(max_epochs=recipe.training.max_epochs),
         checkpointed_fit=CheckpointedFitConfig(save_every_epoch=True, require_empty_manager=True),
         output_directory=(f"runs/{recipe.name}" if recipe.name is not None else str(recipe.output_directory)),
@@ -2013,6 +2047,8 @@ def _compile_training_recipe_impl(
         "ot_solver.training": "user",
         "ot_solver.inference": "user",
     }
+    if recipe.training.early_stopping_patience is not None:
+        origins["selection.early_stopping_patience"] = "user"
     if recipe.model.correlation_method == SYMMETRIC_CORRELATION_METHOD:
         origins.update(
             {

@@ -511,6 +511,45 @@ def test_training_and_validation_batch_sizes_map_and_override_independently():
             TrainingRecipeConfig.from_dict(payload)
 
 
+def test_recipe_early_stopping_patience_maps_to_validation_selection():
+    legacy_payload = _payload()
+    legacy_recipe = TrainingRecipeConfig.from_dict(legacy_payload)
+    legacy_resolved = compile_training_recipe(legacy_recipe, (_spec(),))
+    assert legacy_recipe.training.early_stopping_patience is None
+    assert "early_stopping_patience" not in legacy_recipe.to_dict()["training"]
+    assert legacy_resolved.config.selection.early_stopping_patience is None
+    assert "selection.early_stopping_patience" not in dict(
+        legacy_resolved.manifest.field_origins
+    )
+
+    payload = _payload()
+    payload["training"]["early_stopping_patience"] = 15
+    recipe = TrainingRecipeConfig.from_dict(payload)
+    resolved = compile_training_recipe(recipe, (_spec(),))
+    assert recipe.training.early_stopping_patience == 15
+    assert recipe.to_dict()["training"]["early_stopping_patience"] == 15
+    assert resolved.config.selection.monitor == "total_loss"
+    assert resolved.config.selection.mode == "min"
+    assert resolved.config.selection.min_delta == 0.0
+    assert resolved.config.selection.early_stopping_patience == 15
+    assert dict(resolved.manifest.field_origins)[
+        "selection.early_stopping_patience"
+    ] == "user"
+    assert resolved.config.config_fingerprint != (
+        legacy_resolved.config.config_fingerprint
+    )
+
+
+@pytest.mark.parametrize("invalid", (True, -1, 1.5, "15"))
+def test_recipe_early_stopping_patience_rejects_invalid_values(invalid):
+    payload = _payload()
+    payload["training"]["early_stopping_patience"] = invalid
+    with pytest.raises(TrainingRecipeError) as caught:
+        TrainingRecipeConfig.from_dict(payload)
+    assert caught.value.reason_code == "INVALID_RECIPE_INTEGER"
+    assert caught.value.field == "training.early_stopping_patience"
+
+
 @pytest.mark.parametrize("maximum_l", (0, 1, 2))
 def test_supported_max_l_maps_to_feature_higher_body_and_natural_irreps(maximum_l):
     payload = _payload()
