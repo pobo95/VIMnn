@@ -300,6 +300,33 @@ def build_probability_multipoles(
             f"tolerances={tolerances!r}"
         )
 
+    return _assemble_dense_probability_multipoles(
+        P,
+        q,
+        displacements,
+        config,
+        site_types,
+        probabilities,
+        indicator,
+    )
+
+
+def _assemble_dense_probability_multipoles(
+    P: torch.Tensor,
+    q: torch.Tensor,
+    displacements: torch.Tensor,
+    config: ProbabilityMultipoleConfig,
+    site_types: Optional[torch.Tensor],
+    probabilities: torch.Tensor,
+    indicator: torch.Tensor,
+) -> ProbabilityMultipoleResult:
+    """Assemble the production dense feature arithmetic after validation.
+
+    This split does not alter the public builder's checks or result.  The
+    automatic evaluation audit reuses it only after independently enforcing
+    its versioned production-NK residual and finite/probability contracts.
+    """
+
     y = displacements / displacements.new_tensor(config.ell_feature)
     xi = torch.sum(y * y, dim=-1)
     radial = compact_radial_basis(
@@ -458,6 +485,32 @@ def build_sparse_probability_multipoles(
             f"atom_column_error={float(atom_error.detach().cpu()):.9e}, "
             f"tolerances={tolerances!r}"
         )
+
+    return _assemble_sparse_probability_multipoles(
+        edge_plan,
+        q,
+        edges,
+        config,
+        site_types,
+        indicator,
+        edge_indicator,
+        probabilities,
+        tolerances,
+    )
+
+
+def _assemble_sparse_probability_multipoles(
+    edge_plan: torch.Tensor,
+    q: torch.Tensor,
+    edges: "CompactTransportEdges",
+    config: ProbabilityMultipoleConfig,
+    site_types: Optional[torch.Tensor],
+    indicator: torch.Tensor,
+    edge_indicator: torch.Tensor,
+    probabilities: torch.Tensor,
+    tolerances: dict[str, float],
+) -> ProbabilityMultipoleResult:
+    """Assemble the production sparse feature arithmetic after validation."""
 
     y = edges.displacements / edges.displacements.new_tensor(config.ell_feature)
     xi = torch.sum(y * y, dim=-1)

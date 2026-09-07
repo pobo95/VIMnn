@@ -9,6 +9,8 @@ import torch
 from refsite_mlip.config.automatic_evaluation import (
     _candidate_coverage,
     _compare_phase_candidate_sets,
+    _float32_dense_fixed_sinkhorn_diagnostic,
+    _frozen_float64_dense_oracle,
     automatic_evaluation_policy_profile,
     build_automatic_evaluation_policy,
 )
@@ -23,6 +25,9 @@ from refsite_mlip.phase.evaluation import (
 )
 from refsite_mlip.phase.modes import validate_runtime_amplitudes
 from refsite_mlip.phase.types import EvaluationPhaseError, TypedStabilizer
+from refsite_mlip.transport.hybrid import solve_hybrid_eval
+from refsite_mlip.transport.problem import build_ot_problem
+from refsite_mlip.transport.result import EvalOTConfig
 
 
 def _trivial_stabilizer() -> TypedStabilizer:
@@ -85,6 +90,18 @@ def test_automatic_profile_cannot_weaken_production_phase_acceptance():
     )
     assert profile["max_witness_geometries"] == 256
     assert "audit_budget" not in profile
+    assert profile["oracle_problem_float32"] == (
+        "CPU float64 promotion of the frozen float32 OT problem"
+    )
+    assert profile["oracle_residual_tolerance"] == 1.0e-12
+    assert profile["fixed_sinkhorn_float32_residual_normative"] is False
+    legacy = automatic_evaluation_policy_profile(
+        audit_version="automatic_evaluation_policy_audit_v1"
+    )
+    assert legacy["oracle_residual_target_float32"] == (
+        2.0 * torch.finfo(torch.float32).eps
+    )
+    assert "oracle_problem_float32" not in legacy
 
 
 def test_refined_basin_envelope_is_audit_only_and_certificate_visible():
@@ -95,6 +112,48 @@ def test_refined_basin_envelope_is_audit_only_and_certificate_visible():
     assert profile["refined_basin_equivalence_maximum"] > (
         production.equivalence_tolerance
     )
+
+
+def test_float32_fixed_sinkhorn_cycle_is_not_the_qualification_oracle():
+    cost = torch.tensor(
+        [
+            [2.2385544776916504, 2.2363696098327637, 0.3658273220062256],
+            [0.840012788772583, 0.0287783145904541, 0.15584754943847656],
+            [3.971578359603882, 3.6524524688720703, 2.474316120147705],
+            [3.897554636001587, 1.275648593902588, 0.8593130111694336],
+        ],
+        dtype=torch.float32,
+    )
+    problem = build_ot_problem(cost, 0.2)
+    _, _, fixed = _float32_dense_fixed_sinkhorn_diagnostic(problem)
+    assert fixed["first_passing_iteration"] is None
+    assert max(fixed["terminal_residuals"].values()) > (
+        2.0 * torch.finfo(torch.float32).eps
+    )
+    assert fixed["normative"] is False
+
+    _, oracle, residuals = _frozen_float64_dense_oracle(problem)
+    assert max(residuals.values()) <= 1.0e-12
+    runtime = solve_hybrid_eval(
+        problem,
+        EvalOTConfig(
+            sinkhorn_iterations=16,
+            max_newton_iterations=20,
+            convergence_tolerance=1.0e-6,
+            pcg_max_iterations=256,
+            pcg_absolute_tolerance=1.0e-12,
+            pcg_relative_tolerance=1.0e-10,
+            gauge_rho=1.0,
+            armijo_coefficient=1.0e-4,
+            line_search_reduction=0.5,
+            max_line_search_reductions=12,
+            fallback_sinkhorn_iterations=1024,
+        ),
+    )
+    assert runtime.fallback_used is False
+    assert max(float(runtime.row_residual), float(runtime.column_residual)) <= 1.0e-6
+    assert float((runtime.P.double() - oracle.P).abs().max()) <= 1.0e-5
+    assert float((runtime.q.double() - oracle.q).abs().max()) <= 1.0e-5
 
 
 def test_float32_candidate_grouping_uses_production_equivalence_tolerance():

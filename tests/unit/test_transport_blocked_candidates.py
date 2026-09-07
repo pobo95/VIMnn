@@ -6,6 +6,8 @@ import pytest
 import torch
 
 from refsite_mlip.transport import (
+    EVAL_ADAPTIVE,
+    TRAIN_FIXED,
     EvalOTConfig,
     TrainSinkhornConfig,
     TransportSupportConfig,
@@ -14,6 +16,8 @@ from refsite_mlip.transport import (
     build_compact_transport_edges,
     build_periodic_compact_transport_edges,
     compact_c2_switch,
+    materialize_dense_plan,
+    solve_atom_vacancy_ot,
     solve_sparse_hybrid_eval,
     solve_sparse_sinkhorn_train_fixed,
     validate_compact_support_edges,
@@ -250,6 +254,158 @@ def test_blocked_fixed_and_adaptive_match_dense_candidate_execution():
     for name in ("edge_plan", "q", "f", "g", "row_residual", "column_residual"):
         assert torch.equal(getattr(dense_eval, name), getattr(blocked_eval, name))
     assert dense_eval.fallback_used == blocked_eval.fallback_used
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_roundoff_transition_geometry_matches_dense_edge_and_blocked_backends(
+    dtype, device
+):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA unavailable")
+    target = 4.500205993652344
+    positions = torch.tensor(
+        [[0.2, 0.1, 0.0], [target, 0.0, 0.0]],
+        dtype=dtype,
+        device=device,
+    )
+    references = torch.tensor(
+        [[0.0, 0.0, 0.0], [4.8, 0.2, 0.0], [2.25, 0.2, 0.0]],
+        dtype=dtype,
+        device=device,
+    )
+    cell = torch.eye(3, dtype=dtype, device=device) * 20.0
+    common = dict(
+        kind="compact_c2", cutoff=5.0, switch_width=0.5, candidate_skin=0.2
+    )
+    dense_config = TransportSupportConfig(**common)
+    displacements = atom_site_displacements(
+        positions, references, cell, (True, True, True)
+    )
+    distances = torch.linalg.vector_norm(displacements, dim=-1)
+    assert bool(torch.any(distances == distances.new_tensor(target)))
+    switch = compact_c2_switch(distances, dense_config)
+    assert torch.isfinite(switch).all()
+    assert 0.0 <= float(switch.min()) <= float(switch.max()) <= 1.0
+    cost = distances.square() / distances.new_tensor(2.0 * 1.5**2)
+    fixed_config = TrainSinkhornConfig(256)
+    dense_fixed = solve_atom_vacancy_ot(
+        cost,
+        0.5,
+        TRAIN_FIXED,
+        "sinkhorn",
+        fixed_config,
+        support_config=dense_config,
+        atom_distances=distances,
+    )
+    evaluation_config = EvalOTConfig(
+        sinkhorn_iterations=8,
+        max_newton_iterations=20,
+        convergence_tolerance=1.0e-6 if dtype == torch.float32 else 1.0e-12,
+        fallback_sinkhorn_iterations=4096,
+    )
+    dense_evaluation = solve_atom_vacancy_ot(
+        cost,
+        0.5,
+        EVAL_ADAPTIVE,
+        "hybrid",
+        evaluation_config,
+        support_config=dense_config,
+        atom_distances=distances,
+    )
+    assert dense_evaluation.converged and not dense_evaluation.fallback_used
+
+    edge_results = []
+    for candidate_backend in ("dense", "blocked"):
+        edge_config = TransportSupportConfig(
+            **common,
+            backend="edge_list",
+            candidate_backend=candidate_backend,
+            site_block_size=1,
+            atom_block_size=1,
+        )
+        edges = build_periodic_compact_transport_edges(
+            positions,
+            references,
+            cell,
+            (True, True, True),
+            epsilon_ot=0.5,
+            ell_ot=1.5,
+            config=edge_config,
+        )
+        assert torch.isfinite(edges.switch).all()
+        assert 0.0 <= float(edges.switch.min()) <= float(edges.switch.max()) <= 1.0
+        fixed = solve_sparse_sinkhorn_train_fixed(edges, fixed_config)
+        evaluation = solve_sparse_hybrid_eval(edges, evaluation_config)
+        assert not fixed.dense_plan_materialized
+        assert evaluation.converged and not evaluation.fallback_used
+        assert not evaluation.dense_plan_materialized
+        edge_results.append((edges, fixed, evaluation))
+
+    dense_edges, dense_edge_fixed, dense_edge_evaluation = edge_results[0]
+    blocked_edges, blocked_fixed, blocked_evaluation = edge_results[1]
+    assert torch.equal(dense_edges.site_index, blocked_edges.site_index)
+    assert torch.equal(dense_edges.atom_index, blocked_edges.atom_index)
+    assert (
+        dense_edges.support_diagnostics.candidate_fingerprint
+        == blocked_edges.support_diagnostics.candidate_fingerprint
+    )
+    assert torch.equal(dense_edges.switch, blocked_edges.switch)
+    assert torch.equal(dense_edge_fixed.edge_plan, blocked_fixed.edge_plan)
+    assert torch.equal(dense_edge_fixed.q, blocked_fixed.q)
+    assert torch.equal(dense_edge_evaluation.edge_plan, blocked_evaluation.edge_plan)
+    assert torch.equal(dense_edge_evaluation.q, blocked_evaluation.q)
+    atol = 3.0e-6 if dtype == torch.float32 else 2.0e-12
+    torch.testing.assert_close(
+        materialize_dense_plan(dense_edge_fixed).plan,
+        dense_fixed.P,
+        atol=atol,
+        rtol=atol,
+    )
+    torch.testing.assert_close(dense_edge_fixed.q, dense_fixed.q, atol=atol, rtol=atol)
+    torch.testing.assert_close(
+        materialize_dense_plan(dense_edge_evaluation).plan,
+        dense_evaluation.P,
+        atol=atol,
+        rtol=atol,
+    )
+    torch.testing.assert_close(
+        dense_edge_evaluation.q, dense_evaluation.q, atol=atol, rtol=atol
+    )
+    assert not dense_edge_fixed.dense_plan_materialized
+    assert not dense_edge_evaluation.dense_plan_materialized
+
+    live_positions = positions.detach().clone().requires_grad_(True)
+    live_edges = build_periodic_compact_transport_edges(
+        live_positions,
+        references,
+        cell,
+        (True, True, True),
+        epsilon_ot=0.5,
+        ell_ot=1.5,
+        config=TransportSupportConfig(
+            **common,
+            backend="edge_list",
+            candidate_backend="blocked",
+            site_block_size=1,
+            atom_block_size=1,
+        ),
+    )
+    live_result = solve_sparse_sinkhorn_train_fixed(live_edges, fixed_config)
+    weights = torch.linspace(
+        -0.2,
+        0.3,
+        live_result.edge_plan.numel(),
+        dtype=dtype,
+        device=device,
+    )
+    observable = (
+        (live_result.edge_plan * weights).sum()
+        + 0.17 * live_result.q.square().sum()
+    )
+    first = torch.autograd.grad(observable, live_positions, create_graph=True)[0]
+    second = torch.autograd.grad(first.square().sum(), live_positions)[0]
+    assert torch.isfinite(first).all() and torch.isfinite(second).all()
 
 
 def _fixed_observable(positions, cell, *, adaptive=False):

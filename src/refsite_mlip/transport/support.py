@@ -273,7 +273,21 @@ def compact_c2_switch(
     u = (distances - r_on) / (r_off - r_on)
     # Algebraically identical to 1 - 10u^3 + 15u^4 - 6u^5, while avoiding
     # cancellation to a negative float32 value immediately below r_off.
-    polynomial = (1.0 - u).pow(3) * (1.0 + 3.0 * u + 6.0 * u.square())
+    raw = (1.0 - u).pow(3) * (1.0 + 3.0 * u + 6.0 * u.square())
+    transition = (distances > r_on) & (distances < r_off)
+    bad = transition & torch.isfinite(raw) & ((raw < 0.0) | (raw > 1.0))
+    # Preserve the established arithmetic bitwise unless roundoff alone made
+    # the finite transition polynomial leave its mathematical [0, 1] range.
+    # The equivalent endpoint-oriented forms avoid cancellation at either end
+    # and retain first- and second-order autograd at a repaired element.
+    u_safe = torch.clamp(u, 0.0, 1.0)
+    low = 1.0 - u_safe.pow(3) * (
+        10.0 - 15.0 * u_safe + 6.0 * u_safe.square()
+    )
+    v = 1.0 - u_safe
+    high = v.pow(3) * (1.0 + 3.0 * u_safe + 6.0 * u_safe.square())
+    stable = torch.where(u_safe <= 0.5, low, high)
+    polynomial = torch.where(bad, stable, raw)
     return torch.where(
         distances <= r_on,
         torch.ones_like(distances),

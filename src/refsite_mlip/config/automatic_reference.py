@@ -1027,6 +1027,7 @@ def prepare_automatic_references(
         policy = None
         if evaluation_policy_requested:
             from .automatic_evaluation import (
+                AUTOMATIC_EVALUATION_POLICY_AUDIT_VERSION,
                 build_automatic_evaluation_policy,
             )
 
@@ -1121,7 +1122,9 @@ def prepare_automatic_references(
                 None
                 if policy is None
                 else {
-                    "audit_profile": "automatic_evaluation_policy_audit_v1",
+                    "audit_profile": (
+                        AUTOMATIC_EVALUATION_POLICY_AUDIT_VERSION
+                    ),
                     "status": "pending_numerical_audit",
                     "content_fingerprint": policy.content_fingerprint,
                     "convention_version": policy.convention_version,

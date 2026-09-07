@@ -22,6 +22,15 @@ from refsite_mlip.features import (
     build_probability_multipoles,
     build_sparse_probability_multipoles,
 )
+from refsite_mlip.features.probability_multipoles import (
+    _assemble_dense_probability_multipoles,
+    _assemble_sparse_probability_multipoles,
+    _site_segment_sum,
+)
+from refsite_mlip.features.species import (
+    species_indicator,
+    species_probabilities,
+)
 from refsite_mlip.geometry.reference import aligned_reference_sites
 from refsite_mlip.models import (
     PRODUCTION_EVALUATION_POLICY_ACCEPTANCE_V1,
@@ -50,13 +59,33 @@ from refsite_mlip.transport import (
     solve_atom_vacancy_ot,
     solve_sparse_hybrid_eval,
     sparse_fixed_sinkhorn_updates,
+    sparse_marginal_residual_components,
     sparse_support_fingerprint,
     sparse_transport_plan,
 )
+from refsite_mlip.transport.dual import marginal_residuals, transport_plan
+from refsite_mlip.transport.edge_list import CompactTransportEdges
+from refsite_mlip.transport.marginals import split_atom_vacancy_plan
+from refsite_mlip.transport.problem import OTProblem, build_ot_problem
+from refsite_mlip.transport.sinkhorn import (
+    masked_sinkhorn_full_update,
+    sinkhorn_full_update,
+    solve_sinkhorn_eval_adaptive,
+    zero_duals,
+)
 
 
-AUTOMATIC_EVALUATION_POLICY_AUDIT_VERSION = (
+_AUTOMATIC_EVALUATION_POLICY_AUDIT_VERSION_V1 = (
     "automatic_evaluation_policy_audit_v1"
+)
+AUTOMATIC_EVALUATION_POLICY_AUDIT_VERSION = (
+    "automatic_evaluation_policy_audit_v2"
+)
+_SUPPORTED_AUTOMATIC_EVALUATION_POLICY_AUDIT_VERSIONS = frozenset(
+    {
+        _AUTOMATIC_EVALUATION_POLICY_AUDIT_VERSION_V1,
+        AUTOMATIC_EVALUATION_POLICY_AUDIT_VERSION,
+    }
 )
 AUTOMATIC_EVALUATION_CERTIFICATE_SCHEMA_VERSION_V1 = (
     "refsite_automatic_evaluation_certificate_v1"
@@ -104,6 +133,7 @@ _FLOAT32_TRANSPORT_TOLERANCE = 1.0e-6
 _FLOAT64_ORACLE_TOLERANCE = 1.0e-10
 _FLOAT32_ORACLE_TOLERANCE = 1.0e-5
 _FLOAT32_ORACLE_RESIDUAL_TARGET = 2.0 * torch.finfo(torch.float32).eps
+_FROZEN_FLOAT64_ORACLE_RESIDUAL_TOLERANCE = 1.0e-12
 _FIRST_DERIVATIVE_FD_TOLERANCE = 5.0e-6
 _POSITION_FD_STEP = 2.0e-6
 _STRAIN_FD_STEP = 1.0e-4
@@ -250,7 +280,7 @@ _CANDIDATE_DEFINITION_FIELDS = (
     "stabilizer_reduction_rule",
     "selected_groups_by_geometry",
 )
-_NORMATIVE_COMPARATORS = {
+_NORMATIVE_COMPARATORS_V1 = {
     "objective_gap_passed": "> minimum_objective_gap_absolute",
     "atomic_amplitude_passed": "> minimum_atomic_amplitude_absolute",
     "reference_amplitude_passed": "> minimum_reference_amplitude_absolute",
@@ -275,6 +305,12 @@ _NORMATIVE_COMPARATORS = {
     "all_probe_branches_agree": "is true",
     "cross_dtype_branch_agreement": "is true",
     "fallback_count_matches": "is true",
+}
+_NORMATIVE_COMPARATORS_V2 = {
+    **_NORMATIVE_COMPARATORS_V1,
+    "transport_oracle_residual_passed": (
+        "<= frozen CPU float64 oracle residual tolerance"
+    ),
 }
 
 
@@ -331,8 +367,16 @@ def _normative_outcomes(certificate: Mapping[str, Any]) -> dict[str, Any]:
     comparators and production thresholds before this projection is created.
     """
 
+    audit_version = certificate.get("audit_convention_version")
+    if audit_version not in _SUPPORTED_AUTOMATIC_EVALUATION_POLICY_AUDIT_VERSIONS:
+        raise AutomaticEvaluationPolicyAuditError(
+            "UNSUPPORTED_EVALUATION_CERTIFICATE_AUDIT",
+            "evaluation certificate audit convention is unsupported",
+        )
     profile = _require_mapping(certificate.get("profile"), "profile")
-    expected_profile = _plain(automatic_evaluation_policy_profile())
+    expected_profile = _plain(
+        automatic_evaluation_policy_profile(audit_version=audit_version)
+    )
     if _plain(profile) != expected_profile:
         raise AutomaticEvaluationPolicyAuditError(
             "EVALUATION_CERTIFICATE_PROFILE_MISMATCH",
@@ -385,9 +429,15 @@ def _normative_outcomes(certificate: Mapping[str, Any]) -> dict[str, Any]:
                     "duplicate dtype diagnostic identity",
                 )
             identities[key] = record
+            oracle_field = (
+                "oracle_maximum_errors"
+                if audit_version
+                == _AUTOMATIC_EVALUATION_POLICY_AUDIT_VERSION_V1
+                else "frozen_float64_oracle_maximum_errors"
+            )
             oracle = _require_mapping(
-                record.get("oracle_maximum_errors"),
-                "oracle_maximum_errors",
+                record.get(oracle_field),
+                oracle_field,
             )
             fallback = record.get("fallback_used") is True
             fallback_count += int(fallback)
@@ -473,6 +523,21 @@ def _normative_outcomes(certificate: Mapping[str, Any]) -> dict[str, Any]:
                     or record.get("dense_plan_materialized") is False
                 ),
             }
+            if audit_version == AUTOMATIC_EVALUATION_POLICY_AUDIT_VERSION:
+                oracle_residuals = _require_mapping(
+                    record.get("frozen_float64_oracle_residuals"),
+                    "frozen_float64_oracle_residuals",
+                )
+                checks["transport_oracle_residual_passed"] = max(
+                    _numeric(
+                        value,
+                        f"frozen_float64_oracle_residuals.{name}",
+                    )
+                    for name, value in oracle_residuals.items()
+                ) <= _numeric(
+                    profile["oracle_residual_tolerance"],
+                    "oracle_residual_tolerance",
+                )
             values.append({**identity, "checks": checks})
         by_dtype[dtype_name] = identities
         record_checks[dtype_name] = values
@@ -629,6 +694,12 @@ def _semantic_projection(
             }
             for record in diagnostics[dtype_name]
         ]
+    comparators = (
+        _NORMATIVE_COMPARATORS_V1
+        if certificate["audit_convention_version"]
+        == _AUTOMATIC_EVALUATION_POLICY_AUDIT_VERSION_V1
+        else _NORMATIVE_COMPARATORS_V2
+    )
     return {
         "schema_version": certificate["schema_version"],
         "audit_convention_version": certificate["audit_convention_version"],
@@ -641,7 +712,7 @@ def _semantic_projection(
         "bindings": {key: certificate[key] for key in _BINDING_FIELDS},
         "audit_domain": certificate["audit_input"],
         "normative_profile": certificate["profile"],
-        "normative_comparators": _plain(_NORMATIVE_COMPARATORS),
+        "normative_comparators": _plain(comparators),
         "effective_transport": certificate["effective_transport"],
         "candidate_definition": {
             key: candidate[key] for key in _CANDIDATE_DEFINITION_FIELDS
@@ -697,8 +768,8 @@ def validate_automatic_evaluation_certificate(
             "UNSUPPORTED_EVALUATION_CERTIFICATE_SEMANTIC_PROJECTION",
             "evaluation certificate semantic projection is unsupported",
         )
-    if result.get("audit_convention_version") != (
-        AUTOMATIC_EVALUATION_POLICY_AUDIT_VERSION
+    if result.get("audit_convention_version") not in (
+        _SUPPORTED_AUTOMATIC_EVALUATION_POLICY_AUDIT_VERSIONS
     ):
         raise AutomaticEvaluationPolicyAuditError(
             "UNSUPPORTED_EVALUATION_CERTIFICATE_AUDIT",
@@ -935,62 +1006,95 @@ def _candidate_coverage(template: Any) -> _CandidateCoverage:
     return _CandidateCoverage(runtime, broader, MappingProxyType(metadata))
 
 
-def automatic_evaluation_policy_profile() -> Mapping[str, Any]:
-    """Return the immutable fixed profile used by automatic qualification."""
+def automatic_evaluation_policy_profile(
+    *, audit_version: str | None = None
+) -> Mapping[str, Any]:
+    """Return one immutable, versioned automatic-qualification profile.
 
-    return MappingProxyType(
-        {
-            "convention_version": AUTOMATIC_EVALUATION_POLICY_AUDIT_VERSION,
-            "production_acceptance_convention_version": (
-                _PRODUCTION_ACCEPTANCE.convention_version
-            ),
-            "candidate_generation_convention_version": (
-                AUTOMATIC_EVALUATION_CANDIDATE_GENERATION_VERSION
-            ),
-            "runtime_candidate_grid": (
-                "axiswise primary-coordinate odd Nyquist resolution=max(3,2*b_j+1)"
-            ),
-            "broader_audit_candidate_grid": "2*runtime resolution",
-            "maximum_primary_coordinate_bandlimit": (
-                _MAX_PRIMARY_COORDINATE_BANDLIMIT
-            ),
-            "maximum_audit_candidate_groups": _MAX_AUDIT_CANDIDATE_GROUPS,
-            "phase_step_schedule": _PHASE_STEPS,
-            "phase_damping_schedule": _PHASE_DAMPING,
-            "minimum_objective_gap_absolute": _MINIMUM_OBJECTIVE_GAP,
-            "minimum_cross_amplitude_absolute": _MINIMUM_CROSS_AMPLITUDE,
-            "minimum_atomic_amplitude_absolute": _MINIMUM_ATOMIC_AMPLITUDE,
-            "minimum_reference_amplitude_absolute": _MINIMUM_REFERENCE_AMPLITUDE,
-            "minimum_curvature": _MINIMUM_CURVATURE,
-            "maximum_condition": _MAXIMUM_CONDITION,
-            "maximum_gradient_norm": _MAXIMUM_GRADIENT_NORM,
-            "equivalence_tolerance": _EQUIVALENCE_TOLERANCE,
-            "refined_basin_equivalence_maximum": (
-                _REFINED_BASIN_EQUIVALENCE_MULTIPLIER
-                * _EQUIVALENCE_TOLERANCE
-            ),
-            "transport_tolerance_float64": _FLOAT64_TRANSPORT_TOLERANCE,
-            "transport_tolerance_float32": _FLOAT32_TRANSPORT_TOLERANCE,
-            "oracle_sinkhorn_iterations": _ORACLE_SINKHORN_ITERATIONS,
-            "oracle_tolerance_float64": _FLOAT64_ORACLE_TOLERANCE,
-            "oracle_tolerance_float32": _FLOAT32_ORACLE_TOLERANCE,
-            "oracle_residual_target_float32": _FLOAT32_ORACLE_RESIDUAL_TARGET,
-            "max_newton_iterations": _MAX_NEWTON_ITERATIONS,
-            "pcg_max_iterations": _PCG_MAX_ITERATIONS,
-            "pcg_absolute_tolerance": _PCG_ABSOLUTE_TOLERANCE,
-            "pcg_relative_tolerance": _PCG_RELATIVE_TOLERANCE,
-            "gauge_rho": _GAUGE_RHO,
-            "armijo_coefficient": _ARMIJO_COEFFICIENT,
-            "line_search_reduction": _LINE_SEARCH_REDUCTION,
-            "max_line_search_reductions": _MAX_LINE_SEARCH_REDUCTIONS,
-            "fallback_sinkhorn_iterations": _FALLBACK_SINKHORN_ITERATIONS,
-            "first_derivative_fd_tolerance": _FIRST_DERIVATIVE_FD_TOLERANCE,
-            "position_fd_step": _POSITION_FD_STEP,
-            "strain_fd_step": _STRAIN_FD_STEP,
-            "max_witness_geometries": _MAX_WITNESS_GEOMETRIES,
-            "derivative_scalar_scale": _DERIVATIVE_SCALAR_SCALE,
-        }
+    The historical v1 profile remains available solely to validate already
+    persisted v2 certificates.  New qualification always writes v2.
+    """
+
+    version = (
+        AUTOMATIC_EVALUATION_POLICY_AUDIT_VERSION
+        if audit_version is None
+        else audit_version
     )
+    if version not in _SUPPORTED_AUTOMATIC_EVALUATION_POLICY_AUDIT_VERSIONS:
+        raise ValueError("unsupported automatic evaluation audit version")
+    profile = {
+        "convention_version": version,
+        "production_acceptance_convention_version": (
+            _PRODUCTION_ACCEPTANCE.convention_version
+        ),
+        "candidate_generation_convention_version": (
+            AUTOMATIC_EVALUATION_CANDIDATE_GENERATION_VERSION
+        ),
+        "runtime_candidate_grid": (
+            "axiswise primary-coordinate odd Nyquist resolution=max(3,2*b_j+1)"
+        ),
+        "broader_audit_candidate_grid": "2*runtime resolution",
+        "maximum_primary_coordinate_bandlimit": (
+            _MAX_PRIMARY_COORDINATE_BANDLIMIT
+        ),
+        "maximum_audit_candidate_groups": _MAX_AUDIT_CANDIDATE_GROUPS,
+        "phase_step_schedule": _PHASE_STEPS,
+        "phase_damping_schedule": _PHASE_DAMPING,
+        "minimum_objective_gap_absolute": _MINIMUM_OBJECTIVE_GAP,
+        "minimum_cross_amplitude_absolute": _MINIMUM_CROSS_AMPLITUDE,
+        "minimum_atomic_amplitude_absolute": _MINIMUM_ATOMIC_AMPLITUDE,
+        "minimum_reference_amplitude_absolute": _MINIMUM_REFERENCE_AMPLITUDE,
+        "minimum_curvature": _MINIMUM_CURVATURE,
+        "maximum_condition": _MAXIMUM_CONDITION,
+        "maximum_gradient_norm": _MAXIMUM_GRADIENT_NORM,
+        "equivalence_tolerance": _EQUIVALENCE_TOLERANCE,
+        "refined_basin_equivalence_maximum": (
+            _REFINED_BASIN_EQUIVALENCE_MULTIPLIER
+            * _EQUIVALENCE_TOLERANCE
+        ),
+        "transport_tolerance_float64": _FLOAT64_TRANSPORT_TOLERANCE,
+        "transport_tolerance_float32": _FLOAT32_TRANSPORT_TOLERANCE,
+        "oracle_sinkhorn_iterations": _ORACLE_SINKHORN_ITERATIONS,
+        "oracle_tolerance_float64": _FLOAT64_ORACLE_TOLERANCE,
+        "oracle_tolerance_float32": _FLOAT32_ORACLE_TOLERANCE,
+        "max_newton_iterations": _MAX_NEWTON_ITERATIONS,
+        "pcg_max_iterations": _PCG_MAX_ITERATIONS,
+        "pcg_absolute_tolerance": _PCG_ABSOLUTE_TOLERANCE,
+        "pcg_relative_tolerance": _PCG_RELATIVE_TOLERANCE,
+        "gauge_rho": _GAUGE_RHO,
+        "armijo_coefficient": _ARMIJO_COEFFICIENT,
+        "line_search_reduction": _LINE_SEARCH_REDUCTION,
+        "max_line_search_reductions": _MAX_LINE_SEARCH_REDUCTIONS,
+        "fallback_sinkhorn_iterations": _FALLBACK_SINKHORN_ITERATIONS,
+        "first_derivative_fd_tolerance": _FIRST_DERIVATIVE_FD_TOLERANCE,
+        "position_fd_step": _POSITION_FD_STEP,
+        "strain_fd_step": _STRAIN_FD_STEP,
+        "max_witness_geometries": _MAX_WITNESS_GEOMETRIES,
+        "derivative_scalar_scale": _DERIVATIVE_SCALAR_SCALE,
+    }
+    if version == _AUTOMATIC_EVALUATION_POLICY_AUDIT_VERSION_V1:
+        profile["oracle_residual_target_float32"] = (
+            _FLOAT32_ORACLE_RESIDUAL_TARGET
+        )
+    else:
+        profile.update(
+            {
+                "oracle_problem_float32": (
+                    "CPU float64 promotion of the frozen float32 OT problem"
+                ),
+                "oracle_problem_float64": (
+                    "CPU float64 frozen runtime OT problem"
+                ),
+                "oracle_residual_tolerance": (
+                    _FROZEN_FLOAT64_ORACLE_RESIDUAL_TOLERANCE
+                ),
+                "fixed_sinkhorn_float32_residual_normative": False,
+                "float32_multipole_comparison": (
+                    "production feature arithmetic after the 1e-6 NK residual gate"
+                ),
+            }
+        )
+    return MappingProxyType(profile)
 
 
 def build_automatic_evaluation_policy(template: Any) -> EvaluationPolicy:
@@ -1053,6 +1157,108 @@ def _tensor_maximum_error(left: torch.Tensor, right: torch.Tensor) -> float:
     return float(torch.max(torch.abs(left - right)).detach().cpu())
 
 
+def _audit_dense_probability_multipoles(
+    P: torch.Tensor,
+    q: torch.Tensor,
+    atomic_numbers: torch.Tensor,
+    displacements: torch.Tensor,
+    config: Any,
+    site_types: torch.Tensor,
+):
+    """Use exact production feature arithmetic after the audit's NK gate.
+
+    The public feature builder retains its own validation contract.  Audit v2
+    has already required the actual float32 NK row, column, and vacancy
+    residuals to be at most 1e-6, so it must not substitute the unrelated
+    same-dtype global species reduction as a second transport convergence gate.
+    """
+
+    finite = (P, q, displacements)
+    if any(not bool(torch.all(torch.isfinite(value)).detach()) for value in finite):
+        raise AutomaticEvaluationPolicyAuditError(
+            "NONFINITE_AUDIT_RESULT",
+            "production NK probability feature input is nonfinite",
+        )
+    tolerance = (
+        _FLOAT32_TRANSPORT_TOLERANCE
+        if P.dtype == torch.float32
+        else _FLOAT64_TRANSPORT_TOLERANCE
+    )
+    if bool(torch.any(P < 0.0).detach()) or bool(
+        torch.any((q < -tolerance) | (q > 1.0 + tolerance)).detach()
+    ):
+        raise AutomaticEvaluationPolicyAuditError(
+            "TRANSPORT_CONVERGENCE_FAILURE",
+            "production NK P/q lies outside the physical probability range",
+        )
+    probabilities, indicator = species_probabilities(
+        P, atomic_numbers, config.species_vocabulary
+    )
+    return _assemble_dense_probability_multipoles(
+        P,
+        q,
+        displacements,
+        config,
+        site_types,
+        probabilities,
+        indicator,
+    )
+
+
+def _audit_sparse_probability_multipoles(
+    edge_plan: torch.Tensor,
+    q: torch.Tensor,
+    edges: CompactTransportEdges,
+    atomic_numbers: torch.Tensor,
+    config: Any,
+    site_types: torch.Tensor,
+):
+    """Use exact sparse feature arithmetic after the audit's NK gate."""
+
+    finite = (edge_plan, q, edges.displacements)
+    if any(not bool(torch.all(torch.isfinite(value)).detach()) for value in finite):
+        raise AutomaticEvaluationPolicyAuditError(
+            "NONFINITE_AUDIT_RESULT",
+            "production sparse NK probability feature input is nonfinite",
+        )
+    tolerance = (
+        _FLOAT32_TRANSPORT_TOLERANCE
+        if edge_plan.dtype == torch.float32
+        else _FLOAT64_TRANSPORT_TOLERANCE
+    )
+    if bool(torch.any(edge_plan < 0.0).detach()) or bool(
+        torch.any((q < -tolerance) | (q > 1.0 + tolerance)).detach()
+    ):
+        raise AutomaticEvaluationPolicyAuditError(
+            "TRANSPORT_CONVERGENCE_FAILURE",
+            "production sparse NK edge-plan/q lies outside the physical probability range",
+        )
+    indicator = species_indicator(
+        atomic_numbers, config.species_vocabulary, dtype=edge_plan.dtype
+    )
+    edge_indicator = indicator[edges.atom_index]
+    probabilities = _site_segment_sum(
+        edge_plan[:, None] * edge_indicator,
+        edges.site_index,
+        edges.num_sites,
+    )
+    return _assemble_sparse_probability_multipoles(
+        edge_plan,
+        q,
+        edges,
+        config,
+        site_types,
+        indicator,
+        edge_indicator,
+        probabilities,
+        {
+            "simplex": tolerance,
+            "species_count": tolerance,
+            "vacancy_mass": tolerance,
+        },
+    )
+
+
 def _mic_branch_fingerprint(
     *,
     site_index: torch.Tensor,
@@ -1093,6 +1299,168 @@ def _semantic_support_fingerprint(
         )
     )
     return hashlib.sha256(repr(records).encode("utf-8")).hexdigest()
+
+
+def _promote_frozen_dense_problem(problem: OTProblem) -> OTProblem:
+    """Promote one already-realized OT problem without reselecting support."""
+
+    def floating(value: torch.Tensor) -> torch.Tensor:
+        return value.detach().to(device="cpu", dtype=torch.float64).clone()
+
+    return OTProblem(
+        atom_cost=floating(problem.atom_cost),
+        cost=floating(problem.cost),
+        row_marginal=floating(problem.row_marginal),
+        column_marginal=floating(problem.column_marginal),
+        epsilon=floating(problem.epsilon),
+        num_sites=problem.num_sites,
+        num_atoms=problem.num_atoms,
+        num_vacancies=problem.num_vacancies,
+        log_kernel=(
+            None if problem.log_kernel is None else floating(problem.log_kernel)
+        ),
+        support_diagnostics=problem.support_diagnostics,
+    )
+
+
+def _promote_frozen_sparse_edges(
+    edges: CompactTransportEdges,
+) -> CompactTransportEdges:
+    """Promote edge arithmetic while retaining exact indices, mask, and MIC."""
+
+    def index(value: torch.Tensor) -> torch.Tensor:
+        return value.detach().to(device="cpu").clone()
+
+    def floating(value: torch.Tensor) -> torch.Tensor:
+        return value.detach().to(device="cpu", dtype=torch.float64).clone()
+
+    return replace(
+        edges,
+        site_index=index(edges.site_index),
+        atom_index=index(edges.atom_index),
+        displacements=floating(edges.displacements),
+        distances=floating(edges.distances),
+        switch=floating(edges.switch),
+        log_kernel=floating(edges.log_kernel),
+        active=index(edges.active),
+        atom_major_permutation=index(edges.atom_major_permutation),
+        site_ptr=index(edges.site_ptr),
+        atom_ptr=index(edges.atom_ptr),
+        epsilon=floating(edges.epsilon),
+        periodic_shift=index(edges.periodic_shift),
+    )
+
+
+def _dense_residual_diagnostics(
+    problem: OTProblem, gamma: torch.Tensor, q: torch.Tensor
+) -> dict[str, float]:
+    row, column = marginal_residuals(problem, gamma)
+    q_mass = torch.abs(
+        q.sum() - q.new_tensor(float(problem.num_vacancies))
+    )
+    return {
+        "row": float(row.abs().max().detach().cpu()),
+        "column": float(column.abs().max().detach().cpu()),
+        "q_mass": float(q_mass.detach().cpu()),
+    }
+
+
+def _sparse_residual_diagnostics(
+    edges: CompactTransportEdges,
+    edge_plan: torch.Tensor,
+    q: torch.Tensor,
+) -> dict[str, float]:
+    row, atomic_column, vacancy = sparse_marginal_residual_components(
+        edges, edge_plan, q
+    )
+    return {
+        "row": float(row.abs().max().detach().cpu()),
+        "column": float(atomic_column.abs().max().detach().cpu()),
+        "q_mass": float(vacancy.abs().detach().cpu()),
+    }
+
+
+def _frozen_float64_dense_oracle(problem: OTProblem):
+    promoted = _promote_frozen_dense_problem(problem)
+    result = solve_sinkhorn_eval_adaptive(
+        promoted,
+        maximum_iterations=_ORACLE_SINKHORN_ITERATIONS,
+        tolerance=_FROZEN_FLOAT64_ORACLE_RESIDUAL_TOLERANCE,
+    )
+    residuals = _dense_residual_diagnostics(promoted, result.gamma, result.q)
+    return promoted, result, residuals
+
+
+def _frozen_float64_sparse_oracle(edges: CompactTransportEdges):
+    promoted = _promote_frozen_sparse_edges(edges)
+    duals = sparse_fixed_sinkhorn_updates(
+        promoted, _ORACLE_SINKHORN_ITERATIONS
+    )
+    edge_plan, q = sparse_transport_plan(promoted, duals.f, duals.g)
+    residuals = _sparse_residual_diagnostics(promoted, edge_plan, q)
+    return promoted, edge_plan, q, residuals
+
+
+def _float32_dense_fixed_sinkhorn_diagnostic(
+    problem: OTProblem,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
+    """Retain the historical float32 oracle and terminal telemetry, non-normatively.
+
+    The first plan meeting the former 2-epsilon target reproduces the v1 audit
+    comparison when such an iterate exists.  Qualification never consumes this
+    result; the full 1024-update terminal residual is raw diagnostic telemetry.
+    """
+
+    duals = zero_duals(problem)
+    f, g = duals.f, duals.g
+    first_plan = None
+    first_q = None
+    first_iteration = None
+    final_gamma = None
+    final_q = None
+    with torch.autocast(device_type=problem.cost.device.type, enabled=False):
+        for index in range(_ORACLE_SINKHORN_ITERATIONS):
+            if problem.log_kernel is None:
+                f, g = sinkhorn_full_update(problem, f, g)
+            else:
+                f, g = masked_sinkhorn_full_update(problem, f, g)
+            gamma = transport_plan(problem, f, g)
+            _, q = split_atom_vacancy_plan(problem, gamma)
+            residuals = _dense_residual_diagnostics(problem, gamma, q)
+            if (
+                first_plan is None
+                and max(residuals.values())
+                <= _FLOAT32_ORACLE_RESIDUAL_TARGET
+            ):
+                first_plan = gamma[:, : problem.num_atoms]
+                first_q = q
+                first_iteration = index + 1
+            final_gamma = gamma
+            final_q = q
+            if first_plan is not None:
+                break
+    assert final_gamma is not None and final_q is not None
+    final_residuals = _dense_residual_diagnostics(
+        problem, final_gamma, final_q
+    )
+    legacy_plan = (
+        final_gamma[:, : problem.num_atoms]
+        if first_plan is None
+        else first_plan
+    )
+    legacy_q = final_q if first_q is None else first_q
+    return legacy_plan, legacy_q, {
+        "iterations": (
+            _ORACLE_SINKHORN_ITERATIONS
+            if first_iteration is None
+            else first_iteration
+        ),
+        "maximum_iterations": _ORACLE_SINKHORN_ITERATIONS,
+        "former_target": _FLOAT32_ORACLE_RESIDUAL_TARGET,
+        "first_passing_iteration": first_iteration,
+        "terminal_residuals": final_residuals,
+        "normative": False,
+    }
 
 
 def _evaluate(
@@ -1215,14 +1583,45 @@ def _evaluate(
                 backend="edge_list",
                 diagnostics={"failure_reason": ot.failure_reason},
             )
-        feature = build_sparse_probability_multipoles(
-            ot.edge_plan,
-            ot.q,
-            ot.edges,
-            atomic_numbers,
-            config.feature,
-            runtime.topology.site_types,
-        )
+        if dtype == torch.float32:
+            early_row, early_column, early_vacancy = (
+                sparse_marginal_residual_components(
+                    ot.edges, ot.edge_plan, ot.q
+                )
+            )
+            early_residual = max(
+                float(early_row.abs().max()),
+                float(early_column.abs().max()),
+                float(early_vacancy.abs()),
+            )
+            if early_residual > eval_config.convergence_tolerance:
+                raise AutomaticEvaluationPolicyAuditError(
+                    "TRANSPORT_CONVERGENCE_FAILURE",
+                    "adaptive sparse transport residual exceeds the existing dtype tolerance",
+                    template_id=audit_input.template_id,
+                    sample_id=geometry.sample_id,
+                    dtype="float32",
+                    backend="edge_list",
+                    observed=early_residual,
+                    required=f"<= {eval_config.convergence_tolerance}",
+                )
+            feature = _audit_sparse_probability_multipoles(
+                ot.edge_plan,
+                ot.q,
+                ot.edges,
+                atomic_numbers,
+                config.feature,
+                runtime.topology.site_types,
+            )
+        else:
+            feature = build_sparse_probability_multipoles(
+                ot.edge_plan,
+                ot.q,
+                ot.edges,
+                atomic_numbers,
+                config.feature,
+                runtime.topology.site_types,
+            )
         production_support_fingerprint = sparse_support_fingerprint(edges)
         semantic_support_fingerprint = _semantic_support_fingerprint(
             site_index=edges.site_index,
@@ -1236,21 +1635,78 @@ def _evaluate(
         )
         plan = ot.edge_plan
         if oracle:
-            duals = sparse_fixed_sinkhorn_updates(
-                edges, _ORACLE_SINKHORN_ITERATIONS
-            )
-            oracle_plan, oracle_q = sparse_transport_plan(
-                edges, duals.f, duals.g
-            )
+            if dtype == torch.float32:
+                legacy_duals = sparse_fixed_sinkhorn_updates(
+                    edges, _ORACLE_SINKHORN_ITERATIONS
+                )
+                legacy_plan, legacy_q = sparse_transport_plan(
+                    edges, legacy_duals.f, legacy_duals.g
+                )
+                legacy_errors = {
+                    "plan": _tensor_maximum_error(plan, legacy_plan),
+                    "q": _tensor_maximum_error(ot.q, legacy_q),
+                }
+                legacy_feature_error = None
+                try:
+                    legacy_feature = build_sparse_probability_multipoles(
+                        legacy_plan,
+                        legacy_q,
+                        edges,
+                        atomic_numbers,
+                        config.feature,
+                        runtime.topology.site_types,
+                    )
+                    legacy_errors["multipoles"] = _tensor_maximum_error(
+                        feature.equivariant_features,
+                        legacy_feature.equivariant_features,
+                    )
+                except ValueError as error:
+                    # This same-dtype fixed solve is telemetry in audit v2.
+                    # Never let its representational floor veto a qualified
+                    # production NK result and frozen float64 oracle.
+                    legacy_errors["multipoles"] = None
+                    legacy_feature_error = f"{type(error).__name__}: {error}"
+                fixed_float32_diagnostic = {
+                    "iterations": _ORACLE_SINKHORN_ITERATIONS,
+                    "former_target": _FLOAT32_ORACLE_RESIDUAL_TARGET,
+                    "first_passing_iteration": None,
+                    "terminal_residuals": _sparse_residual_diagnostics(
+                        edges, legacy_plan, legacy_q
+                    ),
+                    "maximum_errors": legacy_errors,
+                    "feature_validation_error": legacy_feature_error,
+                    "normative": False,
+                }
+            else:
+                legacy_errors = None
+                fixed_float32_diagnostic = None
+            try:
+                (
+                    oracle_edges,
+                    oracle_plan,
+                    oracle_q,
+                    oracle_residuals,
+                ) = _frozen_float64_sparse_oracle(edges)
+            except Exception as error:
+                raise AutomaticEvaluationPolicyAuditError(
+                    "TRANSPORT_ORACLE_CONVERGENCE_FAILURE",
+                    "frozen-support CPU float64 sparse oracle did not converge",
+                    template_id=audit_input.template_id,
+                    sample_id=geometry.sample_id,
+                    geometry_digest=geometry.semantic_digest,
+                    dtype=str(dtype).removeprefix("torch."),
+                    backend="edge_list",
+                    original_error=error,
+                ) from error
             oracle_feature = build_sparse_probability_multipoles(
                 oracle_plan,
                 oracle_q,
-                edges,
-                atomic_numbers,
+                oracle_edges,
+                atomic_numbers.detach().cpu(),
                 config.feature,
-                runtime.topology.site_types,
+                runtime.topology.site_types.detach().cpu(),
             )
-            oracle_errors = {
+            frozen_oracle_errors = {
                 "plan": _tensor_maximum_error(plan, oracle_plan),
                 "q": _tensor_maximum_error(ot.q, oracle_q),
                 "multipoles": _tensor_maximum_error(
@@ -1258,8 +1714,13 @@ def _evaluate(
                     oracle_feature.equivariant_features,
                 ),
             }
+            if legacy_errors is None:
+                legacy_errors = frozen_oracle_errors
         else:
-            oracle_errors = {"plan": 0.0, "q": 0.0, "multipoles": 0.0}
+            legacy_errors = {"plan": 0.0, "q": 0.0, "multipoles": 0.0}
+            frozen_oracle_errors = legacy_errors
+            oracle_residuals = {"row": 0.0, "column": 0.0, "q_mass": 0.0}
+            fixed_float32_diagnostic = None
         support = edges.support_diagnostics
         dense_plan_materialized = ot.dense_plan_materialized
     else:
@@ -1290,14 +1751,50 @@ def _evaluate(
                 backend="dense",
                 diagnostics={"failure_reason": ot.failure_reason},
             )
-        feature = build_probability_multipoles(
-            ot.P,
-            ot.q,
-            atomic_numbers,
-            displacements,
-            config.feature,
-            runtime.topology.site_types,
-        )
+        if dtype == torch.float32:
+            early_q_mass_error = torch.abs(
+                ot.q.sum()
+                - ot.q.new_tensor(
+                    runtime.topology.num_sites - positions.shape[0]
+                )
+            )
+            if (
+                float(torch.maximum(ot.row_residual, ot.column_residual))
+                > eval_config.convergence_tolerance
+                or float(early_q_mass_error)
+                > eval_config.convergence_tolerance
+            ):
+                raise AutomaticEvaluationPolicyAuditError(
+                    "TRANSPORT_CONVERGENCE_FAILURE",
+                    "adaptive transport residual exceeds the existing dtype tolerance",
+                    template_id=audit_input.template_id,
+                    sample_id=geometry.sample_id,
+                    dtype="float32",
+                    backend="dense",
+                    observed=max(
+                        float(ot.row_residual),
+                        float(ot.column_residual),
+                        float(early_q_mass_error),
+                    ),
+                    required=f"<= {eval_config.convergence_tolerance}",
+                )
+            feature = _audit_dense_probability_multipoles(
+                ot.P,
+                ot.q,
+                atomic_numbers,
+                displacements,
+                config.feature,
+                runtime.topology.site_types,
+            )
+        else:
+            feature = build_probability_multipoles(
+                ot.P,
+                ot.q,
+                atomic_numbers,
+                displacements,
+                config.feature,
+                runtime.topology.site_types,
+            )
         support = ot.support_diagnostics
         active = distances < distances.new_tensor(support_config.cutoff)
         site_index = torch.arange(
@@ -1328,35 +1825,76 @@ def _evaluate(
         plan = ot.P
         dense_plan_materialized = True
         if oracle:
-            oracle_config = replace(
-                eval_config,
-                sinkhorn_iterations=_ORACLE_SINKHORN_ITERATIONS,
-                convergence_tolerance=(
-                    _FLOAT32_ORACLE_RESIDUAL_TARGET
-                    if dtype == torch.float32
-                    else _FLOAT64_TRANSPORT_TOLERANCE
-                ),
-            )
-            oracle_ot = solve_atom_vacancy_ot(
+            problem = build_ot_problem(
                 cost,
                 config.epsilon_ot,
-                EVAL_ADAPTIVE,
-                "sinkhorn",
-                oracle_config,
                 support_config=support_config,
                 atom_distances=distances,
                 template_id=audit_input.template_id,
                 sample_id=geometry.sample_id,
             )
+            if dtype == torch.float32:
+                (
+                    legacy_plan,
+                    legacy_q,
+                    fixed_float32_diagnostic,
+                ) = _float32_dense_fixed_sinkhorn_diagnostic(problem)
+                legacy_errors = {
+                    "plan": _tensor_maximum_error(plan, legacy_plan),
+                    "q": _tensor_maximum_error(ot.q, legacy_q),
+                }
+                legacy_feature_error = None
+                try:
+                    legacy_feature = build_probability_multipoles(
+                        legacy_plan,
+                        legacy_q,
+                        atomic_numbers,
+                        displacements,
+                        config.feature,
+                        runtime.topology.site_types,
+                    )
+                    legacy_errors["multipoles"] = _tensor_maximum_error(
+                        feature.equivariant_features,
+                        legacy_feature.equivariant_features,
+                    )
+                except ValueError as error:
+                    # Historical float32 fixed-Sinkhorn telemetry can sit on a
+                    # quantization floor.  It is intentionally non-normative.
+                    legacy_errors["multipoles"] = None
+                    legacy_feature_error = f"{type(error).__name__}: {error}"
+                fixed_float32_diagnostic["maximum_errors"] = legacy_errors
+                fixed_float32_diagnostic["feature_validation_error"] = (
+                    legacy_feature_error
+                )
+            else:
+                legacy_errors = None
+                fixed_float32_diagnostic = None
+            try:
+                (
+                    _oracle_problem,
+                    oracle_ot,
+                    oracle_residuals,
+                ) = _frozen_float64_dense_oracle(problem)
+            except Exception as error:
+                raise AutomaticEvaluationPolicyAuditError(
+                    "TRANSPORT_ORACLE_CONVERGENCE_FAILURE",
+                    "frozen-support CPU float64 dense oracle did not converge",
+                    template_id=audit_input.template_id,
+                    sample_id=geometry.sample_id,
+                    geometry_digest=geometry.semantic_digest,
+                    dtype=str(dtype).removeprefix("torch."),
+                    backend="dense",
+                    original_error=error,
+                ) from error
             oracle_feature = build_probability_multipoles(
                 oracle_ot.P,
                 oracle_ot.q,
-                atomic_numbers,
-                displacements,
+                atomic_numbers.detach().cpu(),
+                displacements.detach().cpu().to(torch.float64),
                 config.feature,
-                runtime.topology.site_types,
+                runtime.topology.site_types.detach().cpu(),
             )
-            oracle_errors = {
+            frozen_oracle_errors = {
                 "plan": _tensor_maximum_error(plan, oracle_ot.P),
                 "q": _tensor_maximum_error(ot.q, oracle_ot.q),
                 "multipoles": _tensor_maximum_error(
@@ -1364,15 +1902,34 @@ def _evaluate(
                     oracle_feature.equivariant_features,
                 ),
             }
+            if legacy_errors is None:
+                legacy_errors = frozen_oracle_errors
         else:
-            oracle_errors = {"plan": 0.0, "q": 0.0, "multipoles": 0.0}
+            legacy_errors = {"plan": 0.0, "q": 0.0, "multipoles": 0.0}
+            frozen_oracle_errors = legacy_errors
+            oracle_residuals = {"row": 0.0, "column": 0.0, "q_mass": 0.0}
+            fixed_float32_diagnostic = None
 
     tolerance = (
         _FLOAT32_ORACLE_TOLERANCE
         if dtype == torch.float32
         else _FLOAT64_ORACLE_TOLERANCE
     )
-    worst_oracle = max(oracle_errors.values())
+    worst_oracle_residual = max(oracle_residuals.values())
+    if worst_oracle_residual > _FROZEN_FLOAT64_ORACLE_RESIDUAL_TOLERANCE:
+        raise AutomaticEvaluationPolicyAuditError(
+            "TRANSPORT_ORACLE_CONVERGENCE_FAILURE",
+            "frozen-support CPU float64 oracle residual exceeds its fixed tolerance",
+            template_id=audit_input.template_id,
+            sample_id=geometry.sample_id,
+            geometry_digest=geometry.semantic_digest,
+            dtype=str(dtype).removeprefix("torch."),
+            backend=support_config.backend,
+            observed=worst_oracle_residual,
+            required=f"<= {_FROZEN_FLOAT64_ORACLE_RESIDUAL_TOLERANCE}",
+            diagnostics=oracle_residuals,
+        )
+    worst_oracle = max(frozen_oracle_errors.values())
     if worst_oracle > tolerance:
         raise AutomaticEvaluationPolicyAuditError(
             "TRANSPORT_ORACLE_MISMATCH",
@@ -1384,7 +1941,7 @@ def _evaluate(
             backend=support_config.backend,
             observed=worst_oracle,
             required=f"<= {tolerance}",
-            diagnostics=oracle_errors,
+            diagnostics=frozen_oracle_errors,
         )
     curvature = torch.linalg.eigvalsh(-evaluation.refined.hessian)
     condition = curvature[-1] / curvature[0]
@@ -1514,7 +2071,14 @@ def _evaluate(
         "line_search_reductions": ot.line_search_reductions,
         "total_transport_work": total_transport_work,
         "fallback_used": ot.fallback_used,
-        "oracle_maximum_errors": oracle_errors,
+        # Historical same-dtype comparison remains raw compatibility telemetry.
+        # Audit v2 qualification uses only the branch-frozen CPU float64 oracle
+        # fields below; the float32 fixed-Sinkhorn terminal cycle is explicitly
+        # non-normative and excluded from semantic identity.
+        "oracle_maximum_errors": legacy_errors,
+        "frozen_float64_oracle_maximum_errors": frozen_oracle_errors,
+        "frozen_float64_oracle_residuals": oracle_residuals,
+        "fixed_sinkhorn_float32_diagnostic": fixed_float32_diagnostic,
         "dense_plan_materialized": dense_plan_materialized,
     }
     branch = (
@@ -2405,7 +2969,14 @@ def _audit_one(audit_input: Any, policy: EvaluationPolicy, config: Any) -> dict[
                 for item in all_records
             ),
             "maximum_oracle_error": max(
-                max(item["oracle_maximum_errors"].values()) for item in all_records
+                max(
+                    item["frozen_float64_oracle_maximum_errors"].values()
+                )
+                for item in all_records
+            ),
+            "maximum_oracle_residual": max(
+                max(item["frozen_float64_oracle_residuals"].values())
+                for item in all_records
             ),
             "maximum_transport_work": max(
                 item["total_transport_work"] for item in all_records

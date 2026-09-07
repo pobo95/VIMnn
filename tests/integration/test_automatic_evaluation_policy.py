@@ -34,6 +34,7 @@ from refsite_mlip.config import (
     resolve_training_recipe,
     validate_automatic_evaluation_certificate,
 )
+import refsite_mlip.config.automatic_evaluation as automatic_evaluation_module
 from refsite_mlip.models import load_reference_site_model_bundle
 from refsite_mlip.training import (
     canonical_runtime_json,
@@ -50,14 +51,23 @@ _V1_EVALUATION_CERTIFICATE_SHA256 = (
     "31709e0c31c25f012c91dd5c57dce85fb92a0924f41d9162ec3e023677be8dea"
 )
 _V1_HISTORICAL_POSITION_RELATIVE_DIAGNOSTIC = 8.51007437861865e-08
-_V2_EVALUATION_SEMANTIC_SHA256 = (
+_PRE_12E1C_V2_EVALUATION_SEMANTIC_SHA256 = (
     "d0d79b4022d2977b6e58c390a4305b92f913df6b693b8cf5c63c464705a2f905"
 )
-_V2_AUTOMATIC_PREPARATION_SHA256 = (
+_PRE_12E1C_V2_AUTOMATIC_PREPARATION_SHA256 = (
     "f4e95ac28666a64fa3f418b29ac0f87242570fc5055e889c534a57fe81d39719"
 )
-_NK_CONFIG_SHA256 = (
+_PRE_12E1C_NK_CONFIG_SHA256 = (
     "44857e1e0e66b1a9ecdf785e72a185e6b7d1e5f664ef17d47801d07ea49a7d7c"
+)
+_V2_EVALUATION_SEMANTIC_SHA256 = (
+    "8e6b688f092f150502119315accdb819d3ede5a9f5d8aca7623bd080b0134be5"
+)
+_V2_AUTOMATIC_PREPARATION_SHA256 = (
+    "8793f1113f59ea6ccb492e84d254827b51c4891f5f5ac9e3085f8694fafac498"
+)
+_NK_CONFIG_SHA256 = (
+    "c2a7f9aaf1df383199b0e04713e0bef7506840073f15fd8082028fc524089c65"
 )
 
 
@@ -121,8 +131,56 @@ def _rehash_evaluation_certificate(certificate):
     return result
 
 
-def _as_legacy_v1_evaluation_certificate(certificate):
+def _as_pre_12e1c_v2_evaluation_certificate(certificate, structural):
     result = _plain_copy(certificate)
+    result["audit_convention_version"] = "automatic_evaluation_policy_audit_v1"
+    result["profile"] = _plain_copy(
+        automatic_evaluation_module.automatic_evaluation_policy_profile(
+            audit_version="automatic_evaluation_policy_audit_v1"
+        )
+    )
+    for records in result["dtype_diagnostics"].values():
+        for record in records:
+            record.pop("frozen_float64_oracle_maximum_errors", None)
+            record.pop("frozen_float64_oracle_residuals", None)
+            record.pop("fixed_sinkhorn_float32_diagnostic", None)
+    result["observed_extrema"].pop("maximum_oracle_residual", None)
+    result["observed_extrema"]["maximum_oracle_error"] = max(
+        max(item["oracle_maximum_errors"].values())
+        for item in result["dtype_diagnostics"]["float64"]
+    )
+    historical_structural = _plain_copy(structural)
+    historical_structural["evaluation_policy"]["audit_profile"] = (
+        "automatic_evaluation_policy_audit_v1"
+    )
+    historical_structural.pop("certificate_sha256", None)
+    historical_structural["certificate_sha256"] = hashlib.sha256(
+        canonical_runtime_json(historical_structural).encode("utf-8")
+    ).hexdigest()
+    result["structural_certificate_sha256"] = historical_structural[
+        "certificate_sha256"
+    ]
+    for key in (
+        "normative_outcomes",
+        "evaluation_semantic_fingerprint_sha256",
+        "evaluation_certificate_sha256",
+    ):
+        result.pop(key, None)
+    outcomes = automatic_evaluation_module._normative_outcomes(result)
+    automatic_evaluation_module._assert_qualified_outcomes(outcomes)
+    result["normative_outcomes"] = outcomes
+    result["evaluation_semantic_fingerprint_sha256"] = hashlib.sha256(
+        canonical_runtime_json(
+            automatic_evaluation_module._semantic_projection(result, outcomes)
+        ).encode("utf-8")
+    ).hexdigest()
+    return _rehash_evaluation_certificate(result)
+
+
+def _as_legacy_v1_evaluation_certificate(certificate, structural):
+    result = _as_pre_12e1c_v2_evaluation_certificate(
+        certificate, structural
+    )
     result["schema_version"] = (
         AUTOMATIC_EVALUATION_CERTIFICATE_SCHEMA_VERSION_V1
     )
@@ -225,6 +283,23 @@ def test_poscar_only_newton_krylov_policy_audit_is_deterministic_and_geometry_on
             <= tolerances[dtype_name]
             for item in values
         )
+        assert all(
+            max(item["frozen_float64_oracle_residuals"].values()) <= 1e-12
+            for item in values
+        )
+        assert all(
+            max(item["frozen_float64_oracle_maximum_errors"].values())
+            <= (1e-5 if dtype_name == "float32" else 1e-10)
+            for item in values
+        )
+    assert all(
+        item["fixed_sinkhorn_float32_diagnostic"]["normative"] is False
+        for item in records["float32"]
+    )
+    assert all(
+        item["fixed_sinkhorn_float32_diagnostic"] is None
+        for item in records["float64"]
+    )
     f64 = {
         (item["split"], item["sample_id"]): item
         for item in records["float64"]
@@ -461,6 +536,15 @@ def test_v2_certificate_separates_semantic_identity_from_raw_integrity(tmp_path)
     )
     assert raw_only_result.semantic_dict() == original_result.semantic_dict()
 
+    fixed_cycle_only = _plain_copy(certificate)
+    fixed_cycle_only["dtype_diagnostics"]["float32"][0][
+        "fixed_sinkhorn_float32_diagnostic"
+    ]["terminal_residuals"]["row"] += 1.0e-7
+    fixed_cycle_only = _rehash_evaluation_certificate(fixed_cycle_only)
+    assert validate_automatic_evaluation_certificate(fixed_cycle_only)[
+        "evaluation_semantic_fingerprint_sha256"
+    ] == certificate["evaluation_semantic_fingerprint_sha256"]
+
     same_outcome = _plain_copy(certificate)
     objective_record = same_outcome["dtype_diagnostics"]["float64"][0]
     objective_record["objective_gap"] *= 1.0000001
@@ -492,6 +576,26 @@ def test_v2_certificate_separates_semantic_identity_from_raw_integrity(tmp_path)
         "EVALUATION_CERTIFICATE_QUALIFICATION_FAILED"
     )
 
+    for path, value in (
+        (("transport_row_residual",), 1.1e-6),
+        (("frozen_float64_oracle_residuals", "row"), 1.1e-12),
+        (("frozen_float64_oracle_maximum_errors", "plan"), 1.1e-5),
+        (("frozen_float64_oracle_maximum_errors", "q"), 1.1e-5),
+        (("frozen_float64_oracle_maximum_errors", "multipoles"), 1.1e-5),
+    ):
+        corrupted = _plain_copy(certificate)
+        record = corrupted["dtype_diagnostics"]["float32"][0]
+        if len(path) == 1:
+            record[path[0]] = value
+        else:
+            record[path[0]][path[1]] = value
+        corrupted = _rehash_evaluation_certificate(corrupted)
+        with pytest.raises(AutomaticEvaluationPolicyAuditError) as caught:
+            validate_automatic_evaluation_certificate(corrupted)
+        assert caught.value.reason_code == (
+            "EVALUATION_CERTIFICATE_QUALIFICATION_FAILED"
+        )
+
     for field, value in (
         ("selected_group", 999),
         ("semantic_support_fingerprint", "0" * 64),
@@ -505,17 +609,148 @@ def test_v2_certificate_separates_semantic_identity_from_raw_integrity(tmp_path)
 
 
 def test_legacy_v1_evaluation_certificate_sha_and_decoder_are_preserved(tmp_path):
-    certificate = resolve_training_recipe(
+    result = resolve_training_recipe(
         _nk_recipe(tmp_path)
-    ).automatic_reference_preparation.to_dict()["references"][0][
-        "evaluation_certificate"
-    ]
-    legacy = _as_legacy_v1_evaluation_certificate(certificate)
+    ).automatic_reference_preparation.to_dict()["references"][0]
+    structural = {
+        key: value
+        for key, value in result.items()
+        if key not in {"poscar", "evaluation_certificate"}
+    }
+    legacy = _as_legacy_v1_evaluation_certificate(
+        result["evaluation_certificate"], structural
+    )
     assert legacy["evaluation_certificate_sha256"] == (
         _V1_EVALUATION_CERTIFICATE_SHA256
     )
     assert validate_automatic_evaluation_certificate(legacy) == legacy
     assert automatic_evaluation_certificate_semantic_identity(legacy) == legacy
+
+
+def test_pre_12e1c_v2_certificate_loads_without_migration_or_relabeling(
+    tmp_path,
+):
+    result = resolve_training_recipe(
+        _nk_recipe(tmp_path)
+    ).automatic_reference_preparation.to_dict()["references"][0]
+    structural = {
+        key: value
+        for key, value in result.items()
+        if key not in {"poscar", "evaluation_certificate"}
+    }
+    legacy = _as_pre_12e1c_v2_evaluation_certificate(
+        result["evaluation_certificate"], structural
+    )
+    assert legacy["audit_convention_version"] == (
+        "automatic_evaluation_policy_audit_v1"
+    )
+    assert legacy["evaluation_semantic_fingerprint_sha256"] == (
+        _PRE_12E1C_V2_EVALUATION_SEMANTIC_SHA256
+    )
+    assert validate_automatic_evaluation_certificate(legacy) == legacy
+    identity = automatic_evaluation_certificate_semantic_identity(legacy)
+    assert identity["audit_convention_version"] == (
+        "automatic_evaluation_policy_audit_v1"
+    )
+    assert identity["evaluation_semantic_fingerprint_sha256"] == (
+        _PRE_12E1C_V2_EVALUATION_SEMANTIC_SHA256
+    )
+
+
+def test_frozen_float64_oracle_residual_failure_is_immediate(
+    tmp_path, monkeypatch
+):
+    resolution = resolve_training_recipe(_nk_recipe(tmp_path))
+    preparation = resolution.automatic_reference_preparation
+    audit_input = preparation._audit_inputs[0]
+    geometry = audit_input.train_geometries[0]
+    policy = preparation.results[0].specification.evaluation_policy
+    potential = resolution.config.model_source.potential
+    original = automatic_evaluation_module._frozen_float64_dense_oracle
+
+    def failed(problem):
+        promoted, result, residuals = original(problem)
+        return promoted, result, {**residuals, "row": 1.1e-12}
+
+    monkeypatch.setattr(
+        automatic_evaluation_module,
+        "_frozen_float64_dense_oracle",
+        failed,
+    )
+    with pytest.raises(AutomaticEvaluationPolicyAuditError) as caught:
+        automatic_evaluation_module._evaluate(
+            audit_input,
+            geometry,
+            policy,
+            potential,
+            torch.float32,
+        )
+    assert caught.value.reason_code == (
+        "TRANSPORT_ORACLE_CONVERGENCE_FAILURE"
+    )
+    assert caught.value.observed == pytest.approx(1.1e-12)
+    assert caught.value.required == "<= 1e-12"
+
+
+def test_production_float32_nk_fallback_residual_and_oracle_mismatch_fail_closed(
+    tmp_path, monkeypatch
+):
+    resolution = resolve_training_recipe(_nk_recipe(tmp_path))
+    preparation = resolution.automatic_reference_preparation
+    audit_input = preparation._audit_inputs[0]
+    geometry = audit_input.train_geometries[0]
+    policy = preparation.results[0].specification.evaluation_policy
+    potential = resolution.config.model_source.potential
+    original_solve = automatic_evaluation_module.solve_atom_vacancy_ot
+
+    def evaluate(*, oracle=True):
+        return automatic_evaluation_module._evaluate(
+            audit_input,
+            geometry,
+            policy,
+            potential,
+            torch.float32,
+            oracle=oracle,
+        )
+
+    with monkeypatch.context() as current:
+        def fallback(*args, **kwargs):
+            result = original_solve(*args, **kwargs)
+            return replace(result, fallback_used=True)
+
+        current.setattr(
+            automatic_evaluation_module, "solve_atom_vacancy_ot", fallback
+        )
+        with pytest.raises(AutomaticEvaluationPolicyAuditError) as caught:
+            evaluate(oracle=False)
+        assert caught.value.reason_code == "ADAPTIVE_TRANSPORT_FALLBACK"
+
+    with monkeypatch.context() as current:
+        def unconverged(*args, **kwargs):
+            result = original_solve(*args, **kwargs)
+            return replace(
+                result,
+                row_residual=result.row_residual.new_tensor(1.1e-6),
+            )
+
+        current.setattr(
+            automatic_evaluation_module,
+            "solve_atom_vacancy_ot",
+            unconverged,
+        )
+        with pytest.raises(AutomaticEvaluationPolicyAuditError) as caught:
+            evaluate(oracle=False)
+        assert caught.value.reason_code == "TRANSPORT_CONVERGENCE_FAILURE"
+
+    with monkeypatch.context() as current:
+        current.setattr(
+            automatic_evaluation_module,
+            "_tensor_maximum_error",
+            lambda _left, _right: 1.1e-5,
+        )
+        with pytest.raises(AutomaticEvaluationPolicyAuditError) as caught:
+            evaluate()
+        assert caught.value.reason_code == "TRANSPORT_ORACLE_MISMATCH"
 
 
 def test_cold_and_ase_first_share_v2_semantic_identity(
@@ -711,6 +946,17 @@ def test_full_base_census_exceeds_315_while_only_witnesses_are_budgeted(
                 "q": 0.0,
                 "multipoles": 0.0,
             },
+            "frozen_float64_oracle_maximum_errors": {
+                "plan": 0.0,
+                "q": 0.0,
+                "multipoles": 0.0,
+            },
+            "frozen_float64_oracle_residuals": {
+                "row": 0.0,
+                "column": 0.0,
+                "q_mass": 0.0,
+            },
+            "fixed_sinkhorn_float32_diagnostic": None,
             "dense_plan_materialized": True,
         }
         zero = torch.zeros((), dtype=dtype)
@@ -1125,6 +1371,18 @@ def test_automatic_policy_audit_exercises_sparse_edge_list_without_densification
         assert all(record["backend"] == "edge_list" for record in records)
         assert all(not record["dense_plan_materialized"] for record in records)
         assert all(record["support_fingerprint"] for record in records)
+        assert all(
+            max(record["frozen_float64_oracle_residuals"].values())
+            <= 1e-12
+            for record in records
+        )
+    for dtype_name, records in certificate["dtype_diagnostics"].items():
+        tolerance = 1e-5 if dtype_name == "float32" else 1e-10
+        assert all(
+            max(record["frozen_float64_oracle_maximum_errors"].values())
+            <= tolerance
+            for record in records
+        )
 
 
 def test_resolve_validate_and_dry_run_share_the_qualified_policy_snapshot(

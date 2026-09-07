@@ -16,10 +16,145 @@ from refsite_mlip.transport import (
     compact_c2_switch,
     solve_atom_vacancy_ot,
 )
+from refsite_mlip.transport.support import validate_compact_support
 
 
 def _config(cutoff=2.5, width=0.5, skin=0.2):
     return TransportSupportConfig("compact_c2", cutoff, width, skin)
+
+
+def _legacy_compact_c2_polynomial(distances, config):
+    r_on = distances.new_tensor(config.r_on)
+    r_off = distances.new_tensor(config.cutoff)
+    u = (distances - r_on) / (r_off - r_on)
+    return (1.0 - u).pow(3) * (1.0 + 3.0 * u + 6.0 * u.square())
+
+
+def _legacy_compact_c2_switch(distances, config):
+    raw = _legacy_compact_c2_polynomial(distances, config)
+    r_on = distances.new_tensor(config.r_on)
+    r_off = distances.new_tensor(config.cutoff)
+    return torch.where(
+        distances <= r_on,
+        torch.ones_like(distances),
+        torch.where(distances < r_off, raw, torch.zeros_like(distances)),
+    )
+
+
+def test_float32_switch_roundoff_uses_bounded_equivalent_polynomial():
+    config = _config(5.0, 0.5, 0.2)
+    distance32 = torch.tensor([[4.500205993652344]], dtype=torch.float32)
+    legacy32 = _legacy_compact_c2_polynomial(distance32, config)
+    assert legacy32.item() == 1.0000001192092896
+    with pytest.raises(TransportSupportError) as failure:
+        validate_compact_support(distance32, legacy32, config)
+    assert failure.value.reason_code == "NONFINITE_SUPPORT_GEOMETRY"
+
+    switch32 = compact_c2_switch(distance32, config)
+    assert torch.isfinite(switch32).all()
+    assert bool(torch.all((switch32 >= 0.0) & (switch32 <= 1.0)))
+    validate_compact_support(distance32, switch32, config)
+
+    distance64 = distance32.to(torch.float64)
+    legacy64 = _legacy_compact_c2_polynomial(distance64, config)
+    assert legacy64.item() == pytest.approx(0.9999999993011515, abs=1.0e-16)
+    assert 0.0 <= legacy64.item() <= 1.0
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_compact_switch_endpoint_neighborhood_is_finite_and_bounded(dtype):
+    config = _config(5.0, 0.5, 0.2)
+    negative_infinity = torch.tensor(-math.inf, dtype=dtype)
+    positive_infinity = torch.tensor(math.inf, dtype=dtype)
+    r_on = torch.tensor(config.r_on, dtype=dtype)
+    r_off = torch.tensor(config.cutoff, dtype=dtype)
+    values = torch.stack(
+        (
+            torch.nextafter(r_on, negative_infinity),
+            r_on,
+            torch.nextafter(r_on, positive_infinity),
+            torch.tensor(4.500205993652344, dtype=dtype),
+            torch.tensor(4.75, dtype=dtype),
+            torch.nextafter(r_off, negative_infinity),
+            r_off,
+            torch.nextafter(r_off, positive_infinity),
+        )
+    )
+    switch = compact_c2_switch(values, config)
+    assert torch.isfinite(switch).all()
+    assert bool(torch.all((switch >= 0.0) & (switch <= 1.0)))
+    assert torch.equal(switch[:2], torch.ones_like(switch[:2]))
+    assert torch.equal(switch[-2:], torch.zeros_like(switch[-2:]))
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_compact_switch_preserves_every_sampled_valid_legacy_value_bitwise(dtype):
+    config = _config(5.0, 0.5, 0.2)
+    values = torch.cat(
+        (
+            torch.linspace(0.0, 6.0, 20001, dtype=dtype),
+            torch.tensor([4.500205993652344], dtype=dtype),
+        )
+    )
+    raw = _legacy_compact_c2_polynomial(values, config)
+    legacy = _legacy_compact_c2_switch(values, config)
+    fixed = compact_c2_switch(values, config)
+    transition = (values > config.r_on) & (values < config.cutoff)
+    bad = transition & torch.isfinite(raw) & ((raw < 0.0) | (raw > 1.0))
+    assert torch.equal(fixed[~bad], legacy[~bad])
+    if dtype == torch.float32:
+        assert bool(torch.any(bad))
+    else:
+        assert not bool(torch.any(bad))
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_compact_switch_preserves_valid_legacy_values_and_gradients_bitwise(dtype):
+    config = _config(5.0, 0.5, 0.2)
+    legacy_distances = torch.tensor(
+        [4.55, 4.65, 4.75, 4.90], dtype=dtype, requires_grad=True
+    )
+    fixed_distances = legacy_distances.detach().clone().requires_grad_(True)
+    legacy = _legacy_compact_c2_switch(legacy_distances, config)
+    fixed = compact_c2_switch(fixed_distances, config)
+    legacy_gradient = torch.autograd.grad(legacy.sum(), legacy_distances)[0]
+    fixed_gradient = torch.autograd.grad(fixed.sum(), fixed_distances)[0]
+    assert torch.equal(fixed, legacy)
+    assert torch.equal(fixed_gradient, legacy_gradient)
+
+
+def test_compact_switch_open_domain_gradcheck_and_gradgradcheck():
+    config = _config(5.0, 0.5, 0.2)
+    distances = torch.tensor(
+        [4.500205993652344, 4.75, 4.91],
+        dtype=torch.float64,
+        requires_grad=True,
+    )
+    function = lambda value: compact_c2_switch(value, config)
+    assert torch.autograd.gradcheck(
+        function, (distances,), eps=1.0e-6, atol=2.0e-7, rtol=2.0e-5
+    )
+    assert torch.autograd.gradgradcheck(
+        function, (distances,), eps=1.0e-6, atol=2.0e-6, rtol=2.0e-5
+    )
+
+
+def test_float32_repaired_point_has_finite_analytic_first_and_second_derivatives():
+    config = _config(5.0, 0.5, 0.2)
+    distance = torch.tensor(
+        4.500205993652344, dtype=torch.float32, requires_grad=True
+    )
+    switch = compact_c2_switch(distance, config)
+    first = torch.autograd.grad(switch, distance, create_graph=True)[0]
+    second = torch.autograd.grad(first, distance)[0]
+    u = (distance.detach() - config.r_on) / config.switch_width
+    expected_first = -30.0 * u.square() * (1.0 - u).square() / config.switch_width
+    expected_second = (
+        -60.0 * u + 180.0 * u.square() - 120.0 * u.pow(3)
+    ) / config.switch_width**2
+    assert torch.isfinite(first) and torch.isfinite(second)
+    torch.testing.assert_close(first, expected_first, atol=2.0e-11, rtol=2.0e-6)
+    torch.testing.assert_close(second, expected_second, atol=3.0e-8, rtol=2.0e-6)
 
 
 def _solve_distances(distances, *, iterations=256, config=None, tolerance=None):
