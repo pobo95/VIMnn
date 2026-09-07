@@ -90,6 +90,8 @@ training:
   max_epochs: 500
   # Current public optimizer knob; training uses AdamW with zero weight decay.
   learning_rate: 1.0e-3
+  # Default: stop after 15 consecutive validation epochs without improvement.
+  early_stopping_patience: 15
 
 runtime:
   # Use cuda only on a CUDA-capable system; cpu remains supported.

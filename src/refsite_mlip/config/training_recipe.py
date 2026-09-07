@@ -63,8 +63,9 @@ REFERENCE_SPECIFICATION_SCHEMA_VERSION = "refsite_reference_specification_v1"
 RECIPE_RESOLVER_VERSION = "refsite_training_recipe_resolver_v1"
 SYMMETRIC_MODEL_DEFAULTS_VERSION = "symmetric_model_defaults_v1"
 SEQUENTIAL_MODEL_DEFAULTS_VERSION = "sequential_model_defaults_v1"
-TRAINING_DEFAULTS_VERSION = "training_defaults_v1"
+TRAINING_DEFAULTS_VERSION = "training_defaults_v2"
 RADIUS_DERIVATION_VERSION = "radius_derivation_v1"
+DEFAULT_EARLY_STOPPING_PATIENCE = 15
 
 SYMMETRIC_CORRELATION_METHOD = "symmetric"
 SEQUENTIAL_CORRELATION_METHOD = "sequential"
@@ -1090,7 +1091,9 @@ class RecipeTrainingConfig:
     batch_size: int = 4
     validation_batch_size: int | None = None
     learning_rate: float = 1.0e-3
-    early_stopping_patience: int | None = field(default=None, kw_only=True)
+    early_stopping_patience: int | None = field(
+        default=DEFAULT_EARLY_STOPPING_PATIENCE, kw_only=True
+    )
     _provided_fields: tuple[str, ...] = field(default=(), repr=False, compare=False)
 
     def __post_init__(self) -> None:
@@ -1130,7 +1133,10 @@ class RecipeTrainingConfig:
             "max_epochs": self.max_epochs,
             "learning_rate": self.learning_rate,
         }
-        if self.early_stopping_patience is not None:
+        if (
+            self.early_stopping_patience is not None
+            or "early_stopping_patience" in self._provided_fields
+        ):
             result["early_stopping_patience"] = self.early_stopping_patience
         return result
 
@@ -1682,6 +1688,7 @@ _TRAINING_DEFAULTS = {
     "scheduler": "none",
     "monitor": "total_loss",
     "mode": "min",
+    "early_stopping_patience": DEFAULT_EARLY_STOPPING_PATIENCE,
     "save_every_epoch": True,
     "energy_scale": 1.0,
     "force_scale": 1.0,
@@ -2047,8 +2054,9 @@ def _compile_training_recipe_impl(
         "ot_solver.training": "user",
         "ot_solver.inference": "user",
     }
-    if recipe.training.early_stopping_patience is not None:
-        origins["selection.early_stopping_patience"] = "user"
+    origins["selection.early_stopping_patience"] = _origin(
+        recipe.training._provided_fields, "early_stopping_patience"
+    )
     if recipe.model.correlation_method == SYMMETRIC_CORRELATION_METHOD:
         origins.update(
             {

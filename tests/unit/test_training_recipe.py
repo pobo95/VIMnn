@@ -512,14 +512,16 @@ def test_training_and_validation_batch_sizes_map_and_override_independently():
 
 
 def test_recipe_early_stopping_patience_maps_to_validation_selection():
-    legacy_payload = _payload()
-    legacy_recipe = TrainingRecipeConfig.from_dict(legacy_payload)
-    legacy_resolved = compile_training_recipe(legacy_recipe, (_spec(),))
-    assert legacy_recipe.training.early_stopping_patience is None
-    assert "early_stopping_patience" not in legacy_recipe.to_dict()["training"]
-    assert legacy_resolved.config.selection.early_stopping_patience is None
-    assert "selection.early_stopping_patience" not in dict(
-        legacy_resolved.manifest.field_origins
+    default_recipe = TrainingRecipeConfig.from_dict(_payload())
+    default_resolved = compile_training_recipe(default_recipe, (_spec(),))
+    assert default_recipe.training.early_stopping_patience == 15
+    assert default_recipe.to_dict()["training"]["early_stopping_patience"] == 15
+    assert default_resolved.config.selection.early_stopping_patience == 15
+    assert dict(default_resolved.manifest.field_origins)[
+        "selection.early_stopping_patience"
+    ] == "preset"
+    assert dict(default_resolved.manifest.preset_versions)["training"] == (
+        "training_defaults_v2"
     )
 
     payload = _payload()
@@ -535,8 +537,21 @@ def test_recipe_early_stopping_patience_maps_to_validation_selection():
     assert dict(resolved.manifest.field_origins)[
         "selection.early_stopping_patience"
     ] == "user"
-    assert resolved.config.config_fingerprint != (
-        legacy_resolved.config.config_fingerprint
+    assert resolved.config.config_fingerprint == (
+        default_resolved.config.config_fingerprint
+    )
+
+    disabled_payload = _payload()
+    disabled_payload["training"]["early_stopping_patience"] = None
+    disabled_recipe = TrainingRecipeConfig.from_dict(disabled_payload)
+    disabled_resolved = compile_training_recipe(disabled_recipe, (_spec(),))
+    assert disabled_recipe.to_dict()["training"]["early_stopping_patience"] is None
+    assert disabled_resolved.config.selection.early_stopping_patience is None
+    assert dict(disabled_resolved.manifest.field_origins)[
+        "selection.early_stopping_patience"
+    ] == "user"
+    assert disabled_resolved.config.config_fingerprint != (
+        default_resolved.config.config_fingerprint
     )
 
 
