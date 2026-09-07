@@ -2430,6 +2430,7 @@ def resolve_training_recipe(
         if recipe.ot_solver.inference == SINKHORN_NEWTON_KRYLOV_OT_SOLVER:
             from .automatic_evaluation import (
                 AutomaticEvaluationPolicyAuditError,
+                automatic_evaluation_certificate_semantic_identity,
                 qualify_automatic_evaluation_policies,
             )
 
@@ -2461,7 +2462,21 @@ def resolve_training_recipe(
             compiled.manifest,
             automatic_reference_fingerprint=automatic.content_fingerprint,
             automatic_reference_certificates=tuple(
-                (result.template_id, result.to_dict())
+                (
+                    result.template_id,
+                    (
+                        result.to_dict()
+                        if result.evaluation_certificate is None
+                        else {
+                            **result.to_dict(),
+                            "evaluation_certificate": (
+                                automatic_evaluation_certificate_semantic_identity(
+                                    result.evaluation_certificate
+                                )
+                            ),
+                        }
+                    ),
+                )
                 for result in automatic.results
             ),
         )

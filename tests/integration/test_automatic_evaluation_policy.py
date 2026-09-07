@@ -8,6 +8,7 @@ from pathlib import Path
 import random
 import subprocess
 import sys
+import textwrap
 from types import MappingProxyType, SimpleNamespace
 
 import numpy as np
@@ -23,10 +24,15 @@ from refsite_mlip.cli.export_bundle import export_bundle
 from refsite_mlip.cli.resolve_train_config import render_resolution_human
 from refsite_mlip.cli.resume import resume_training
 from refsite_mlip.config import (
+    AUTOMATIC_EVALUATION_CERTIFICATE_SCHEMA_VERSION_V1,
+    AUTOMATIC_EVALUATION_CERTIFICATE_SCHEMA_VERSION_V2,
     AUTOMATIC_EVALUATION_POLICY_AUDIT_VERSION,
+    AUTOMATIC_EVALUATION_SEMANTIC_PROJECTION_VERSION,
     AutomaticEvaluationPolicyAuditError,
+    automatic_evaluation_certificate_semantic_identity,
     qualify_automatic_evaluation_policies,
     resolve_training_recipe,
+    validate_automatic_evaluation_certificate,
 )
 from refsite_mlip.models import load_reference_site_model_bundle
 from refsite_mlip.training import (
@@ -36,7 +42,23 @@ from refsite_mlip.training import (
 )
 
 from test_scratch_training_preparation import _atoms, _labeled, _partially_labeled
+from test_bundle_predictor_runtime import _save_case
 from test_training_recipe_cli import _write_automatic_recipe
+
+
+_V1_EVALUATION_CERTIFICATE_SHA256 = (
+    "31709e0c31c25f012c91dd5c57dce85fb92a0924f41d9162ec3e023677be8dea"
+)
+_V1_HISTORICAL_POSITION_RELATIVE_DIAGNOSTIC = 8.51007437861865e-08
+_V2_EVALUATION_SEMANTIC_SHA256 = (
+    "d0d79b4022d2977b6e58c390a4305b92f913df6b693b8cf5c63c464705a2f905"
+)
+_V2_AUTOMATIC_PREPARATION_SHA256 = (
+    "f4e95ac28666a64fa3f418b29ac0f87242570fc5055e889c534a57fe81d39719"
+)
+_NK_CONFIG_SHA256 = (
+    "44857e1e0e66b1a9ecdf785e72a185e6b7d1e5f664ef17d47801d07ea49a7d7c"
+)
 
 
 def _stable_reference():
@@ -86,6 +108,42 @@ def _assert_tree_equal(left, right):
         assert left == right
 
 
+def _plain_copy(value):
+    return json.loads(canonical_runtime_json(value))
+
+
+def _rehash_evaluation_certificate(certificate):
+    result = _plain_copy(certificate)
+    result.pop("evaluation_certificate_sha256", None)
+    result["evaluation_certificate_sha256"] = hashlib.sha256(
+        canonical_runtime_json(result).encode("utf-8")
+    ).hexdigest()
+    return result
+
+
+def _as_legacy_v1_evaluation_certificate(certificate):
+    result = _plain_copy(certificate)
+    result["schema_version"] = (
+        AUTOMATIC_EVALUATION_CERTIFICATE_SCHEMA_VERSION_V1
+    )
+    for key in (
+        "semantic_projection_version",
+        "normative_outcomes",
+        "evaluation_semantic_fingerprint_sha256",
+        "evaluation_certificate_sha256",
+    ):
+        result.pop(key, None)
+    for probe in result["derivative_probes"]:
+        probe.pop("branch_agreement", None)
+    # Reconstruct the already-released cold-process v1 artifact.  This is a
+    # test fixture value, not production quantization: v1 remains a byte-exact
+    # integrity format and is never rewritten by the decoder.
+    result["derivative_probes"][2][
+        "position_maximum_relative_error"
+    ] = _V1_HISTORICAL_POSITION_RELATIVE_DIAGNOSTIC
+    return _rehash_evaluation_certificate(result)
+
+
 def test_poscar_only_newton_krylov_policy_audit_is_deterministic_and_geometry_only(
     tmp_path,
 ):
@@ -112,8 +170,30 @@ def test_poscar_only_newton_krylov_policy_audit_is_deterministic_and_geometry_on
     )
     certificate = result.evaluation_certificate
     assert certificate is not None
-    assert certificate["evaluation_certificate_sha256"] == (
-        "31709e0c31c25f012c91dd5c57dce85fb92a0924f41d9162ec3e023677be8dea"
+    assert certificate["schema_version"] == (
+        AUTOMATIC_EVALUATION_CERTIFICATE_SCHEMA_VERSION_V2
+    )
+    assert certificate["semantic_projection_version"] == (
+        AUTOMATIC_EVALUATION_SEMANTIC_PROJECTION_VERSION
+    )
+    assert certificate["evaluation_semantic_fingerprint_sha256"] == (
+        _V2_EVALUATION_SEMANTIC_SHA256
+    )
+    assert certificate["evaluation_certificate_sha256"] != (
+        certificate["evaluation_semantic_fingerprint_sha256"]
+    )
+    assert validate_automatic_evaluation_certificate(certificate) == (
+        _plain_copy(certificate)
+    )
+    assert first.automatic_reference_preparation.content_fingerprint == (
+        _V2_AUTOMATIC_PREPARATION_SHA256
+    )
+    assert first.config.content_fingerprint == _NK_CONFIG_SHA256
+    manifest_reference = dict(
+        first.manifest.automatic_reference_certificates
+    )[result.template_id]
+    assert manifest_reference["evaluation_certificate"] == (
+        automatic_evaluation_certificate_semantic_identity(certificate)
     )
     assert certificate["audit_convention_version"] == (
         AUTOMATIC_EVALUATION_POLICY_AUDIT_VERSION
@@ -192,7 +272,15 @@ def test_poscar_only_newton_krylov_policy_audit_is_deterministic_and_geometry_on
     assert changed.specification.evaluation_policy.content_fingerprint == (
         result.specification.evaluation_policy.content_fingerprint
     )
-    assert changed.evaluation_certificate == result.evaluation_certificate
+    assert changed.evaluation_certificate[
+        "evaluation_semantic_fingerprint_sha256"
+    ] == certificate["evaluation_semantic_fingerprint_sha256"]
+    assert changed_labels.automatic_reference_preparation.content_fingerprint == (
+        first.automatic_reference_preparation.content_fingerprint
+    )
+    assert changed_labels.manifest.content_fingerprint == (
+        first.manifest.content_fingerprint
+    )
     changed_data = prepare_scratch_training_run(
         changed_labels.config,
         automatic_reference_preparation=(
@@ -229,7 +317,9 @@ def test_poscar_only_newton_krylov_policy_audit_is_deterministic_and_geometry_on
     assert relocated_result.specification.evaluation_policy.content_fingerprint == (
         result.specification.evaluation_policy.content_fingerprint
     )
-    assert relocated_result.evaluation_certificate == result.evaluation_certificate
+    assert relocated_result.evaluation_certificate[
+        "evaluation_semantic_fingerprint_sha256"
+    ] == certificate["evaluation_semantic_fingerprint_sha256"]
 
     assert random.getstate() == python_state
     assert np.array_equal(np.random.get_state()[1], numpy_state[1])
@@ -286,19 +376,34 @@ def test_mixed_template_policy_audit_records_k0_k1_k2_and_is_order_independent(
     assert automatic.to_dict() == second.automatic_reference_preparation.to_dict()
 
 
-def test_policy_certificate_is_exact_across_thread_and_process_boundaries(tmp_path):
+def test_policy_certificate_semantic_identity_is_exact_across_thread_and_process_boundaries(
+    tmp_path,
+):
     recipe = _nk_recipe(tmp_path)
 
-    def resolve_certificate() -> str:
+    def resolve_identity() -> dict[str, str]:
         result = resolve_training_recipe(recipe)
         certificate = result.automatic_reference_preparation.to_dict()[
             "references"
         ][0]["evaluation_certificate"]
-        return json.dumps(certificate, sort_keys=True, separators=(",", ":"))
+        return {
+            "semantic": certificate[
+                "evaluation_semantic_fingerprint_sha256"
+            ],
+            "preparation": result.automatic_reference_preparation.content_fingerprint,
+            "config": result.config.content_fingerprint,
+            "status": certificate["status"],
+        }
 
-    expected = resolve_certificate()
+    expected = resolve_identity()
+    assert expected == {
+        "semantic": _V2_EVALUATION_SEMANTIC_SHA256,
+        "preparation": _V2_AUTOMATIC_PREPARATION_SHA256,
+        "config": _NK_CONFIG_SHA256,
+        "status": "qualified",
+    }
     with ThreadPoolExecutor(max_workers=1) as executor:
-        assert executor.submit(resolve_certificate).result() == expected
+        assert executor.submit(resolve_identity).result() == expected
 
     command = (
         "import json,sys; "
@@ -306,7 +411,10 @@ def test_policy_certificate_is_exact_across_thread_and_process_boundaries(tmp_pa
         "r=resolve_training_recipe(sys.argv[1]); "
         "c=r.automatic_reference_preparation.to_dict()['references'][0]"
         "['evaluation_certificate']; "
-        "print(json.dumps(c,sort_keys=True,separators=(',',':')))"
+        "print(json.dumps({'semantic':c['evaluation_semantic_fingerprint_sha256'],"
+        "'preparation':r.automatic_reference_preparation.content_fingerprint,"
+        "'config':r.config.content_fingerprint,'status':c['status']},"
+        "sort_keys=True,separators=(',',':')))"
     )
     outputs = []
     for _ in range(2):
@@ -316,8 +424,198 @@ def test_policy_certificate_is_exact_across_thread_and_process_boundaries(tmp_pa
             capture_output=True,
             text=True,
         )
-        outputs.append(completed.stdout.strip())
+        outputs.append(json.loads(completed.stdout.strip()))
     assert outputs == [expected, expected]
+
+
+def test_v2_certificate_separates_semantic_identity_from_raw_integrity(tmp_path):
+    resolution = resolve_training_recipe(_nk_recipe(tmp_path))
+    certificate = resolution.automatic_reference_preparation.to_dict()[
+        "references"
+    ][0]["evaluation_certificate"]
+    assert automatic_evaluation_certificate_semantic_identity(certificate) == {
+        "schema_version": AUTOMATIC_EVALUATION_CERTIFICATE_SCHEMA_VERSION_V2,
+        "audit_convention_version": AUTOMATIC_EVALUATION_POLICY_AUDIT_VERSION,
+        "semantic_projection_version": (
+            AUTOMATIC_EVALUATION_SEMANTIC_PROJECTION_VERSION
+        ),
+        "evaluation_semantic_fingerprint_sha256": (
+            _V2_EVALUATION_SEMANTIC_SHA256
+        ),
+    }
+
+    raw_only = _plain_copy(certificate)
+    raw_only["derivative_probes"][0][
+        "position_maximum_relative_error"
+    ] += 1.0e-9
+    raw_only = _rehash_evaluation_certificate(raw_only)
+    assert raw_only["evaluation_certificate_sha256"] != (
+        certificate["evaluation_certificate_sha256"]
+    )
+    assert validate_automatic_evaluation_certificate(raw_only)[
+        "evaluation_semantic_fingerprint_sha256"
+    ] == certificate["evaluation_semantic_fingerprint_sha256"]
+    original_result = resolution.automatic_reference_preparation.results[0]
+    raw_only_result = replace(
+        original_result, evaluation_certificate=raw_only
+    )
+    assert raw_only_result.semantic_dict() == original_result.semantic_dict()
+
+    same_outcome = _plain_copy(certificate)
+    objective_record = same_outcome["dtype_diagnostics"]["float64"][0]
+    objective_record["objective_gap"] *= 1.0000001
+    same_outcome = _rehash_evaluation_certificate(same_outcome)
+    assert validate_automatic_evaluation_certificate(same_outcome)[
+        "evaluation_semantic_fingerprint_sha256"
+    ] == certificate["evaluation_semantic_fingerprint_sha256"]
+
+    integrity_corruption = _plain_copy(certificate)
+    integrity_corruption["derivative_probes"][0][
+        "position_maximum_relative_error"
+    ] += 1.0e-9
+    with pytest.raises(AutomaticEvaluationPolicyAuditError) as integrity:
+        validate_automatic_evaluation_certificate(integrity_corruption)
+    assert integrity.value.reason_code == (
+        "EVALUATION_CERTIFICATE_INTEGRITY_MISMATCH"
+    )
+
+    threshold_corruption = _plain_copy(certificate)
+    threshold_corruption["dtype_diagnostics"]["float64"][0][
+        "objective_gap"
+    ] = 0.0
+    threshold_corruption = _rehash_evaluation_certificate(
+        threshold_corruption
+    )
+    with pytest.raises(AutomaticEvaluationPolicyAuditError) as qualification:
+        validate_automatic_evaluation_certificate(threshold_corruption)
+    assert qualification.value.reason_code == (
+        "EVALUATION_CERTIFICATE_QUALIFICATION_FAILED"
+    )
+
+    for field, value in (
+        ("selected_group", 999),
+        ("semantic_support_fingerprint", "0" * 64),
+        ("fallback_used", True),
+    ):
+        categorical = _plain_copy(certificate)
+        categorical["dtype_diagnostics"]["float64"][0][field] = value
+        categorical = _rehash_evaluation_certificate(categorical)
+        with pytest.raises(AutomaticEvaluationPolicyAuditError):
+            validate_automatic_evaluation_certificate(categorical)
+
+
+def test_legacy_v1_evaluation_certificate_sha_and_decoder_are_preserved(tmp_path):
+    certificate = resolve_training_recipe(
+        _nk_recipe(tmp_path)
+    ).automatic_reference_preparation.to_dict()["references"][0][
+        "evaluation_certificate"
+    ]
+    legacy = _as_legacy_v1_evaluation_certificate(certificate)
+    assert legacy["evaluation_certificate_sha256"] == (
+        _V1_EVALUATION_CERTIFICATE_SHA256
+    )
+    assert validate_automatic_evaluation_certificate(legacy) == legacy
+    assert automatic_evaluation_certificate_semantic_identity(legacy) == legacy
+
+
+def test_cold_and_ase_first_share_v2_semantic_identity(
+    typed_crystal, tmp_path
+):
+    recipe_root = tmp_path / "recipe"
+    recipe_root.mkdir()
+    recipe = _nk_recipe(recipe_root)
+    bundle_root = tmp_path / "bundle"
+    bundle_root.mkdir()
+    *_, bundle_path = _save_case(typed_crystal, bundle_root)
+    program = textwrap.dedent(
+        """
+        import json
+        import sys
+        import numpy as np
+        import torch
+        from ase import Atoms
+        from refsite_mlip.config import resolve_training_recipe
+        from refsite_mlip.interfaces import ReferenceSiteASECalculator
+
+        recipe, bundle, order = sys.argv[1:]
+
+        def certificate():
+            resolution = resolve_training_recipe(recipe)
+            cert = resolution.automatic_reference_preparation.to_dict()[\
+                "references"][0]["evaluation_certificate"]
+            return {
+                "status": cert["status"],
+                "semantic": cert["evaluation_semantic_fingerprint_sha256"],
+                "content": cert["evaluation_certificate_sha256"],
+                "preparation": resolution.automatic_reference_preparation.content_fingerprint,
+                "config": resolution.config.content_fingerprint,
+                "policy": cert["policy_fingerprint"],
+                "outcomes": cert["normative_outcomes"],
+                "position_relative": [
+                    item["position_maximum_relative_error"]
+                    for item in cert["derivative_probes"]
+                ],
+            }
+
+        def ase_force_stress():
+            calculator = ReferenceSiteASECalculator(
+                bundle,
+                template_id="zeta",
+                dtype=torch.float64,
+                solver_path="train_fixed",
+            )
+            template = calculator.predictor.registry.resolve("zeta")
+            site_types = template.topology.site_types.detach().cpu().numpy()
+            vocabulary = np.asarray(template.supported_species, dtype=np.int64)
+            atoms = Atoms(
+                numbers=vocabulary[site_types],
+                positions=(
+                    template.topology.reference_fractional
+                    @ template.topology.reference_cell
+                ).detach().cpu().numpy(),
+                cell=template.topology.reference_cell.detach().cpu().numpy(),
+                pbc=True,
+            )
+            atoms.calc = calculator
+            assert np.isfinite(atoms.get_forces()).all()
+            assert np.isfinite(atoms.get_stress()).all()
+
+        if order == "cold":
+            values = [certificate()]
+        elif order == "certificate-ase-certificate":
+            values = [certificate()]
+            ase_force_stress()
+            values.append(certificate())
+        else:
+            ase_force_stress()
+            values = [certificate()]
+        print(json.dumps(values, sort_keys=True, separators=(",", ":")))
+        """
+    )
+
+    def run(order):
+        completed = subprocess.run(
+            [sys.executable, "-c", program, str(recipe), str(bundle_path), order],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return json.loads(completed.stdout.strip())
+
+    cold = run("cold")[0]
+    around = run("certificate-ase-certificate")
+    ase_first = run("ase-certificate")[0]
+    for value in (cold, *around, ase_first):
+        assert value["status"] == "qualified"
+        assert value["semantic"] == _V2_EVALUATION_SEMANTIC_SHA256
+        assert value["preparation"] == _V2_AUTOMATIC_PREPARATION_SHA256
+        assert value["config"] == _NK_CONFIG_SHA256
+        assert value["policy"] == (
+            "91813ca851baec9cd98b8f6a2cb4b8a9020c8c92669d97e8b7621a8b355e02ca"
+        )
+        assert value["outcomes"] == cold["outcomes"]
+    if cold["content"] != ase_first["content"]:
+        assert cold["position_relative"] != ase_first["position_relative"]
 
 
 def test_full_base_census_exceeds_315_while_only_witnesses_are_budgeted(

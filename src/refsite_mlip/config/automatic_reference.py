@@ -43,7 +43,11 @@ from refsite_mlip.phase.stabilizer import (
 )
 
 
-AUTO_REFERENCE_CONVENTION_VERSION = "poscar_first_reference_preparation_v1"
+AUTO_REFERENCE_CONVENTION_VERSION_V1 = "poscar_first_reference_preparation_v1"
+AUTO_REFERENCE_CONVENTION_VERSION_V2 = (
+    "poscar_first_reference_preparation_evaluation_semantics_v2"
+)
+AUTO_REFERENCE_CONVENTION_VERSION = AUTO_REFERENCE_CONVENTION_VERSION_V1
 AUTO_STRAIN_POLICY_VERSION = "dataset_bounded_strain_margin_v1"
 AUTO_PHASE_SEARCH_VERSION = "bounded_typed_reciprocal_search_v1"
 AUTO_STRAIN_MARGIN = 0.005
@@ -238,8 +242,14 @@ class AutomaticReferenceResult:
 
         result = _plain(self.certificate)
         if self.evaluation_certificate is not None:
-            result["evaluation_certificate"] = _plain(
-                self.evaluation_certificate
+            from .automatic_evaluation import (
+                automatic_evaluation_certificate_semantic_identity,
+            )
+
+            result["evaluation_certificate"] = (
+                automatic_evaluation_certificate_semantic_identity(
+                    self.evaluation_certificate
+                )
             )
         return result
 
@@ -1258,6 +1268,8 @@ def prepare_automatic_references(
 __all__ = [
     "AUTO_PHASE_SEARCH_VERSION",
     "AUTO_REFERENCE_CONVENTION_VERSION",
+    "AUTO_REFERENCE_CONVENTION_VERSION_V1",
+    "AUTO_REFERENCE_CONVENTION_VERSION_V2",
     "AUTO_STRAIN_CEILING",
     "AUTO_STRAIN_GRID",
     "AUTO_STRAIN_MARGIN",

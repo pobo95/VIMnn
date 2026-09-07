@@ -255,19 +255,29 @@ def _certificates(
                     stage="reference_materialization.evaluation_certificate",
                     template_id=template_id,
                 )
-            evaluation = _plain(evaluation_certificate)
-            declared_evaluation = evaluation.get(
-                "evaluation_certificate_sha256"
+            from refsite_mlip.config import (
+                AutomaticEvaluationPolicyAuditError,
+                validate_automatic_evaluation_certificate,
             )
-            evaluation_content = dict(evaluation)
-            evaluation_content.pop("evaluation_certificate_sha256", None)
-            if declared_evaluation != _fingerprint(evaluation_content):
+
+            try:
+                evaluation = validate_automatic_evaluation_certificate(
+                    evaluation_certificate
+                )
+            except AutomaticEvaluationPolicyAuditError as error:
+                reason = (
+                    "EVALUATION_CERTIFICATE_FINGERPRINT_MISMATCH"
+                    if error.reason_code
+                    == "EVALUATION_CERTIFICATE_INTEGRITY_MISMATCH"
+                    else "INVALID_AUTOMATIC_EVALUATION_CERTIFICATE"
+                )
                 raise AutomaticReferenceMaterializationError(
-                    "EVALUATION_CERTIFICATE_FINGERPRINT_MISMATCH",
-                    "automatic evaluation certificate fingerprint differs from content",
+                    reason,
+                    "automatic evaluation certificate validation failed",
                     stage="reference_materialization.evaluation_certificate",
                     template_id=template_id,
-                )
+                    original_error=error,
+                ) from error
             evaluation_certificates[template_id] = evaluation
     _safe_template_ids(tuple(certificates))
     return payload, certificates, evaluation_certificates
@@ -571,6 +581,25 @@ def materialize_automatic_references(
                     evaluation_path,
                     stage="reference_materialization.evaluation_certificate_reload",
                 )
+                from refsite_mlip.config import (
+                    AutomaticEvaluationPolicyAuditError,
+                    validate_automatic_evaluation_certificate,
+                )
+
+                try:
+                    loaded_evaluation = validate_automatic_evaluation_certificate(
+                        loaded_evaluation
+                    )
+                except AutomaticEvaluationPolicyAuditError as error:
+                    raise AutomaticReferenceMaterializationError(
+                        "EVALUATION_CERTIFICATE_RELOAD_CONTENT_MISMATCH",
+                        "reloaded evaluation certificate failed strict validation",
+                        stage="reference_materialization.evaluation_certificate_reload",
+                        template_id=template_id,
+                        path=evaluation_path,
+                        completed_files=completed,
+                        original_error=error,
+                    ) from error
             if loaded.to_dict() != specifications[template_id].to_dict():
                 raise AutomaticReferenceMaterializationError(
                     "REFERENCE_RELOAD_CONTENT_MISMATCH",
@@ -654,6 +683,13 @@ def materialize_automatic_references(
                 entries[template_id]["evaluation_certificate_fingerprint"] = (
                     loaded_evaluation["evaluation_certificate_sha256"]
                 )
+                semantic_fingerprint = loaded_evaluation.get(
+                    "evaluation_semantic_fingerprint_sha256"
+                )
+                if semantic_fingerprint is not None:
+                    entries[template_id][
+                        "evaluation_certificate_semantic_fingerprint"
+                    ] = semantic_fingerprint
 
         rebound_sources = tuple(
             replace(
@@ -921,19 +957,41 @@ def validate_materialized_reference_files(
                     template_id=template_id,
                 )
         else:
-            declared_evaluation = evaluation_certificate.get(
-                "evaluation_certificate_sha256"
+            from refsite_mlip.config import (
+                AutomaticEvaluationPolicyAuditError,
+                validate_automatic_evaluation_certificate,
             )
-            evaluation_content = dict(evaluation_certificate)
-            evaluation_content.pop("evaluation_certificate_sha256", None)
+
+            try:
+                evaluation_certificate = validate_automatic_evaluation_certificate(
+                    evaluation_certificate
+                )
+            except AutomaticEvaluationPolicyAuditError as error:
+                raise AutomaticReferenceMaterializationError(
+                    "EVALUATION_CERTIFICATE_BINDING_MISMATCH",
+                    "persisted evaluation certificate failed strict validation",
+                    stage="reference_materialization.validate",
+                    template_id=template_id,
+                    path=evaluation_path,
+                    original_error=error,
+                ) from error
+            declared_evaluation = evaluation_certificate[
+                "evaluation_certificate_sha256"
+            ]
+            semantic_evaluation = evaluation_certificate.get(
+                "evaluation_semantic_fingerprint_sha256"
+            )
             if (
-                declared_evaluation != _fingerprint(evaluation_content)
-                or policy is None
+                policy is None
                 or binding.evaluation_policy is None
                 or policy.content_fingerprint
                 != binding.evaluation_policy.content_fingerprint
                 or entry.get("evaluation_certificate_fingerprint")
                 != declared_evaluation
+                or entry.get(
+                    "evaluation_certificate_semantic_fingerprint"
+                )
+                != semantic_evaluation
                 or evaluation_certificate.get("status") != "qualified"
                 or evaluation_certificate.get("scope")
                 != "assigned_dataset_local_neighborhood"

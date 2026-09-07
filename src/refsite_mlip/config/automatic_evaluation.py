@@ -58,8 +58,17 @@ from refsite_mlip.transport import (
 AUTOMATIC_EVALUATION_POLICY_AUDIT_VERSION = (
     "automatic_evaluation_policy_audit_v1"
 )
-AUTOMATIC_EVALUATION_CERTIFICATE_SCHEMA_VERSION = (
+AUTOMATIC_EVALUATION_CERTIFICATE_SCHEMA_VERSION_V1 = (
     "refsite_automatic_evaluation_certificate_v1"
+)
+AUTOMATIC_EVALUATION_CERTIFICATE_SCHEMA_VERSION_V2 = (
+    "refsite_automatic_evaluation_certificate_v2"
+)
+AUTOMATIC_EVALUATION_CERTIFICATE_SCHEMA_VERSION = (
+    AUTOMATIC_EVALUATION_CERTIFICATE_SCHEMA_VERSION_V2
+)
+AUTOMATIC_EVALUATION_SEMANTIC_PROJECTION_VERSION = (
+    "automatic_evaluation_certificate_semantic_projection_v1"
 )
 AUTOMATIC_EVALUATION_SCOPE = "assigned_dataset_local_neighborhood"
 AUTOMATIC_EVALUATION_CANDIDATE_GENERATION_VERSION = (
@@ -192,6 +201,552 @@ def _fingerprint(value: Mapping[str, Any]) -> str:
         allow_nan=False,
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+_QUALIFICATION_FIELDS = (
+    "status",
+    "scope",
+    "phase_approval",
+    "differentiability_scope",
+    "hard_branch_frozen",
+    "future_md_guarantee",
+    "cuda_qualified",
+    "create_graph_supported",
+    "force_loss_double_backward_supported",
+    "inference_mode_derivative_supported",
+    "derivative_fallback_supported",
+    "adaptive_stopping_differentiated",
+    "hard_candidate_group_indices_differentiated",
+)
+_BINDING_FIELDS = (
+    "template_id",
+    "policy_fingerprint",
+    "template_fingerprint",
+    "structural_certificate_sha256",
+    "specification_sha256",
+    "artifact_sha256",
+    "phase_specification_sha256",
+    "radius_fingerprint",
+)
+_CANDIDATE_DEFINITION_FIELDS = (
+    "convention_version",
+    "primary_mode_matrix",
+    "primary_coordinate_mode_matrix",
+    "primary_coordinate_bandlimit",
+    "primary_coordinate_l1_bandlimit",
+    "primary_coordinate_axis_bandlimits",
+    "maximum_supported_primary_coordinate_bandlimit",
+    "alias_kernel_order",
+    "alias_kernel_fingerprint",
+    "typed_stabilizer_fingerprint",
+    "runtime_grid_resolution",
+    "broader_audit_grid_resolution",
+    "runtime_raw_candidate_count",
+    "broader_audit_raw_candidate_count",
+    "runtime_candidate_count",
+    "broader_audit_candidate_count",
+    "runtime_candidate_fingerprint",
+    "broader_audit_candidate_fingerprint",
+    "stabilizer_reduction_rule",
+    "selected_groups_by_geometry",
+)
+_NORMATIVE_COMPARATORS = {
+    "objective_gap_passed": "> minimum_objective_gap_absolute",
+    "atomic_amplitude_passed": "> minimum_atomic_amplitude_absolute",
+    "reference_amplitude_passed": "> minimum_reference_amplitude_absolute",
+    "cross_amplitude_passed": "> minimum_cross_amplitude_absolute",
+    "hessian_curvature_passed": "> minimum_curvature",
+    "hessian_condition_passed": "< maximum_condition",
+    "phase_residual_passed": "< maximum_gradient_norm",
+    "transport_row_residual_passed": "<= dtype transport_tolerance",
+    "transport_column_residual_passed": "<= dtype transport_tolerance",
+    "vacancy_mass_residual_passed": "<= dtype transport_tolerance",
+    "transport_oracle_passed": "<= dtype oracle_tolerance",
+    "support_margin_passed": "> 0",
+    "mic_margin_passed": "> 0 for dense; not normative for edge_list",
+    "fallback_free": "is true",
+    "runtime_sparse_non_densified": "is true for edge_list",
+    "same_stabilizer_group": "is true",
+    "alternate_basin_gap_passed": (
+        "is absent or > minimum_objective_gap_absolute"
+    ),
+    "position_absolute_fd_passed": "<= first_derivative_fd_tolerance",
+    "strain_absolute_fd_passed": "<= first_derivative_fd_tolerance",
+    "all_probe_branches_agree": "is true",
+    "cross_dtype_branch_agreement": "is true",
+    "fallback_count_matches": "is true",
+}
+
+
+def _require_mapping(value: Any, name: str) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise AutomaticEvaluationPolicyAuditError(
+            "INVALID_EVALUATION_CERTIFICATE",
+            f"{name} must be a mapping",
+        )
+    return value
+
+
+def _require_list(value: Any, name: str) -> list[Any]:
+    if not isinstance(value, list):
+        raise AutomaticEvaluationPolicyAuditError(
+            "INVALID_EVALUATION_CERTIFICATE",
+            f"{name} must be a list",
+        )
+    return value
+
+
+def _numeric(value: Any, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise AutomaticEvaluationPolicyAuditError(
+            "INVALID_EVALUATION_CERTIFICATE",
+            f"{name} must be a finite number",
+        )
+    result = float(value)
+    if not math.isfinite(result):
+        raise AutomaticEvaluationPolicyAuditError(
+            "NONFINITE_AUDIT_RESULT",
+            f"{name} is nonfinite",
+        )
+    return result
+
+
+def _record_identity(record: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "sample_id": record["sample_id"],
+        "split": record["split"],
+        "geometry_digest": record["geometry_digest"],
+        "K": record["K"],
+        "composition": record["composition"],
+        "dtype": record["dtype"],
+        "backend": record["backend"],
+    }
+
+
+def _normative_outcomes(certificate: Mapping[str, Any]) -> dict[str, Any]:
+    """Recompute pass/fail claims from unrounded full-precision telemetry.
+
+    Relative derivative errors and other continuous diagnostics are deliberately
+    informational.  Qualification continues to use the existing absolute
+    comparators and production thresholds before this projection is created.
+    """
+
+    profile = _require_mapping(certificate.get("profile"), "profile")
+    expected_profile = _plain(automatic_evaluation_policy_profile())
+    if _plain(profile) != expected_profile:
+        raise AutomaticEvaluationPolicyAuditError(
+            "EVALUATION_CERTIFICATE_PROFILE_MISMATCH",
+            "certificate profile differs from the versioned audit profile",
+        )
+    diagnostics = _require_mapping(
+        certificate.get("dtype_diagnostics"), "dtype_diagnostics"
+    )
+    if set(diagnostics) != {"float32", "float64"}:
+        raise AutomaticEvaluationPolicyAuditError(
+            "INVALID_EVALUATION_CERTIFICATE",
+            "certificate must contain float32 and float64 diagnostics",
+        )
+    record_checks: dict[str, list[dict[str, Any]]] = {}
+    by_dtype: dict[str, dict[tuple[Any, ...], Mapping[str, Any]]] = {}
+    fallback_count = 0
+    for dtype_name in ("float32", "float64"):
+        records = _require_list(diagnostics[dtype_name], dtype_name)
+        if not records:
+            raise AutomaticEvaluationPolicyAuditError(
+                "INVALID_EVALUATION_CERTIFICATE",
+                f"{dtype_name} diagnostics must not be empty",
+            )
+        tolerance = _numeric(
+            profile[f"transport_tolerance_{dtype_name}"],
+            f"transport_tolerance_{dtype_name}",
+        )
+        oracle_tolerance = _numeric(
+            profile[f"oracle_tolerance_{dtype_name}"],
+            f"oracle_tolerance_{dtype_name}",
+        )
+        values: list[dict[str, Any]] = []
+        identities: dict[tuple[Any, ...], Mapping[str, Any]] = {}
+        for index, raw in enumerate(records):
+            record = _require_mapping(raw, f"{dtype_name}[{index}]")
+            if record.get("dtype") != dtype_name:
+                raise AutomaticEvaluationPolicyAuditError(
+                    "INVALID_EVALUATION_CERTIFICATE",
+                    "diagnostic dtype key and record disagree",
+                )
+            identity = _record_identity(record)
+            key = (
+                identity["split"],
+                identity["sample_id"],
+                identity["geometry_digest"],
+            )
+            if key in identities:
+                raise AutomaticEvaluationPolicyAuditError(
+                    "INVALID_EVALUATION_CERTIFICATE",
+                    "duplicate dtype diagnostic identity",
+                )
+            identities[key] = record
+            oracle = _require_mapping(
+                record.get("oracle_maximum_errors"),
+                "oracle_maximum_errors",
+            )
+            fallback = record.get("fallback_used") is True
+            fallback_count += int(fallback)
+            backend = record.get("backend")
+            checks = {
+                "objective_gap_passed": _numeric(
+                    record.get("objective_gap"), "objective_gap"
+                )
+                > _numeric(
+                    profile["minimum_objective_gap_absolute"],
+                    "minimum_objective_gap_absolute",
+                ),
+                "atomic_amplitude_passed": _numeric(
+                    record.get("minimum_atomic_amplitude"),
+                    "minimum_atomic_amplitude",
+                )
+                > _numeric(
+                    profile["minimum_atomic_amplitude_absolute"],
+                    "minimum_atomic_amplitude_absolute",
+                ),
+                "reference_amplitude_passed": _numeric(
+                    record.get("minimum_reference_amplitude"),
+                    "minimum_reference_amplitude",
+                )
+                > _numeric(
+                    profile["minimum_reference_amplitude_absolute"],
+                    "minimum_reference_amplitude_absolute",
+                ),
+                "cross_amplitude_passed": _numeric(
+                    record.get("minimum_cross_amplitude"),
+                    "minimum_cross_amplitude",
+                )
+                > _numeric(
+                    profile["minimum_cross_amplitude_absolute"],
+                    "minimum_cross_amplitude_absolute",
+                ),
+                "hessian_curvature_passed": _numeric(
+                    record.get("hessian_minimum_curvature"),
+                    "hessian_minimum_curvature",
+                )
+                > _numeric(profile["minimum_curvature"], "minimum_curvature"),
+                "hessian_condition_passed": _numeric(
+                    record.get("hessian_condition"), "hessian_condition"
+                )
+                < _numeric(profile["maximum_condition"], "maximum_condition"),
+                "phase_residual_passed": _numeric(
+                    record.get("phase_residual"), "phase_residual"
+                )
+                < _numeric(
+                    profile["maximum_gradient_norm"],
+                    "maximum_gradient_norm",
+                ),
+                "transport_row_residual_passed": _numeric(
+                    record.get("transport_row_residual"),
+                    "transport_row_residual",
+                )
+                <= tolerance,
+                "transport_column_residual_passed": _numeric(
+                    record.get("transport_column_residual"),
+                    "transport_column_residual",
+                )
+                <= tolerance,
+                "vacancy_mass_residual_passed": _numeric(
+                    record.get("q_mass_error"), "q_mass_error"
+                )
+                <= tolerance,
+                "transport_oracle_passed": max(
+                    _numeric(value, f"oracle_maximum_errors.{name}")
+                    for name, value in oracle.items()
+                )
+                <= oracle_tolerance,
+                "support_margin_passed": _numeric(
+                    record.get("support_margin"), "support_margin"
+                )
+                > 0.0,
+                "mic_margin_passed": (
+                    backend == "edge_list"
+                    or _numeric(record.get("mic_margin"), "mic_margin") > 0.0
+                ),
+                "fallback_free": not fallback,
+                "runtime_sparse_non_densified": (
+                    backend != "edge_list"
+                    or record.get("dense_plan_materialized") is False
+                ),
+            }
+            values.append({**identity, "checks": checks})
+        by_dtype[dtype_name] = identities
+        record_checks[dtype_name] = values
+
+    shared = set(by_dtype["float64"])
+    cross_dtype = shared == set(by_dtype["float32"])
+    if cross_dtype:
+        for key in sorted(shared):
+            left = by_dtype["float64"][key]
+            right = by_dtype["float32"][key]
+            for field in (
+                "selected_group",
+                "semantic_support_fingerprint",
+                "mic_branch_fingerprint",
+                "backend",
+                "fallback_used",
+            ):
+                cross_dtype = cross_dtype and left.get(field) == right.get(field)
+
+    candidate = _require_mapping(
+        certificate.get("candidate_group_manifest"),
+        "candidate_group_manifest",
+    )
+    coverage_checks = []
+    for index, raw in enumerate(
+        _require_list(candidate.get("coverage_diagnostics"), "coverage_diagnostics")
+    ):
+        item = _require_mapping(raw, f"coverage_diagnostics[{index}]")
+        gap = item.get("broader_non_equivalent_gap")
+        coverage_checks.append(
+            {
+                "sample_id": item["sample_id"],
+                "geometry_digest": item["geometry_digest"],
+                "runtime_selected_group": item["runtime_selected_group"],
+                "checks": {
+                    "same_stabilizer_group": item.get("same_stabilizer_group")
+                    is True,
+                    "alternate_basin_gap_passed": gap is None
+                    or _numeric(gap, "broader_non_equivalent_gap")
+                    > _numeric(
+                        profile["minimum_objective_gap_absolute"],
+                        "minimum_objective_gap_absolute",
+                    ),
+                },
+            }
+        )
+
+    probe_checks = []
+    for index, raw in enumerate(
+        _require_list(certificate.get("derivative_probes"), "derivative_probes")
+    ):
+        probe = _require_mapping(raw, f"derivative_probes[{index}]")
+        branch = _require_mapping(
+            probe.get("branch_agreement"), "branch_agreement"
+        )
+        probe_checks.append(
+            {
+                "sample_id": probe["sample_id"],
+                "geometry_digest": probe["geometry_digest"],
+                "position_directions": probe["position_directions"],
+                "strain_directions": probe["strain_directions"],
+                "branch_agreement": _plain(branch),
+                "checks": {
+                    "position_absolute_fd_passed": _numeric(
+                        probe.get("position_maximum_absolute_error"),
+                        "position_maximum_absolute_error",
+                    )
+                    <= _numeric(
+                        profile["first_derivative_fd_tolerance"],
+                        "first_derivative_fd_tolerance",
+                    ),
+                    "strain_absolute_fd_passed": _numeric(
+                        probe.get("strain_maximum_absolute_error"),
+                        "strain_maximum_absolute_error",
+                    )
+                    <= _numeric(
+                        profile["first_derivative_fd_tolerance"],
+                        "first_derivative_fd_tolerance",
+                    ),
+                    "all_probe_branches_agree": bool(branch)
+                    and all(value is True for value in branch.values()),
+                },
+            }
+        )
+    return {
+        "record_checks": record_checks,
+        "cross_dtype_branch_agreement": cross_dtype,
+        "candidate_coverage_checks": coverage_checks,
+        "probe_checks": probe_checks,
+        "fallback_count_matches": certificate.get("fallback_count")
+        == fallback_count,
+        "fallback_free": fallback_count == 0,
+    }
+
+
+def _assert_qualified_outcomes(outcomes: Mapping[str, Any]) -> None:
+    booleans = [
+        outcomes.get("cross_dtype_branch_agreement"),
+        outcomes.get("fallback_count_matches"),
+        outcomes.get("fallback_free"),
+    ]
+    for records in _require_mapping(
+        outcomes.get("record_checks"), "record_checks"
+    ).values():
+        for record in _require_list(records, "record_checks records"):
+            booleans.extend(
+                _require_mapping(record, "record check")["checks"].values()
+            )
+    for key in ("candidate_coverage_checks", "probe_checks"):
+        for item in _require_list(outcomes.get(key), key):
+            current = _require_mapping(item, key)
+            booleans.extend(
+                _require_mapping(current.get("checks"), f"{key}.checks").values()
+            )
+            if key == "probe_checks":
+                booleans.extend(
+                    _require_mapping(
+                        current.get("branch_agreement"),
+                        "probe branch agreement",
+                    ).values()
+                )
+    if not booleans or any(value is not True for value in booleans):
+        raise AutomaticEvaluationPolicyAuditError(
+            "EVALUATION_CERTIFICATE_QUALIFICATION_FAILED",
+            "full-precision certificate telemetry does not satisfy its semantic qualification claim",
+            diagnostics=_plain(outcomes),
+        )
+
+
+def _semantic_projection(
+    certificate: Mapping[str, Any], outcomes: Mapping[str, Any]
+) -> dict[str, Any]:
+    candidate = _require_mapping(
+        certificate.get("candidate_group_manifest"),
+        "candidate_group_manifest",
+    )
+    diagnostics = _require_mapping(
+        certificate.get("dtype_diagnostics"), "dtype_diagnostics"
+    )
+    dtype_branches = {}
+    for dtype_name in sorted(diagnostics):
+        dtype_branches[dtype_name] = [
+            {
+                **_record_identity(record),
+                "selected_group": record["selected_group"],
+                "semantic_support_fingerprint": record[
+                    "semantic_support_fingerprint"
+                ],
+                "mic_branch_fingerprint": record["mic_branch_fingerprint"],
+                "fallback_used": record["fallback_used"],
+                "dense_plan_materialized": record[
+                    "dense_plan_materialized"
+                ],
+            }
+            for record in diagnostics[dtype_name]
+        ]
+    return {
+        "schema_version": certificate["schema_version"],
+        "audit_convention_version": certificate["audit_convention_version"],
+        "semantic_projection_version": certificate[
+            "semantic_projection_version"
+        ],
+        "qualification": {
+            key: certificate[key] for key in _QUALIFICATION_FIELDS
+        },
+        "bindings": {key: certificate[key] for key in _BINDING_FIELDS},
+        "audit_domain": certificate["audit_input"],
+        "normative_profile": certificate["profile"],
+        "normative_comparators": _plain(_NORMATIVE_COMPARATORS),
+        "effective_transport": certificate["effective_transport"],
+        "candidate_definition": {
+            key: candidate[key] for key in _CANDIDATE_DEFINITION_FIELDS
+        },
+        "dtype_branch_manifest": dtype_branches,
+        "witness_and_probe_definition": certificate["witness_selection"],
+        "normative_outcomes": _plain(outcomes),
+    }
+
+
+def _finalize_evaluation_certificate(
+    certificate: Mapping[str, Any],
+) -> dict[str, Any]:
+    result = _plain(certificate)
+    result["semantic_projection_version"] = (
+        AUTOMATIC_EVALUATION_SEMANTIC_PROJECTION_VERSION
+    )
+    outcomes = _normative_outcomes(result)
+    _assert_qualified_outcomes(outcomes)
+    result["normative_outcomes"] = outcomes
+    result["evaluation_semantic_fingerprint_sha256"] = _fingerprint(
+        _semantic_projection(result, outcomes)
+    )
+    result["evaluation_certificate_sha256"] = _fingerprint(result)
+    return result
+
+
+def validate_automatic_evaluation_certificate(
+    certificate: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Validate v1 integrity or v2 integrity plus full semantic qualification."""
+
+    result = _plain(_require_mapping(certificate, "certificate"))
+    declared = result.pop("evaluation_certificate_sha256", None)
+    if declared != _fingerprint(result):
+        raise AutomaticEvaluationPolicyAuditError(
+            "EVALUATION_CERTIFICATE_INTEGRITY_MISMATCH",
+            "evaluation certificate content SHA-256 differs from its payload",
+        )
+    result["evaluation_certificate_sha256"] = declared
+    schema = result.get("schema_version")
+    if schema == AUTOMATIC_EVALUATION_CERTIFICATE_SCHEMA_VERSION_V1:
+        return result
+    if schema != AUTOMATIC_EVALUATION_CERTIFICATE_SCHEMA_VERSION_V2:
+        raise AutomaticEvaluationPolicyAuditError(
+            "UNSUPPORTED_EVALUATION_CERTIFICATE_SCHEMA",
+            "evaluation certificate schema is unsupported",
+        )
+    if result.get("semantic_projection_version") != (
+        AUTOMATIC_EVALUATION_SEMANTIC_PROJECTION_VERSION
+    ):
+        raise AutomaticEvaluationPolicyAuditError(
+            "UNSUPPORTED_EVALUATION_CERTIFICATE_SEMANTIC_PROJECTION",
+            "evaluation certificate semantic projection is unsupported",
+        )
+    if result.get("audit_convention_version") != (
+        AUTOMATIC_EVALUATION_POLICY_AUDIT_VERSION
+    ):
+        raise AutomaticEvaluationPolicyAuditError(
+            "UNSUPPORTED_EVALUATION_CERTIFICATE_AUDIT",
+            "evaluation certificate audit convention is unsupported",
+        )
+    outcomes = _normative_outcomes(result)
+    _assert_qualified_outcomes(outcomes)
+    if result.get("normative_outcomes") != outcomes:
+        raise AutomaticEvaluationPolicyAuditError(
+            "EVALUATION_CERTIFICATE_OUTCOME_MISMATCH",
+            "stored semantic outcomes differ from full-precision telemetry",
+        )
+    actual_semantic = _fingerprint(_semantic_projection(result, outcomes))
+    if result.get("evaluation_semantic_fingerprint_sha256") != actual_semantic:
+        raise AutomaticEvaluationPolicyAuditError(
+            "EVALUATION_CERTIFICATE_SEMANTIC_FINGERPRINT_MISMATCH",
+            "evaluation certificate semantic fingerprint differs from its allowlist projection",
+        )
+    if result.get("status") != "qualified" or result.get("scope") != (
+        AUTOMATIC_EVALUATION_SCOPE
+    ):
+        raise AutomaticEvaluationPolicyAuditError(
+            "EVALUATION_CERTIFICATE_QUALIFICATION_FAILED",
+            "evaluation certificate does not make the supported qualified claim",
+        )
+    return result
+
+
+def automatic_evaluation_certificate_semantic_identity(
+    certificate: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return the v2 semantic identity or the exact legacy v1 payload."""
+
+    validated = validate_automatic_evaluation_certificate(certificate)
+    if validated["schema_version"] == (
+        AUTOMATIC_EVALUATION_CERTIFICATE_SCHEMA_VERSION_V1
+    ):
+        return validated
+    return {
+        "schema_version": validated["schema_version"],
+        "audit_convention_version": validated["audit_convention_version"],
+        "semantic_projection_version": validated[
+            "semantic_projection_version"
+        ],
+        "evaluation_semantic_fingerprint_sha256": validated[
+            "evaluation_semantic_fingerprint_sha256"
+        ],
+    }
 
 
 def _tensor_fingerprint(value: torch.Tensor) -> str:
@@ -1523,7 +2078,18 @@ def _probe_witness(
         "geometry_digest": geometry.semantic_digest,
         "position_directions": len(position_errors),
         "strain_directions": len(strain_errors),
+        "branch_agreement": {
+            "joint_translation": True,
+            "periodic_lattice_wrap": True,
+            "atom_permutation": True,
+            "position_finite_difference": True,
+            "strain_finite_difference": True,
+        },
         "position_maximum_absolute_error": maximum_position,
+        # Relative errors are diagnostic-only because near-zero directional
+        # derivatives make them backend/allocation-history sensitive.  They
+        # are retained at full precision in the integrity certificate, but
+        # never participate in qualification or semantic identity.
         "position_maximum_relative_error": max(position_relative_errors, default=0.0),
         "strain_maximum_absolute_error": maximum_strain,
         "strain_maximum_relative_error": max(strain_relative_errors, default=0.0),
@@ -1867,6 +2433,7 @@ def qualify_automatic_evaluation_policies(
     """Audit every template, then atomically return a fully qualified snapshot."""
 
     from .automatic_reference import (
+        AUTO_REFERENCE_CONVENTION_VERSION_V2,
         AutomaticReferencePreparation,
         AutomaticReferenceResult,
         _fingerprint as reference_fingerprint,
@@ -1910,9 +2477,7 @@ def qualify_automatic_evaluation_policies(
                 "radius_fingerprint": structural["radius_fingerprint"],
             }
         )
-        certificate["evaluation_certificate_sha256"] = reference_fingerprint(
-            certificate
-        )
+        certificate = _finalize_evaluation_certificate(certificate)
         audited.append(
             AutomaticReferenceResult(
                 source_index=result.source_index,
@@ -1925,7 +2490,7 @@ def qualify_automatic_evaluation_policies(
         )
     audited.sort(key=lambda value: value.template_id)
     semantic = {
-        "convention_version": preparation.convention_version,
+        "convention_version": AUTO_REFERENCE_CONVENTION_VERSION_V2,
         "scope": "dataset_bounded",
         "species_vocabulary": list(preparation.species_vocabulary),
         "references": [item.semantic_dict() for item in audited],
@@ -1938,17 +2503,22 @@ def qualify_automatic_evaluation_policies(
         validation_assignments=preparation.validation_assignments,
         species_vocabulary=preparation.species_vocabulary,
         content_fingerprint=reference_fingerprint(semantic),
-        convention_version=preparation.convention_version,
+        convention_version=AUTO_REFERENCE_CONVENTION_VERSION_V2,
         _audit_inputs=preparation._audit_inputs,
     )
 
 
 __all__ = [
     "AUTOMATIC_EVALUATION_CERTIFICATE_SCHEMA_VERSION",
+    "AUTOMATIC_EVALUATION_CERTIFICATE_SCHEMA_VERSION_V1",
+    "AUTOMATIC_EVALUATION_CERTIFICATE_SCHEMA_VERSION_V2",
     "AUTOMATIC_EVALUATION_POLICY_AUDIT_VERSION",
+    "AUTOMATIC_EVALUATION_SEMANTIC_PROJECTION_VERSION",
     "AUTOMATIC_EVALUATION_SCOPE",
     "AutomaticEvaluationPolicyAuditError",
+    "automatic_evaluation_certificate_semantic_identity",
     "automatic_evaluation_policy_profile",
     "build_automatic_evaluation_policy",
     "qualify_automatic_evaluation_policies",
+    "validate_automatic_evaluation_certificate",
 ]

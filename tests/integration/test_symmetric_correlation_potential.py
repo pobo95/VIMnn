@@ -478,12 +478,22 @@ def test_v2_cpu_dtype_and_strict_state_roundtrip(typed_crystal, dtype):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
 def test_v2_cuda_direct_smoke(typed_crystal, dtype):
+    original_positions = typed_crystal["positions"].clone()
     data, model, registry, _, _, contexts = v2_grouped_case(
         typed_crystal, dtype=dtype, device="cuda:0", layers=1
     )
     context = contexts["zeta"]
+    positions_cuda = (
+        data["positions"][:5]
+        .detach()
+        .clone()
+        .to(device="cuda:0", dtype=dtype)
+        .requires_grad_(True)
+    )
+    assert positions_cuda.is_leaf and positions_cuda.requires_grad
+    assert torch.equal(typed_crystal["positions"], original_positions)
     arguments = (
-        data["positions"][:5].to("cuda:0"),
+        positions_cuda,
         numbers(data, 5).to("cuda:0"),
         data["cell"].to("cuda:0"),
         data["origin"].to("cuda:0"),

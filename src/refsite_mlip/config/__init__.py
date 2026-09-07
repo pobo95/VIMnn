@@ -68,6 +68,8 @@ from .training_recipe import (
 from .automatic_reference import (
     AUTO_PHASE_SEARCH_VERSION,
     AUTO_REFERENCE_CONVENTION_VERSION,
+    AUTO_REFERENCE_CONVENTION_VERSION_V1,
+    AUTO_REFERENCE_CONVENTION_VERSION_V2,
     AUTO_STRAIN_POLICY_VERSION,
     AutomaticReferenceError,
     AutomaticReferencePreparation,
@@ -77,12 +79,17 @@ from .automatic_reference import (
 )
 from .automatic_evaluation import (
     AUTOMATIC_EVALUATION_CERTIFICATE_SCHEMA_VERSION,
+    AUTOMATIC_EVALUATION_CERTIFICATE_SCHEMA_VERSION_V1,
+    AUTOMATIC_EVALUATION_CERTIFICATE_SCHEMA_VERSION_V2,
     AUTOMATIC_EVALUATION_POLICY_AUDIT_VERSION,
+    AUTOMATIC_EVALUATION_SEMANTIC_PROJECTION_VERSION,
     AUTOMATIC_EVALUATION_SCOPE,
     AutomaticEvaluationPolicyAuditError,
+    automatic_evaluation_certificate_semantic_identity,
     automatic_evaluation_policy_profile,
     build_automatic_evaluation_policy,
     qualify_automatic_evaluation_policies,
+    validate_automatic_evaluation_certificate,
 )
 
 __all__ = [
@@ -96,9 +103,14 @@ __all__ = [
     "BundleModelSourceConfig",
     "AUTO_PHASE_SEARCH_VERSION",
     "AUTO_REFERENCE_CONVENTION_VERSION",
+    "AUTO_REFERENCE_CONVENTION_VERSION_V1",
+    "AUTO_REFERENCE_CONVENTION_VERSION_V2",
     "AUTO_STRAIN_POLICY_VERSION",
     "AUTOMATIC_EVALUATION_CERTIFICATE_SCHEMA_VERSION",
+    "AUTOMATIC_EVALUATION_CERTIFICATE_SCHEMA_VERSION_V1",
+    "AUTOMATIC_EVALUATION_CERTIFICATE_SCHEMA_VERSION_V2",
     "AUTOMATIC_EVALUATION_POLICY_AUDIT_VERSION",
+    "AUTOMATIC_EVALUATION_SEMANTIC_PROJECTION_VERSION",
     "AUTOMATIC_EVALUATION_SCOPE",
     "AutomaticEvaluationPolicyAuditError",
     "AutomaticReferenceError",
@@ -139,6 +151,7 @@ __all__ = [
     "derive_interaction_radii",
     "apply_training_run_overrides",
     "automatic_evaluation_policy_profile",
+    "automatic_evaluation_certificate_semantic_identity",
     "build_automatic_evaluation_policy",
     "compile_training_recipe",
     "is_training_recipe",
@@ -150,6 +163,7 @@ __all__ = [
     "resolve_training_recipe",
     "prepare_automatic_references",
     "qualify_automatic_evaluation_policies",
+    "validate_automatic_evaluation_certificate",
     "resolve_auto_maximum_strain",
     "SYMMETRIC_MODEL_DEFAULTS_VERSION",
     "TRAINING_DEFAULTS_VERSION",
