@@ -113,7 +113,13 @@ def _live_state(device="cpu"):
     return model, optimizer, scheduler, scheduler_config, optimizer_config, selection, progress
 
 
-def _capture(*, device="cpu", train_batches=None, validation_batches=None):
+def _capture(
+    *,
+    device="cpu",
+    train_batches=None,
+    validation_batches=None,
+    selection_config=None,
+):
     model, optimizer, scheduler, scheduler_config, optimizer_config, selection, progress = _live_state(device)
     train_batches = train_batches or (_batch(("train",), device=device),)
     validation_batches = validation_batches or (_batch(("validation",), device=device),)
@@ -131,7 +137,7 @@ def _capture(*, device="cpu", train_batches=None, validation_batches=None):
         train_step_config=TrainStepConfig(),
         validation_step_config=ValidationStepConfig(),
         scheduler_config=scheduler_config,
-        model_selection_config=ModelSelectionConfig(),
+        model_selection_config=(selection_config or ModelSelectionConfig()),
         fit_config=FitConfig(3),
         species_vocabulary=(6,),
         baseline_fit_metadata={"kind": "explicit", "values": [0.25]},
@@ -210,6 +216,29 @@ def test_complete_capture_and_owned_cpu_detached_snapshot():
     assert checkpoint.metadata.resolved_configuration.keys() == {
         "model", "loss", "optimizer", "train_step", "validation_step",
         "scheduler", "model_selection", "fit",
+    }
+
+
+def test_relative_selection_threshold_checkpoint_metadata_is_additive():
+    _, _, _, legacy = _capture()
+    assert legacy.metadata.resolved_configuration["model_selection"] == {
+        "monitor": "total_loss",
+        "mode": "min",
+        "min_delta": 0.0,
+        "early_stopping_patience": None,
+    }
+    _, _, _, configured = _capture(
+        selection_config=ModelSelectionConfig(
+            early_stopping_patience=15,
+            relative_min_delta=1.0e-3,
+        )
+    )
+    assert configured.metadata.resolved_configuration["model_selection"] == {
+        "monitor": "total_loss",
+        "mode": "min",
+        "min_delta": 0.0,
+        "early_stopping_patience": 15,
+        "relative_min_delta": 1.0e-3,
     }
 
 

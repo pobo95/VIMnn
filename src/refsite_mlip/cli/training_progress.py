@@ -22,6 +22,7 @@ from refsite_mlip.training.metrics_journal import (
     CommittedEpochMetrics,
     EpochMetricsObserver,
 )
+from refsite_mlip.training.losses import PhysicalErrorSums
 
 
 TRAINING_PROGRESS_CONFIG_VERSION = "refsite_training_progress_config_v1"
@@ -182,8 +183,18 @@ class TrainingStartSummary:
     existing_best_epoch: int | None = None
     existing_best_value: float | None = None
     recovered_journal_event_count: int = 0
+    early_stop_relative_delta: float = 0.0
+    energy_normalization: str = "per_structure"
+    gradient_clip_norm: float | None = None
 
     def __post_init__(self) -> None:
+        if self.energy_normalization not in ("per_structure", "per_atom"):
+            raise ValueError("invalid energy_normalization")
+        if self.gradient_clip_norm is not None:
+            clip = _finite("gradient_clip_norm", self.gradient_clip_norm, minimum=0.0)
+            if clip <= 0:
+                raise ValueError("gradient_clip_norm must be positive")
+            object.__setattr__(self, "gradient_clip_norm", clip)
         string_fields = (
             "run_name",
             "source_kind",
@@ -348,6 +359,16 @@ class TrainingStartSummary:
             "early_stop_patience",
             _optional_integer("early_stop_patience", self.early_stop_patience),
         )
+        relative_delta = _finite(
+            "early_stop_relative_delta",
+            self.early_stop_relative_delta,
+            minimum=0.0,
+        )
+        if relative_delta >= 1.0:
+            raise ValueError("early_stop_relative_delta must be smaller than 1")
+        object.__setattr__(
+            self, "early_stop_relative_delta", relative_delta
+        )
         for name in (
             "initial_bundle_fingerprint",
             "train_semantic_digest",
@@ -509,6 +530,7 @@ class TrainingProgressRenderer:
         self._summary: TrainingStartSummary | None = None
         self._session_started_at: float | None = None
         self._session_event_count = 0
+        self._last_event: CommittedEpochMetrics | None = None
 
     @property
     def config(self) -> TrainingProgressConfig:
@@ -669,6 +691,7 @@ class TrainingProgressRenderer:
     def render_epoch(self, event: CommittedEpochMetrics) -> None:
         if not isinstance(event, CommittedEpochMetrics):
             raise TypeError("event must be CommittedEpochMetrics")
+        self._last_event = event
         if not self.enabled:
             return
         try:
@@ -703,8 +726,7 @@ class TrainingProgressRenderer:
         if not self._io_available and not self._log_available:
             return
         try:
-            self._write(
-                self._terminal_line(
+            value = self._terminal_line(
                     status,
                     epochs=epochs,
                     global_step=global_step,
@@ -715,7 +737,9 @@ class TrainingProgressRenderer:
                     phase=phase,
                     recoverable=recoverable,
                 )
-            )
+            if status in ("completed", "early_stopped") and self._last_event is not None:
+                value += self._final_metrics_block(self._last_event)
+            self._write(value)
         except Exception as error:
             self._disable(error)
 
@@ -832,13 +856,17 @@ class TrainingProgressRenderer:
             f"  Transport: backend={summary.ot_backend}, solver={summary.solver_path}",
             f"  Baseline: {baseline}",
             f"  Loss weights: {loss}",
+            f"  Energy normalization: {summary.energy_normalization}",
+            f"  Gradient clipping: {_optional_text(summary.gradient_clip_norm)}",
             f"  Optimizer: {summary.optimizer_kind}, "
             f"lr={self._float(summary.initial_learning_rate)}, "
             f"weight_decay={self._float(summary.weight_decay)}",
             f"  Scheduler: {summary.scheduler_kind}, "
             f"monitor={summary.scheduler_monitor}/{summary.scheduler_mode}",
             f"  Epochs: {summary.max_epochs}, early-stop patience="
-            f"{_optional_text(summary.early_stop_patience)}",
+            f"{_optional_text(summary.early_stop_patience)}, "
+            "relative improvement="
+            f"{self._float(100.0 * summary.early_stop_relative_delta)}%",
             f"  Output: {summary.output_directory}",
             f"  Initial bundle: {summary.initial_bundle_fingerprint}",
             f"  Data digests: train={summary.train_semantic_digest}, "
@@ -892,26 +920,84 @@ class TrainingProgressRenderer:
         # epochs which will not run would contradict the same line's
         # ``stop=yes`` state.
         eta = 0.0 if event.should_stop else elapsed / count * remaining
+        patience = None if self._summary is None else self._summary.early_stop_patience
+        relative_delta = (
+            0.0
+            if self._summary is None
+            else self._summary.early_stop_relative_delta
+        )
         return (
             f"Epoch {human_epoch:0{width}d}/{maximum} | step={event.global_step_end}\n"
-            f"  train [{event.training_metric_semantics}] "
-            f"total={self._float(event.training_total_loss)} "
-            f"E={_term_mean(event.training_energy, self._float)} "
-            f"F={_term_mean(event.training_force, self._float)} "
-            f"S={_term_mean(event.training_stress, self._float)}\n"
-            f"  valid [{event.validation_metric_semantics}] "
-            f"total={self._float(event.validation_total_loss)} "
-            f"E={_term_mean(event.validation_energy, self._float)} "
-            f"F={_term_mean(event.validation_force, self._float)} "
-            f"S={_term_mean(event.validation_stress, self._float)}\n"
-            f"  lr(before)="
+            + self._physical_metrics_line(
+                "train",
+                event.training_metric_semantics,
+                event.training_total_loss,
+                event.training_reporting,
+            )
+            + self._physical_metrics_line(
+                "valid",
+                event.validation_metric_semantics,
+                event.validation_total_loss,
+                event.validation_reporting,
+            )
+            + f"  lr(before)="
             f"{_learning_rates(event.learning_rates_before_scheduler, self._float)} "
             f"lr(next)="
             f"{_learning_rates(event.learning_rates_after_scheduler, self._float)} "
             f"best={'yes' if event.is_best else 'no'} "
             f"stop={'yes' if event.should_stop else 'no'} "
+            f"no-improvement={event.bad_validation_count}/"
+            f"{_optional_text(patience)} "
+            f"relative-delta={self._float(100.0 * relative_delta)}% "
             f"checkpoint={event.epoch_checkpoint_basename} "
             f"elapsed={self._duration(elapsed)} eta={self._duration(eta)}\n"
+        )
+
+    def _physical_metrics_line(
+        self,
+        label: str,
+        semantics: str,
+        total_loss: float,
+        reporting: PhysicalErrorSums,
+    ) -> str:
+        energy = _rmse_mev(
+            reporting.energy_per_atom_squared_sum,
+            reporting.energy_structure_count,
+            self._float,
+        )
+        force = _rmse_mev(
+            reporting.force_squared_sum,
+            reporting.force_component_count,
+            self._float,
+        )
+        stress = _rmse_mev(
+            reporting.stress_squared_sum,
+            reporting.stress_component_count,
+            self._float,
+        )
+        relative_force = _relative_force_percent(reporting, self._float)
+        return (
+            f"  {label} [{semantics}] loss={self._float(total_loss)} "
+            f"RMSE_E/atom={energy} meV/atom "
+            f"RMSE_F={force} meV/A relative_F={relative_force} "
+            f"RMSE_S={stress} meV/A^3\n"
+        )
+
+    def _final_metrics_block(self, event: CommittedEpochMetrics) -> str:
+        return (
+            "Final recorded RMSE\n"
+            + self._physical_metrics_line(
+                "train",
+                event.training_metric_semantics,
+                event.training_total_loss,
+                event.training_reporting,
+            )
+            + self._physical_metrics_line(
+                "valid",
+                event.validation_metric_semantics,
+                event.validation_total_loss,
+                event.validation_reporting,
+            )
         )
 
     def _terminal_line(
@@ -1008,6 +1094,31 @@ def _optional_float(
     value: float | None, formatter: Callable[[float], str]
 ) -> str:
     return "n/a" if value is None else formatter(value)
+
+
+def _rmse_mev(
+    squared_error_sum: float,
+    count: int,
+    formatter: Callable[[float], str],
+) -> str:
+    if count == 0:
+        return "n/a"
+    return formatter(1000.0 * math.sqrt(squared_error_sum / count))
+
+
+def _relative_force_percent(
+    reporting: PhysicalErrorSums,
+    formatter: Callable[[float], str],
+) -> str:
+    if (
+        reporting.force_component_count == 0
+        or reporting.force_reference_squared_sum == 0.0
+    ):
+        return "n/a"
+    value = 100.0 * math.sqrt(
+        reporting.force_squared_sum / reporting.force_reference_squared_sum
+    )
+    return formatter(value) + "%"
 
 
 def _human_epoch(value: int | None) -> str:

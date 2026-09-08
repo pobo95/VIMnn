@@ -565,6 +565,33 @@ def test_recipe_early_stopping_patience_rejects_invalid_values(invalid):
     assert caught.value.field == "training.early_stopping_patience"
 
 
+def test_recipe_relative_early_stopping_threshold_maps_and_preserves_default():
+    default_recipe = TrainingRecipeConfig.from_dict(_payload())
+    default_resolved = compile_training_recipe(default_recipe, (_spec(),))
+    assert default_recipe.training.early_stopping_relative_delta == 0.0
+    assert "early_stopping_relative_delta" not in default_recipe.to_dict()["training"]
+    assert default_resolved.config.selection.relative_min_delta == 0.0
+
+    payload = _payload()
+    payload["training"]["early_stopping_relative_delta"] = 1.0e-3
+    recipe = TrainingRecipeConfig.from_dict(payload)
+    resolved = compile_training_recipe(recipe, (_spec(),))
+    assert recipe.training.early_stopping_relative_delta == 1.0e-3
+    assert recipe.to_dict()["training"]["early_stopping_relative_delta"] == 1.0e-3
+    assert resolved.config.selection.relative_min_delta == 1.0e-3
+    assert dict(resolved.manifest.field_origins)["selection.relative_min_delta"] == "user"
+    assert resolved.config.config_fingerprint != default_resolved.config.config_fingerprint
+
+
+@pytest.mark.parametrize("invalid", (True, -1.0, 1.0, float("nan"), "0.001"))
+def test_recipe_relative_early_stopping_threshold_rejects_invalid_values(invalid):
+    payload = _payload()
+    payload["training"]["early_stopping_relative_delta"] = invalid
+    with pytest.raises(TrainingRecipeError) as caught:
+        TrainingRecipeConfig.from_dict(payload)
+    assert caught.value.field == "training.early_stopping_relative_delta"
+
+
 @pytest.mark.parametrize("maximum_l", (0, 1, 2))
 def test_supported_max_l_maps_to_feature_higher_body_and_natural_irreps(maximum_l):
     payload = _payload()
@@ -735,3 +762,115 @@ def test_input_toctou_is_detected(monkeypatch, tmp_path):
     with pytest.raises(TrainingRecipeError) as caught:
         module._read_regular_file(path, text=False)
     assert caught.value.reason_code == "INPUT_TOCTOU_MISMATCH"
+
+
+@pytest.mark.parametrize("cutoff", [3.0, 5.0])
+@pytest.mark.parametrize("method", ["symmetric", "sequential"])
+def test_mp_radial_normalization_uses_resolved_cutoff(cutoff, method):
+    from refsite_mlip.graph import (
+        build_reference_graph_topology,
+        update_reference_edge_geometry,
+    )
+    from refsite_mlip.interactions import squared_edge_radial_basis
+
+    payload = _payload()
+    payload["radii"]["r_mp"] = cutoff
+    payload["model"]["correlation_method"] = method
+    if method == "sequential":
+        payload["model"].pop("correlation")
+        payload["model"]["correlation_mode"] = "uuu"
+    specification = replace(
+        _spec(), builder=replace(_builder(), graph_cutoff=cutoff, maximum_strain=.05)
+    )
+    resolved = compile_training_recipe(
+        TrainingRecipeConfig.from_dict(payload), (specification,)
+    )
+    higher = resolved.config.model_source.potential.higher_body
+    assert higher.edge_length_scale == cutoff
+    assert dict(resolved.manifest.field_origins)["model.edge_length_scale"] == "derived"
+    assert dict(resolved.manifest.preset_versions)["model"] == f"{method}_model_defaults_v2"
+
+    # The same relative separation must produce the same radial input for
+    # different physical cutoffs, while retaining live cell derivatives.
+    cell = torch.eye(3, dtype=torch.float64) * (2 * cutoff)
+    topology = build_reference_graph_topology(
+        torch.tensor([[0., 0., 0.], [.25, 0., 0.]], dtype=torch.float64),
+        torch.zeros(2, dtype=torch.long), cell,
+        cutoff=cutoff, skin=.5, maximum_strain=.01,
+    )
+    strain = torch.zeros((), dtype=torch.float64, requires_grad=True)
+    geometry = update_reference_edge_geometry(
+        topology, cell * (1 + strain), edge_length_scale=higher.edge_length_scale
+    )
+    radial = squared_edge_radial_basis(geometry.radial_coordinate, 3)
+    expected = torch.tensor([1., .25, .0625], dtype=torch.float64)
+    torch.testing.assert_close(radial, expected.expand_as(radial))
+    derivative = torch.autograd.grad(radial[:, 2].sum(), strain)[0]
+    torch.testing.assert_close(derivative, derivative.new_tensor(.25 * radial.shape[0]))
+
+    restored = TrainingRunConfig.from_json(resolved.config.canonical_json())
+    assert restored.model_source.potential.higher_body.edge_length_scale == cutoff
+    # Explicit legacy scales are configuration, not a new runtime default.
+    legacy_payload = resolved.config.to_dict()
+    legacy_payload["model_source"]["potential"]["higher_body"]["edge_length_scale"] = 1.0
+    legacy = TrainingRunConfig.from_dict(legacy_payload)
+    assert legacy.model_source.potential.higher_body.edge_length_scale == 1.0
+
+
+def test_loss_stability_options_compile_and_roundtrip():
+    payload = _payload()
+    payload['loss'].update(energy_normalization='per_atom', energy_scale=0.03,
+                           force_scale=0.04, stress_scale=0.005)
+    payload['training'].update(gradient_clip_norm=2.0, early_stopping_patience=30,
+        scheduler={'kind': 'reduce_on_plateau', 'factor': 0.5, 'patience': 5,
+                   'cooldown': 2, 'min_lr': 1e-6})
+    recipe = TrainingRecipeConfig.from_dict(payload)
+    resolved = compile_training_recipe(recipe, (_spec(),))
+    cfg = resolved.config
+    assert cfg.loss.energy_normalization == 'per_atom'
+    assert (cfg.loss.energy_scale, cfg.loss.force_scale, cfg.loss.stress_scale) == (0.03, 0.04, 0.005)
+    assert cfg.train_step.gradient_clip_norm == 2
+    assert cfg.scheduler.kind == 'reduce_on_plateau'
+    assert cfg.scheduler.factor == 0.5 and cfg.scheduler.patience == 5
+    assert cfg.scheduler.cooldown == 2 and cfg.scheduler.min_lr == 1e-6
+    restored = compile_training_recipe(TrainingRecipeConfig.from_dict(recipe.to_dict()), (_spec(),))
+    assert cfg.config_fingerprint == restored.config.config_fingerprint
+    assert TrainingRunConfig.from_dict(cfg.to_dict()).config_fingerprint == cfg.config_fingerprint
+    origins = dict(resolved.manifest.field_origins)
+    for name in ('loss.energy_normalization', 'loss.force_scale', 'train_step.gradient_clip_norm', 'scheduler.kind'):
+        assert origins[name] == 'user'
+
+
+def test_omitted_stability_options_preserve_legacy_configuration():
+    payload = _payload()
+    original = TrainingRecipeConfig.from_dict(payload)
+    for name in ('energy_scale', 'force_scale', 'stress_scale', 'energy_normalization'):
+        assert name not in original.to_dict()['loss']
+    assert 'scheduler' not in original.to_dict()['training']
+    assert 'gradient_clip_norm' not in original.to_dict()['training']
+    payload['loss'].update(energy_scale=1, force_scale=1, stress_scale=1, energy_normalization='per_structure')
+    payload['training'].update(gradient_clip_norm=None, scheduler={'kind': 'none'})
+    implicit = compile_training_recipe(original, (_spec(),))
+    explicit = compile_training_recipe(TrainingRecipeConfig.from_dict(payload), (_spec(),))
+    assert implicit.config.config_fingerprint == explicit.config.config_fingerprint
+    assert implicit.config.train_step.gradient_clip_norm is None
+    assert implicit.config.scheduler.kind == 'none'
+
+
+@pytest.mark.parametrize('section,key,value', [
+    ('loss', 'energy_scale', 0), ('loss', 'force_scale', -1),
+    ('loss', 'stress_scale', float('nan')), ('loss', 'energy_scale', True),
+    ('loss', 'energy_normalization', 'total'),
+    ('training', 'gradient_clip_norm', 0), ('training', 'gradient_clip_norm', True),
+    ('training', 'scheduler', None), ('training', 'scheduler', {'kind': 'cosine'}),
+    ('training', 'scheduler', {'factor': 1}),
+    ('training', 'scheduler', {'patience': True}),
+    ('training', 'scheduler', {'monitor': 'force'}),
+    ('training', 'scheduler', {'mode': 'max'}),
+    ('training', 'scheduler', {'unknown': 1}),
+])
+def test_invalid_stability_options_fail_before_training(section, key, value):
+    payload = _payload()
+    payload[section][key] = value
+    with pytest.raises(TrainingRecipeError):
+        TrainingRecipeConfig.from_dict(payload)

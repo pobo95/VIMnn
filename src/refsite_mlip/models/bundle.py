@@ -2446,7 +2446,45 @@ def instantiate_reference_site_model_bundle(
                         state_key=key,
                     )
             model.load_state_dict(dict(bundle.model_state), strict=True)
+            # Check the stored representation before rebuilding fixed buffers:
+            # regeneration must never hide a corrupt serialized basis.
+            _validate_model_architecture(
+                model, stage="instantiate.stored_model_architecture"
+            )
+            runtime_basis = None
+            if (
+                config.higher_body.contract_version == SYMMETRIC_POWER_CONTRACT_VERSION
+                and stored_dtype != dtype
+            ):
+                bank = model.symmetric_cg_basis
+                # U is fixed canonical geometry, not a learned parameter.
+                # float32 -> float64 casting cannot restore its lost bits;
+                # materialize from canonical coefficients in the target dtype.
+                runtime_basis = SymmetricCGBasisBank(
+                    bank.input_irreps,
+                    bank.requested_output_irreps,
+                    bank.correlation_order,
+                    normalization=bank.normalization,
+                    basis_version=bank.basis_version,
+                    dtype=dtype,
+                    device=target_device,
+                )
             model.to(device=target_device, dtype=dtype)
+            if stored_dtype != dtype:
+                # These fixed buffers are bound to the canonical template too.
+                # Widening rounded float32 values would disagree with the
+                # template used by inference and prevent portable re-export.
+                for name in (
+                    "phase_mode_weights",
+                    "site_alignment_weights",
+                    "phase_channel_weights",
+                ):
+                    setattr(
+                        model, name,
+                        getattr(default, name).to(device=target_device, dtype=dtype).clone(),
+                    )
+            if runtime_basis is not None:
+                model.symmetric_cg_basis = runtime_basis
             _validate_model_architecture(
                 model, stage="instantiate.model_architecture"
             )

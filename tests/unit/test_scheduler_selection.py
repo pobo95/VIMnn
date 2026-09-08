@@ -101,6 +101,9 @@ def test_scheduler_config_validation(kwargs):
         {"monitor": "bad"},
         {"mode": "bad"},
         {"min_delta": -1.0},
+        {"relative_min_delta": -1.0},
+        {"relative_min_delta": True},
+        {"relative_min_delta": 1.0},
         {"early_stopping_patience": -1},
         {"early_stopping_patience": True},
     ],
@@ -156,6 +159,64 @@ def test_min_and_max_improvement_and_absolute_delta_boundary():
     assert not tie.is_best
     state, improved = _process(maximum, state, 2.101, 2)
     assert improved.is_best and state.best_metric == pytest.approx(5.101)
+
+
+def test_relative_improvement_threshold_accumulates_against_best():
+    minimum = _objects(
+        SchedulerConfig(mode="min"),
+        ModelSelectionConfig(mode="min", relative_min_delta=0.01),
+    )
+    state, first = _process(minimum, ModelSelectionState(), 97.0, 0)
+    assert first.is_best and state.best_metric == 100.0
+    state, too_small = _process(minimum, state, 96.5, 1)
+    assert not too_small.is_best
+    assert state.best_metric == 100.0
+    state, enough = _process(minimum, state, 95.9, 2)
+    assert enough.is_best
+    assert state.best_metric == pytest.approx(98.9)
+
+    maximum = _objects(
+        SchedulerConfig(mode="max"),
+        ModelSelectionConfig(mode="max", relative_min_delta=0.01),
+    )
+    state, _ = _process(maximum, ModelSelectionState(), 7.0, 0)
+    state, too_small = _process(maximum, state, 7.05, 1)
+    assert not too_small.is_best
+    state, enough = _process(maximum, state, 7.11, 2)
+    assert enough.is_best
+
+
+def test_relative_convergence_counts_toward_patience():
+    objects = _objects(
+        SchedulerConfig(mode="min"),
+        ModelSelectionConfig(
+            mode="min",
+            relative_min_delta=0.01,
+            early_stopping_patience=2,
+        ),
+    )
+    state, _ = _process(objects, ModelSelectionState(), 97.0, 0)
+    state, first_small_change = _process(objects, state, 96.5, 1)
+    assert not first_small_change.is_best
+    assert not first_small_change.should_stop
+    state, second_small_change = _process(objects, state, 96.4, 2)
+    assert not second_small_change.is_best
+    assert second_small_change.should_stop
+    assert state.epochs_since_improvement == 2
+    assert state.best_metric == 100.0
+
+
+def test_zero_relative_delta_preserves_legacy_serialization():
+    legacy = {
+        "monitor": "total_loss",
+        "mode": "min",
+        "min_delta": 0.0,
+        "early_stopping_patience": None,
+    }
+    assert ModelSelectionConfig().to_dict() == legacy
+    assert ModelSelectionConfig.from_dict(legacy) == ModelSelectionConfig()
+    configured = ModelSelectionConfig(relative_min_delta=1.0e-3)
+    assert configured.to_dict()["relative_min_delta"] == 1.0e-3
 
 
 @pytest.mark.parametrize("patience, stop_bad_event", [(0, 1), (1, 1), (2, 2)])

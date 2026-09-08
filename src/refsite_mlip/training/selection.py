@@ -42,6 +42,7 @@ class ModelSelectionConfig:
     mode: str = "min"
     min_delta: float = 0.0
     early_stopping_patience: int | None = None
+    relative_min_delta: float = 0.0
 
     def __post_init__(self) -> None:
         if self.monitor not in _MONITORS:
@@ -53,6 +54,12 @@ class ModelSelectionConfig:
         object.__setattr__(
             self, "min_delta", _finite_nonnegative("min_delta", self.min_delta)
         )
+        relative = _finite_nonnegative(
+            "relative_min_delta", self.relative_min_delta
+        )
+        if relative >= 1.0:
+            raise ValueError("relative_min_delta must be smaller than 1")
+        object.__setattr__(self, "relative_min_delta", relative)
         object.__setattr__(
             self,
             "early_stopping_patience",
@@ -62,7 +69,12 @@ class ModelSelectionConfig:
         )
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        result = asdict(self)
+        # Omit the additive relative criterion at its legacy value so existing
+        # canonical configurations and fingerprints remain byte-exact.
+        if self.relative_min_delta == 0.0:
+            result.pop("relative_min_delta")
+        return result
 
     @classmethod
     def from_dict(cls, values: Mapping[str, Any]) -> "ModelSelectionConfig":
@@ -237,12 +249,21 @@ def process_primary_validation(
     metric = _extract_metric(validation_epoch_result, selection_config.monitor)
 
     first = selection_state.validation_events == 0
+    required_improvement = (
+        0.0
+        if first
+        else max(
+            selection_config.min_delta,
+            abs(float(selection_state.best_metric))
+            * selection_config.relative_min_delta,
+        )
+    )
     if first:
         improved = True
     elif selection_config.mode == "min":
-        improved = metric < selection_state.best_metric - selection_config.min_delta
+        improved = metric < selection_state.best_metric - required_improvement
     else:
-        improved = metric > selection_state.best_metric + selection_config.min_delta
+        improved = metric > selection_state.best_metric + required_improvement
 
     if improved:
         best_metric = metric

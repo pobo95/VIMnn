@@ -18,6 +18,7 @@ from refsite_mlip.training.metrics_journal import (
     CommittedEpochMetrics,
     CommittedEpochProvenance,
 )
+from refsite_mlip.training.losses import PhysicalErrorSums
 
 
 _HASH_A = "a" * 64
@@ -79,6 +80,7 @@ def _summary(**overrides: object) -> TrainingStartSummary:
         "scheduler_mode": "min",
         "max_epochs": 4,
         "early_stop_patience": 3,
+        "early_stop_relative_delta": 1.0e-3,
         "output_directory": "/display/run-output",
         "initial_bundle_fingerprint": _HASH_A,
         "train_semantic_digest": _HASH_B,
@@ -133,6 +135,22 @@ def _event(
             train_data_fingerprint=_HASH_B,
             validation_data_fingerprint=_HASH_C,
             template_fingerprints=(("a-template", _HASH_A),),
+        ),
+        training_reporting=PhysicalErrorSums(
+            energy_per_atom_squared_sum=4.0,
+            energy_structure_count=1,
+            force_squared_sum=9.0,
+            force_reference_squared_sum=36.0,
+            force_component_count=4,
+            stress_squared_sum=16.0,
+            stress_component_count=4,
+        ),
+        validation_reporting=PhysicalErrorSums(
+            energy_per_atom_squared_sum=1.0,
+            energy_structure_count=4,
+            force_squared_sum=4.0,
+            force_reference_squared_sum=16.0,
+            force_component_count=4,
         ),
     )
 
@@ -253,6 +271,7 @@ def test_start_block_contains_runtime_snapshot_and_resume_context() -> None:
     assert "Baseline: minimum_norm/fitted [-1.25, 2.5]" in text
     assert "Resume: checkpoint_epoch=2, step=7" in text
     assert "journal_recovered=1" in text
+    assert "relative improvement=0.1%" in text
 
 
 def test_epoch_block_is_one_based_fixed_lines_and_formats_na() -> None:
@@ -269,14 +288,18 @@ def test_epoch_block_is_one_based_fixed_lines_and_formats_na() -> None:
 
     assert epoch_lines[0] == "Epoch 001/4 | step=2"
     assert epoch_lines[1] == (
-        "  train [pre_update_batch_observations] total=1.25 "
-        "E=1 F=n/a S=2"
+        "  train [pre_update_batch_observations] loss=1.25 "
+        "RMSE_E/atom=2000 meV/atom RMSE_F=1500 meV/A "
+        "relative_F=50% RMSE_S=2000 meV/A^3"
     )
     assert epoch_lines[2] == (
-        "  valid [fixed_model_validation] total=2 E=1 F=2 S=n/a"
+        "  valid [fixed_model_validation] loss=2 "
+        "RMSE_E/atom=500 meV/atom RMSE_F=1000 meV/A "
+        "relative_F=50% RMSE_S=n/a meV/A^3"
     )
     assert "lr(before)=0.0005 lr(next)=0.00025" in epoch_lines[3]
-    assert "best=yes stop=no checkpoint=epoch_000000.pt" in epoch_lines[3]
+    assert "best=yes stop=no no-improvement=0/3 relative-delta=0.1%" in epoch_lines[3]
+    assert "checkpoint=epoch_000000.pt" in epoch_lines[3]
     assert epoch_lines[3].endswith("elapsed=4.0s eta=12.0s")
     assert renderer.session_event_count == 1
 
@@ -467,6 +490,13 @@ def test_quiet_suppresses_progress_but_not_terminal_result() -> None:
     assert stream.getvalue() == (
         "Training completed | epochs=1 step=2 best_epoch=1 "
         "best=2 latest=latest.pt\n"
+        "Final recorded RMSE\n"
+        "  train [pre_update_batch_observations] loss=1.25 "
+        "RMSE_E/atom=2000 meV/atom RMSE_F=1500 meV/A "
+        "relative_F=50% RMSE_S=2000 meV/A^3\n"
+        "  valid [fixed_model_validation] loss=2 "
+        "RMSE_E/atom=500 meV/atom RMSE_F=1000 meV/A "
+        "relative_F=50% RMSE_S=n/a meV/A^3\n"
     )
     assert renderer.session_event_count == 0
 
@@ -580,3 +610,15 @@ def test_renderer_failure_never_escapes_composed_observer() -> None:
     observer(_event(1, start=2, end=4, is_best=False))
     assert committed == [0, 1]
     assert renderer.presentation_error is not None
+
+
+def test_start_reports_energy_normalization_and_gradient_clipping():
+    stream = io.StringIO()
+    renderer = TrainingProgressRenderer(stream=stream, monotonic=_Clock(10.0))
+    renderer.render_start(_summary(energy_normalization='per_atom', gradient_clip_norm=2.0))
+    assert 'Energy normalization: per_atom' in stream.getvalue()
+    assert 'Gradient clipping: 2.0' in stream.getvalue()
+    with pytest.raises(ValueError):
+        _summary(energy_normalization='invalid')
+    with pytest.raises(ValueError):
+        _summary(gradient_clip_norm=0)

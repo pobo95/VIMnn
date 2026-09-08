@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 import math
 from numbers import Integral
 from typing import Any, Literal
@@ -12,7 +12,7 @@ import torch
 
 from refsite_mlip.data import StructureBatch
 
-from .losses import LossConfig
+from .losses import LossConfig, PhysicalErrorSums
 from .step import TrainStepConfig, train_step
 from .validation import ValidationStepConfig, validation_step
 
@@ -73,12 +73,21 @@ class EpochResult(EpochMetrics):
     successful_optimizer_steps: int
     ordered_batch_sample_ids: tuple[tuple[str, ...], ...]
     metric_semantics: str
+    reporting: PhysicalErrorSums = field(
+        default_factory=PhysicalErrorSums,
+        compare=False,
+        repr=False,
+    )
 
     def __getitem__(self, key):
         return getattr(self, key)
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        result = asdict(self)
+        # Physical-unit reporting is deliberately live presentation metadata,
+        # not part of the checkpoint/history serialization contract.
+        result.pop("reporting")
+        return result
 
     @classmethod
     def from_dict(cls, values: Mapping[str, Any]) -> "EpochResult":
@@ -119,6 +128,33 @@ def _term_metrics(results, name: str) -> EpochTermMetrics:
     return EpochTermMetrics(numerator, denominator, mean, valid_count)
 
 
+def _reporting_metrics(results) -> PhysicalErrorSums:
+    values = tuple(result.reporting for result in results)
+    return PhysicalErrorSums(
+        energy_per_atom_squared_sum=math.fsum(
+            value.energy_per_atom_squared_sum for value in values
+        ),
+        energy_structure_count=sum(
+            value.energy_structure_count for value in values
+        ),
+        force_squared_sum=math.fsum(
+            value.force_squared_sum for value in values
+        ),
+        force_reference_squared_sum=math.fsum(
+            value.force_reference_squared_sum for value in values
+        ),
+        force_component_count=sum(
+            value.force_component_count for value in values
+        ),
+        stress_squared_sum=math.fsum(
+            value.stress_squared_sum for value in values
+        ),
+        stress_component_count=sum(
+            value.stress_component_count for value in values
+        ),
+    )
+
+
 def _is_supervised(result) -> bool:
     explicit = getattr(result, "has_supervision", None)
     if explicit is not None:
@@ -143,6 +179,7 @@ def _epoch_result(
     energy = _term_metrics(results, "energy")
     force = _term_metrics(results, "force")
     stress = _term_metrics(results, "stress")
+    reporting = _reporting_metrics(results)
     total_loss = math.fsum(
         (
             loss_config.energy_weight * energy.mean,
@@ -172,6 +209,7 @@ def _epoch_result(
             if phase == "train"
             else VALIDATION_METRIC_SEMANTICS
         ),
+        reporting=reporting,
     )
 
 

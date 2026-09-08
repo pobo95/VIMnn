@@ -38,12 +38,12 @@ from test_grouped_evaluation_phase_batch import _adaptive_case
 from test_model_bundle_runtime import _phase_from_template
 
 
-def _capture_v2(typed_crystal, *, edge_backend=False):
+def _capture_v2(typed_crystal, *, edge_backend=False, dtype=torch.float64):
     data, _, registry, samples, batch, contexts, policies = _adaptive_case(
         typed_crystal
     )
     default = registry.resolve("zeta")
-    config = v2_configuration(torch.float64, order=3, layers=2)
+    config = v2_configuration(dtype, order=3, layers=2)
     if edge_backend:
         config = replace(
             config,
@@ -69,7 +69,7 @@ def _capture_v2(typed_crystal, *, edge_backend=False):
             default.site_alignment_weights,
             default.phase_channel_weights,
             (-1.0, 2.0),
-        ).to(dtype=torch.float64)
+        ).to(dtype=dtype)
     artifacts = {}
     phases: dict[str, PhaseSpecification] = {}
     for template_id in ("alpha", "zeta"):
@@ -350,14 +350,36 @@ def test_v2_bundle_adaptive_grouped_branch_and_sparse_parity(
     assert torch.equal(predicted.stress, reconstructed.stress)
 
 
+@pytest.mark.parametrize("stored_dtype", [torch.float32, torch.float64])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
 def test_v2_bundle_cpu_materialization_predictor_and_ase(
-    typed_crystal, tmp_path, dtype
+    typed_crystal, tmp_path, dtype, stored_dtype
 ):
-    *_, samples, _, _, _, bundle = _capture_v2(typed_crystal)
+    *_, samples, _, _, _, bundle = _capture_v2(typed_crystal, dtype=stored_dtype)
     path = tmp_path / f"symmetric-{dtype}.pt"
     save_reference_site_model_bundle(path, bundle)
+    original_state = {key: value.clone() for key, value in bundle.model_state.items()}
     predictor = load_reference_site_predictor(path, device="cpu", dtype=dtype)
+    predictor.model.symmetric_cg_basis.validate_integrity()
+    converted_state = predictor.model.state_dict()
+    template = bundle.validate()[bundle.default_template_id]
+    template_buffers = {"phase_mode_weights", "site_alignment_weights", "phase_channel_weights"}
+    for key, source in original_state.items():
+        assert torch.equal(bundle.model_state[key], source)
+        if not key.startswith("symmetric_cg_basis."):
+            if key in template_buffers:
+                expected = getattr(template, key).to(dtype=dtype)
+            else:
+                expected = source.to(dtype=dtype) if source.is_floating_point() else source
+            assert torch.equal(converted_state[key], expected)
+    if stored_dtype == torch.float32 and dtype == torch.float64:
+        # Nontrivial CG coefficients must recover canonical float64 precision,
+        # rather than merely widening the rounded float32 representation.
+        assert any(
+            not torch.equal(converted_state[key], source.to(dtype=dtype))
+            for key, source in original_state.items()
+            if key.startswith("symmetric_cg_basis.")
+        )
     assert all(
         value.dtype == dtype
         for value in predictor.model.state_dict().values()
@@ -616,3 +638,36 @@ def test_v2_bundle_cuda_materialization_smoke(typed_crystal, dtype):
         assert value.device.type == "cuda"
         assert value.dtype == dtype
         assert bool(torch.all(torch.isfinite(value)))
+
+
+def test_v2_float32_promotion_rejects_corrupt_basis_before_regeneration(typed_crystal):
+    *_, bundle = _capture_v2(typed_crystal, dtype=torch.float32)
+    key = next(key for key in bundle.model_state if key.startswith("symmetric_cg_basis."))
+    # Even the already-loaded in-memory representation must be validated.
+    bundle.model_state[key].reshape(-1)[0] += 1.0
+    with pytest.raises(ModelBundleError):
+        instantiate_reference_site_model_bundle(bundle, dtype=torch.float64)
+
+
+def test_v2_promoted_float32_bundle_can_be_recaptured(typed_crystal, tmp_path):
+    *_, bundle = _capture_v2(typed_crystal, dtype=torch.float32)
+    loaded = instantiate_reference_site_model_bundle(bundle, dtype=torch.float64)
+    promoted = capture_reference_site_model_bundle(
+        model=loaded.model,
+        structural_artifacts={
+            item.template_id: item.structural_artifact for item in bundle.template_bindings
+        },
+        phase_specifications={
+            item.template_id: item.phase_specification for item in bundle.template_bindings
+        },
+        evaluation_policies=loaded.evaluation_policies,
+        default_template_id=loaded.default_template_id,
+    )
+    path = tmp_path / "promoted.pt"
+    save_reference_site_model_bundle(path, promoted)
+    restored = instantiate_reference_site_model_bundle(
+        load_reference_site_model_bundle(path), dtype=torch.float64
+    )
+    assert promoted.model_floating_dtype == "float64"
+    for key, value in loaded.model.state_dict().items():
+        assert torch.equal(restored.model.state_dict()[key], value)

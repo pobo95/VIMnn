@@ -88,6 +88,125 @@ class PotentialLossOutput:
         return getattr(self, key)
 
 
+@dataclass(frozen=True)
+class PhysicalErrorSums:
+    """Detached additive diagnostics in the package's physical units.
+
+    These values are presentation-only.  They never participate in the loss,
+    backward graph, optimizer, model selection, or persisted checkpoint and
+    metrics-journal contracts.
+    """
+
+    energy_per_atom_squared_sum: float = 0.0
+    energy_structure_count: int = 0
+    force_squared_sum: float = 0.0
+    force_reference_squared_sum: float = 0.0
+    force_component_count: int = 0
+    stress_squared_sum: float = 0.0
+    stress_component_count: int = 0
+
+    def __post_init__(self) -> None:
+        for name in (
+            "energy_per_atom_squared_sum",
+            "force_squared_sum",
+            "force_reference_squared_sum",
+            "stress_squared_sum",
+        ):
+            value = float(getattr(self, name))
+            if not math.isfinite(value) or value < 0.0:
+                raise ValueError(f"{name} must be finite and nonnegative")
+            object.__setattr__(self, name, value)
+        for name in (
+            "energy_structure_count",
+            "force_component_count",
+            "stress_component_count",
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise TypeError(f"{name} must be a nonnegative integer")
+
+
+def _detached_float(value: torch.Tensor) -> float:
+    return float(value.detach().cpu())
+
+
+def compute_physical_error_sums(
+    prediction,
+    batch: StructureBatch,
+    config: LossConfig,
+) -> PhysicalErrorSums:
+    """Return exact additive RMSE diagnostics without altering loss scaling."""
+
+    energy_sum = 0.0
+    energy_count = 0
+    if config.energy_weight > 0.0 and bool(torch.any(batch.energy_mask)):
+        valid = batch.energy_mask
+        atom_counts = (batch.atom_ptr[1:] - batch.atom_ptr[:-1]).to(
+            dtype=prediction.energy.dtype
+        )[valid]
+        residual = (prediction.energy[valid] - batch.energy[valid]) / atom_counts
+        energy_sum = _detached_float(torch.sum(residual.square()))
+        energy_count = int(torch.count_nonzero(valid).detach().cpu())
+
+    force_sum = 0.0
+    force_reference_sum = 0.0
+    force_count = 0
+    if config.force_weight > 0.0:
+        valid = batch.force_mask & batch.force_present[batch.atom_batch, None]
+        if bool(torch.any(valid)):
+            residual = prediction.forces[valid] - batch.forces[valid]
+            target = batch.forces[valid]
+            force_sum = _detached_float(torch.sum(residual.square()))
+            force_reference_sum = _detached_float(torch.sum(target.square()))
+            force_count = int(torch.count_nonzero(valid).detach().cpu())
+
+    stress_sum = 0.0
+    stress_count = 0
+    if config.stress_weight > 0.0:
+        valid_mask = batch.stress_mask & batch.stress_present[:, None, None]
+        diagonal = torch.arange(3, device=batch.device)
+        diagonal_valid = valid_mask[:, diagonal, diagonal]
+        pairs = ((0, 1), (0, 2), (1, 2))
+        off_valid = torch.stack(
+            [valid_mask[:, first, second] for first, second in pairs], dim=1
+        )
+        if bool(torch.any(diagonal_valid)) or bool(torch.any(off_valid)):
+            diagonal_residual = (
+                prediction.stress[:, diagonal, diagonal]
+                - batch.stress[:, diagonal, diagonal]
+            )[diagonal_valid]
+            off_residual = torch.stack(
+                [
+                    prediction.stress[:, first, second]
+                    - batch.stress[:, first, second]
+                    for first, second in pairs
+                ],
+                dim=1,
+            )[off_valid]
+            stress_sum = _detached_float(
+                torch.sum(diagonal_residual.square())
+                + 2.0 * torch.sum(off_residual.square())
+            )
+            stress_count = int(
+                (
+                    torch.count_nonzero(diagonal_valid)
+                    + torch.count_nonzero(off_valid)
+                )
+                .detach()
+                .cpu()
+            )
+
+    return PhysicalErrorSums(
+        energy_per_atom_squared_sum=energy_sum,
+        energy_structure_count=energy_count,
+        force_squared_sum=force_sum,
+        force_reference_squared_sum=force_reference_sum,
+        force_component_count=force_count,
+        stress_squared_sum=stress_sum,
+        stress_component_count=stress_count,
+    )
+
+
 def _zero_term(anchor: torch.Tensor) -> LossTerm:
     zero = anchor * 0.0
     denominator = anchor.new_zeros(())

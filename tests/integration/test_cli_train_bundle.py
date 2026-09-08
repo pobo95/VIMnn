@@ -219,7 +219,9 @@ def test_bundle_progress_summary_and_quiet_are_trajectory_neutral(
     assert "Epoch 001/1" in rendered
     assert "checkpoint=epoch_000000.pt" in rendered
     assert "elapsed=2.5s eta=0.0s" in rendered
-    assert rendered.rstrip().endswith("latest=latest.pt")
+    assert "Training completed | epochs=1 step=1" in rendered
+    assert "Final recorded RMSE\n" in rendered
+    assert rendered.rstrip().endswith("RMSE_S=n/a meV/A^3")
     assert (
         visible_root / "run-output" / "training.log"
     ).read_text(encoding="utf-8") == rendered

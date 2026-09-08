@@ -36,7 +36,7 @@ from .checkpoint import (
 from .fit import FitConfig
 from .scheduler import SchedulerConfig, _validate_scheduler_binding
 from .optimizer import validate_optimizer_binding
-from .selection import ModelSelectionState
+from .selection import ModelSelectionConfig, ModelSelectionState
 
 
 class CheckpointCompatibilityError(ValueError):
@@ -222,7 +222,15 @@ def _validate_configs(
             f"resolved configuration is missing keys: {sorted(missing)}"
         )
     current = {
-        key: _canonical(resolved_configs[key], path=f"resolved_configs.{key}")
+        key: _canonical(
+            (
+                resolved_configs[key].to_dict()
+                if key == "model_selection"
+                and isinstance(resolved_configs[key], ModelSelectionConfig)
+                else resolved_configs[key]
+            ),
+            path=f"resolved_configs.{key}",
+        )
         for key in _CONFIG_KEYS
     }
     saved = checkpoint.metadata.resolved_configuration

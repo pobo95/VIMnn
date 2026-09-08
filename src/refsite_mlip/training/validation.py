@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Any, Mapping
 
 import torch
@@ -11,7 +11,13 @@ from refsite_mlip.data import StructureBatch
 from refsite_mlip.models import evaluate_structure_batch
 from refsite_mlip.transport import TRAIN_FIXED
 
-from .losses import LossConfig, LossTerm, compute_potential_loss
+from .losses import (
+    LossConfig,
+    LossTerm,
+    PhysicalErrorSums,
+    compute_physical_error_sums,
+    compute_potential_loss,
+)
 from .step import (
     _active_terms,
     _has_force_supervision,
@@ -60,6 +66,11 @@ class ValidationStepResult:
     need_stress: bool
     sample_ids: tuple[str, ...]
     solver_path: str
+    reporting: PhysicalErrorSums = field(
+        default_factory=PhysicalErrorSums,
+        compare=False,
+        repr=False,
+    )
 
     def __getitem__(self, key):
         return getattr(self, key)
@@ -179,6 +190,9 @@ def validation_step(
             )
             loss = compute_potential_loss(prediction, local_batch, loss_config)
             _require_loss_finite(loss, loss_config, batch.sample_ids)
+            reporting = compute_physical_error_sums(
+                prediction, local_batch, loss_config
+            )
 
         energy = _term_result(loss.energy)
         force = _term_result(loss.force)
@@ -199,6 +213,7 @@ def validation_step(
             need_stress=need_stress,
             sample_ids=batch.sample_ids,
             solver_path=config.solver_path,
+            reporting=reporting,
         )
     finally:
         try:

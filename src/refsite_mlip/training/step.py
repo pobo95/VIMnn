@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 import math
 from numbers import Real
 from typing import Any, Mapping
@@ -13,7 +13,13 @@ from refsite_mlip.data import StructureBatch
 from refsite_mlip.models import evaluate_structure_batch
 from refsite_mlip.transport import TRAIN_FIXED
 
-from .losses import LossConfig, LossTerm, compute_potential_loss
+from .losses import (
+    LossConfig,
+    LossTerm,
+    PhysicalErrorSums,
+    compute_physical_error_sums,
+    compute_potential_loss,
+)
 from .optimizer import validate_optimizer_binding
 
 
@@ -81,6 +87,11 @@ class TrainStepResult:
     need_forces: bool
     need_stress: bool
     sample_ids: tuple[str, ...]
+    reporting: PhysicalErrorSums = field(
+        default_factory=PhysicalErrorSums,
+        compare=False,
+        repr=False,
+    )
 
     def __getitem__(self, key):
         return getattr(self, key)
@@ -212,6 +223,9 @@ def train_step(
         return_aux=False,
     )
     loss = compute_potential_loss(prediction, step_batch, loss_config)
+    reporting = compute_physical_error_sums(
+        prediction, step_batch, loss_config
+    )
     active = _active_terms(loss, loss_config)
     supervised = tuple(name for name, _, term in active if bool(term.valid_count))
     if not supervised:
@@ -270,4 +284,5 @@ def train_step(
         need_forces=need_forces,
         need_stress=need_stress,
         sample_ids=batch.sample_ids,
+        reporting=reporting,
     )

@@ -6,6 +6,7 @@ import hashlib
 import importlib
 import json
 import os
+from pathlib import Path
 import random
 
 import numpy as np
@@ -32,6 +33,7 @@ from refsite_mlip.training import (
     committed_epoch_provenance_from_checkpoint_metadata,
 )
 from refsite_mlip.training.checkpoint_manager import ManagedCheckpointResult
+from refsite_mlip.training.losses import PhysicalErrorSums
 
 
 module = importlib.import_module("refsite_mlip.training.metrics_journal")
@@ -345,6 +347,23 @@ def test_atomic_one_and_two_epoch_append_preserves_prefix(owned_journal):
         canonical_runtime_json(second.to_dict()) + "\n"
     ).encode()
     assert journal.summary().metrics_event_count == 2
+
+
+def test_live_physical_reporting_does_not_change_v1_journal_bytes():
+    event = _event(0, Path("/display/checkpoints"))
+    reported = replace(
+        event,
+        training_reporting=PhysicalErrorSums(
+            energy_per_atom_squared_sum=1.0,
+            energy_structure_count=1,
+        ),
+        validation_reporting=PhysicalErrorSums(
+            force_squared_sum=2.0,
+            force_reference_squared_sum=8.0,
+            force_component_count=3,
+        ),
+    )
+    assert reported.to_dict() == event.to_dict()
 
 
 def test_journal_append_does_not_consume_process_rng(owned_journal):

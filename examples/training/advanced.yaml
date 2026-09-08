@@ -72,11 +72,21 @@ loss:
   forces_weight: 100.0
   # A positive value requires valid stress labels in the extended-XYZ files.
   stress_weight: 10.0
+  # Optional. Defaults preserve per-structure energy and scales of 1.
+  # per_atom divides the energy error by atom count BEFORE squaring.
+  energy_normalization: per_atom
+  # Positive divisors of residuals, not multipliers of the loss.
+  # Energy units are eV/atom for per_atom, eV for per_structure.
+  # Estimate dataset-specific values from TRAIN labels only; these 1s are neutral.
+  energy_scale: 1.0
+  force_scale: 1.0  # eV/angstrom
+  stress_scale: 1.0 # eV/angstrom^3
 
 radii:
   # Angstrom. OT atom-to-reference support cutoff.
   r_ot: 4.0
   # Angstrom. Message-passing graph cutoff. Switch/skin radii are derived.
+  # New training derives MP radial normalization from r_mp: x=(r/r_mp)^2.
   r_mp: 3.0
 
 # Recommended for production. Train compositions must have full rank so each
@@ -88,10 +98,23 @@ training:
   batch_size: 5
   validation_batch_size: 5
   max_epochs: 500
-  # Current public optimizer knob; training uses AdamW with zero weight decay.
+  # Training uses AdamW with zero weight decay.
   learning_rate: 1.0e-3
-  # Default: stop after 15 consecutive validation epochs without improvement.
-  early_stopping_patience: 15
+  # Optional; null (default) disables global gradient clipping.
+  gradient_clip_norm: 1.0
+  # Optional; omission keeps the scheduler disabled. One step per validation epoch.
+  scheduler:
+    kind: reduce_on_plateau
+    factor: 0.5
+    patience: 5
+    threshold: 1.0e-3
+    threshold_mode: rel
+    cooldown: 2
+    min_lr: 1.0e-6
+  # Default is 15. Allow recovery after LR reductions; null disables early stopping.
+  early_stopping_patience: 30
+  # A smaller change is treated as convergence; 1e-3 means 0.1% of the best loss.
+  early_stopping_relative_delta: 1.0e-3
 
 runtime:
   # Use cuda only on a CUDA-capable system; cpu remains supported.

@@ -52,12 +52,12 @@ def _tree_equal(left, right):
     return left == right
 
 
-def _configs(model, max_epochs, *, scheduler_kind="none"):
+def _configs(model, max_epochs, *, scheduler_kind="none", stability_options=False):
     return {
         "model": model.config,
-        "loss": LossConfig(energy_weight=1.0),
+        "loss": LossConfig(energy_weight=1.0, energy_normalization="per_atom" if stability_options else "per_structure", energy_scale=0.03 if stability_options else 1.0),
         "optimizer": OptimizerConfig(learning_rate=1.0e-4, weight_decay=0.0),
-        "train_step": TrainStepConfig(),
+        "train_step": TrainStepConfig(gradient_clip_norm=0.1 if stability_options else None),
         "validation_step": ValidationStepConfig(),
         "scheduler": SchedulerConfig(kind=scheduler_kind, patience=0),
         "model_selection": ModelSelectionConfig(),
@@ -292,9 +292,10 @@ def test_v2_semantic_corruption_fails_before_runtime_or_rng_mutation(
     assert torch.equal(torch.get_rng_state(), torch_before)
 
 
+@pytest.mark.parametrize("stability_options", [False, True])
 @pytest.mark.parametrize("scheduler_kind", ["none", "reduce_on_plateau"])
 def test_v2_cpu_float64_continuous_three_epochs_equals_one_plus_resume(
-    typed_crystal, scheduler_kind
+    typed_crystal, scheduler_kind, stability_options
 ):
     rng_entry = (
         random.getstate(),
@@ -305,7 +306,7 @@ def test_v2_cpu_float64_continuous_three_epochs_equals_one_plus_resume(
         _capture_v2(typed_crystal)
     )
     continuous_configs = _configs(
-        continuous_model, 3, scheduler_kind=scheduler_kind
+        continuous_model, 3, scheduler_kind=scheduler_kind, stability_options=stability_options
     )
     continuous_optimizer = build_optimizer(
         continuous_model, continuous_configs["optimizer"]
@@ -336,7 +337,7 @@ def test_v2_cpu_float64_continuous_three_epochs_equals_one_plus_resume(
     _, split_model, _, _, split_batch, split_contexts, _, split_bundle = _capture_v2(
         typed_crystal
     )
-    split_configs = _configs(split_model, 1, scheduler_kind=scheduler_kind)
+    split_configs = _configs(split_model, 1, scheduler_kind=scheduler_kind, stability_options=stability_options)
     split_optimizer = build_optimizer(split_model, split_configs["optimizer"])
     split_scheduler = build_scheduler(split_optimizer, split_configs["scheduler"])
     first = run_fit(
@@ -387,7 +388,7 @@ def test_v2_cpu_float64_continuous_three_epochs_equals_one_plus_resume(
     )
     resumed_model = loaded.model
     resumed_configs = _configs(
-        resumed_model, 3, scheduler_kind=scheduler_kind
+        resumed_model, 3, scheduler_kind=scheduler_kind, stability_options=stability_options
     )
     resumed_optimizer = build_optimizer(
         resumed_model, resumed_configs["optimizer"]

@@ -7,6 +7,7 @@ import torch
 
 from refsite_mlip.data import StructureBatch
 from refsite_mlip.training import LossConfig, compute_potential_loss
+from refsite_mlip.training.losses import compute_physical_error_sums
 
 
 def _batch(
@@ -111,6 +112,56 @@ def test_manual_per_structure_and_per_atom_energy_loss():
     )
     assert torch.equal(per_atom.energy.numerator, energy.new_tensor(2.0))
     assert torch.equal(per_atom.energy.mean, energy.new_tensor(1.0))
+
+
+def test_physical_rmse_sums_are_exact_unscaled_and_additive():
+    force_target = torch.tensor(
+        [[1.0, 0.0, -1.0], [2.0, 0.0, -2.0], [3.0, 0.0, -3.0]],
+        dtype=torch.float64,
+    )
+    force_error = torch.tensor(
+        [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6], [0.7, 0.8, 0.9]],
+        dtype=torch.float64,
+    )
+    stress_error = _symmetric_stress()
+    batch = _batch(
+        (1, 2),
+        energy=(10.0, 20.0),
+        energy_mask=(True, True),
+        forces=force_target,
+        force_mask=torch.ones((3, 3), dtype=torch.bool),
+        force_present=(True, True),
+        stress=torch.zeros((2, 3, 3), dtype=torch.float64),
+        stress_mask=torch.ones((2, 3, 3), dtype=torch.bool),
+        stress_present=(True, True),
+    )
+    predicted_stress = torch.stack((stress_error, 2.0 * stress_error))
+    prediction = _prediction(
+        torch.tensor([12.0, 26.0], dtype=torch.float64),
+        forces=force_target + force_error,
+        stress=predicted_stress,
+    )
+    config = LossConfig(
+        energy_weight=1.0,
+        force_weight=1.0,
+        stress_weight=1.0,
+        energy_scale=17.0,
+        force_scale=19.0,
+        stress_scale=23.0,
+    )
+    sums = compute_physical_error_sums(prediction, batch, config)
+
+    # Per-structure energy errors are divided by their own atom count: 2/1, 6/2.
+    assert sums.energy_per_atom_squared_sum == pytest.approx(2.0**2 + 3.0**2)
+    assert sums.energy_structure_count == 2
+    assert sums.force_squared_sum == pytest.approx(float(force_error.square().sum()))
+    assert sums.force_reference_squared_sum == pytest.approx(
+        float(force_target.square().sum())
+    )
+    assert sums.force_component_count == 9
+    expected_stress = float(stress_error.square().sum()) * (1.0 + 4.0)
+    assert sums.stress_squared_sum == pytest.approx(expected_stress)
+    assert sums.stress_component_count == 12
 
 
 def test_force_partial_components_and_zero_energy_label_are_distinct_from_missing():

@@ -617,7 +617,14 @@ class TrainingRuntimeConfig:
 
 def _parse_existing_config(name: str, cls, value: Any):
     expected = frozenset(item.name for item in dataclass_fields(cls))
-    payload = _strict_keys(value, expected, name=name)
+    normalized = value
+    if name == "selection" and isinstance(value, Mapping):
+        # relative_min_delta is an additive selection control. Legacy
+        # canonical v1/v2 payloads omit it and retain their byte-exact
+        # serialization/fingerprint by resolving to the legacy zero value.
+        normalized = dict(value)
+        normalized.setdefault("relative_min_delta", 0.0)
+    payload = _strict_keys(normalized, expected, name=name)
     if name in ("train_step", "validation_step"):
         solver_path = payload["solver_path"]
         if solver_path != TRAIN_FIXED:

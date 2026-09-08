@@ -19,6 +19,7 @@ from refsite_mlip.training import (
     run_training_epoch,
     run_validation_epoch,
 )
+from refsite_mlip.training.losses import PhysicalErrorSums
 
 
 epoch_module = importlib.import_module("refsite_mlip.training.epoch")
@@ -62,7 +63,15 @@ def _term(kind, numerator, denominator, valid_count):
     return cls(float(numerator), float(denominator), float(mean), int(valid_count))
 
 
-def _result(kind, batch, energy, force=(0, 0, 0), stress=(0, 0, 0), supervised=True):
+def _result(
+    kind,
+    batch,
+    energy,
+    force=(0, 0, 0),
+    stress=(0, 0, 0),
+    supervised=True,
+    reporting=None,
+):
     e = _term(kind, *energy)
     f = _term(kind, *force)
     s = _term(kind, *stress)
@@ -75,6 +84,7 @@ def _result(kind, batch, energy, force=(0, 0, 0), stress=(0, 0, 0), supervised=T
         force=f,
         stress=s,
         sample_ids=batch.sample_ids,
+        reporting=PhysicalErrorSums() if reporting is None else reporting,
     )
     if kind == "train":
         return TrainStepResult(
@@ -119,6 +129,58 @@ def test_unequal_denominator_aggregation_is_not_batch_mean(monkeypatch):
     assert epoch.global_step_start == epoch.global_step_end == 11
     assert epoch.number_of_structures == 2 and epoch.number_of_atoms == 3
     assert epoch.ordered_batch_sample_ids == (("first",), ("second",))
+
+
+def test_physical_reporting_sums_aggregate_without_entering_serialization(monkeypatch):
+    batches = (_batch("first"), _batch("second"))
+    results = {
+        "first": _result(
+            "validation",
+            batches[0],
+            (1, 1, 1),
+            reporting=PhysicalErrorSums(
+                energy_per_atom_squared_sum=1.0,
+                energy_structure_count=1,
+                force_squared_sum=2.0,
+                force_reference_squared_sum=8.0,
+                force_component_count=3,
+            ),
+        ),
+        "second": _result(
+            "validation",
+            batches[1],
+            (1, 1, 1),
+            reporting=PhysicalErrorSums(
+                energy_per_atom_squared_sum=4.0,
+                energy_structure_count=1,
+                force_squared_sum=3.0,
+                force_reference_squared_sum=12.0,
+                force_component_count=3,
+            ),
+        ),
+    }
+    monkeypatch.setattr(
+        epoch_module,
+        "validation_step",
+        lambda model, batch, *args: results[batch.sample_ids[0]],
+    )
+    epoch = run_validation_epoch(
+        TinyModel(),
+        batches,
+        {},
+        LossConfig(),
+        ValidationStepConfig(),
+        epoch_index=0,
+        global_step=0,
+    )
+    assert epoch.reporting == PhysicalErrorSums(
+        energy_per_atom_squared_sum=5.0,
+        energy_structure_count=2,
+        force_squared_sum=5.0,
+        force_reference_squared_sum=20.0,
+        force_component_count=6,
+    )
+    assert "reporting" not in epoch.to_dict()
 
 
 def test_full_vs_split_validation_and_unlabeled_exclusion(monkeypatch):

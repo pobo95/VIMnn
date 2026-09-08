@@ -399,7 +399,7 @@ def _validate_static_metadata(
         ),
         "scheduler": _plain(scheduler_config, path="scheduler_config"),
         "model_selection": _plain(
-            selection_config, path="model_selection_config"
+            selection_config.to_dict(), path="model_selection_config"
         ),
         "fit": _plain(fit_config, path="fit_config"),
     }

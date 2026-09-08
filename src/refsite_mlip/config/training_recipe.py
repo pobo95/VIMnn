@@ -61,11 +61,12 @@ from .training_run import (
 TRAINING_RECIPE_SCHEMA_VERSION = "refsite_training_recipe_v1"
 REFERENCE_SPECIFICATION_SCHEMA_VERSION = "refsite_reference_specification_v1"
 RECIPE_RESOLVER_VERSION = "refsite_training_recipe_resolver_v1"
-SYMMETRIC_MODEL_DEFAULTS_VERSION = "symmetric_model_defaults_v1"
-SEQUENTIAL_MODEL_DEFAULTS_VERSION = "sequential_model_defaults_v1"
+SYMMETRIC_MODEL_DEFAULTS_VERSION = "symmetric_model_defaults_v2"
+SEQUENTIAL_MODEL_DEFAULTS_VERSION = "sequential_model_defaults_v2"
 TRAINING_DEFAULTS_VERSION = "training_defaults_v2"
 RADIUS_DERIVATION_VERSION = "radius_derivation_v1"
 DEFAULT_EARLY_STOPPING_PATIENCE = 15
+DEFAULT_EARLY_STOPPING_RELATIVE_DELTA = 0.0
 
 SYMMETRIC_CORRELATION_METHOD = "symmetric"
 SEQUENTIAL_CORRELATION_METHOD = "sequential"
@@ -1054,9 +1055,18 @@ class RecipeLossConfig:
     energy_weight: float = 1.0
     forces_weight: float = 100.0
     stress_weight: float = 0.0
+    energy_scale: float = field(default=1.0, kw_only=True)
+    force_scale: float = field(default=1.0, kw_only=True)
+    stress_scale: float = field(default=1.0, kw_only=True)
+    energy_normalization: str = field(default="per_structure", kw_only=True)
     _provided_fields: tuple[str, ...] = field(default=(), repr=False, compare=False)
 
     def __post_init__(self) -> None:
+        for name in ("energy_scale", "force_scale", "stress_scale"):
+            object.__setattr__(self, name, _positive_real(getattr(self, name), field_name=f"loss.{name}"))
+        if self.energy_normalization not in ("per_structure", "per_atom"):
+            raise _error("INVALID_ENERGY_NORMALIZATION", "use per_structure or per_atom",
+                         stage="recipe.loss", field="loss.energy_normalization")
         for name in ("energy_weight", "forces_weight", "stress_weight"):
             object.__setattr__(
                 self, name, _finite_nonnegative(getattr(self, name), field_name=f"loss.{name}")
@@ -1069,17 +1079,24 @@ class RecipeLossConfig:
         object.__setattr__(self, "_provided_fields", tuple(sorted(self._provided_fields)))
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        result = {
             "energy_weight": self.energy_weight,
             "forces_weight": self.forces_weight,
             "stress_weight": self.stress_weight,
         }
+        # Preserve legacy recipe serialization when the new options are omitted.
+        for name, default in (("energy_scale", 1.0), ("force_scale", 1.0),
+                              ("stress_scale", 1.0), ("energy_normalization", "per_structure")):
+            if getattr(self, name) != default or name in self._provided_fields:
+                result[name] = getattr(self, name)
+        return result
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "RecipeLossConfig":
         payload = _strict_mapping(
             value,
-            allowed=frozenset({"energy_weight", "forces_weight", "stress_weight"}),
+            allowed=frozenset({"energy_weight", "forces_weight", "stress_weight",
+                               "energy_scale", "force_scale", "stress_scale", "energy_normalization"}),
             field_name="loss",
         )
         return cls(**dict(payload), _provided_fields=tuple(payload))
@@ -1091,12 +1108,26 @@ class RecipeTrainingConfig:
     batch_size: int = 4
     validation_batch_size: int | None = None
     learning_rate: float = 1.0e-3
+    gradient_clip_norm: float | None = field(default=None, kw_only=True)
+    scheduler: SchedulerConfig | None = field(default=None, kw_only=True)
     early_stopping_patience: int | None = field(
         default=DEFAULT_EARLY_STOPPING_PATIENCE, kw_only=True
+    )
+    early_stopping_relative_delta: float = field(
+        default=DEFAULT_EARLY_STOPPING_RELATIVE_DELTA, kw_only=True
     )
     _provided_fields: tuple[str, ...] = field(default=(), repr=False, compare=False)
 
     def __post_init__(self) -> None:
+        if self.gradient_clip_norm is not None:
+            object.__setattr__(self, "gradient_clip_norm", _positive_real(
+                self.gradient_clip_norm, field_name="training.gradient_clip_norm"))
+        if self.scheduler is not None and not isinstance(self.scheduler, SchedulerConfig):
+            raise _error("INVALID_RECIPE_SCHEDULER", "scheduler must be a SchedulerConfig",
+                         stage="recipe.training", field="training.scheduler")
+        if self.scheduler is not None and (self.scheduler.monitor != "total_loss" or self.scheduler.mode != "min"):
+            raise _error("INVALID_RECIPE_SCHEDULER", "recipe scheduler must monitor total_loss in min mode, matching model selection",
+                         stage="recipe.training", field="training.scheduler")
         for name in ("max_epochs", "batch_size"):
             object.__setattr__(self, name, _positive_int(getattr(self, name), field_name=f"training.{name}"))
         validation = self.batch_size if self.validation_batch_size is None else _positive_int(
@@ -1124,6 +1155,21 @@ class RecipeTrainingConfig:
                     actual=patience,
                 )
         object.__setattr__(self, "early_stopping_patience", patience)
+        relative_delta = _finite_nonnegative(
+            self.early_stopping_relative_delta,
+            field_name="training.early_stopping_relative_delta",
+        )
+        if relative_delta >= 1.0:
+            raise _error(
+                "INVALID_EARLY_STOPPING_RELATIVE_DELTA",
+                "relative improvement threshold must be smaller than 1",
+                stage="recipe.validation",
+                field="training.early_stopping_relative_delta",
+                actual=relative_delta,
+            )
+        object.__setattr__(
+            self, "early_stopping_relative_delta", relative_delta
+        )
         object.__setattr__(self, "_provided_fields", tuple(sorted(self._provided_fields)))
 
     def to_dict(self) -> dict[str, Any]:
@@ -1133,11 +1179,22 @@ class RecipeTrainingConfig:
             "max_epochs": self.max_epochs,
             "learning_rate": self.learning_rate,
         }
+        if self.gradient_clip_norm is not None or "gradient_clip_norm" in self._provided_fields:
+            result["gradient_clip_norm"] = self.gradient_clip_norm
+        if self.scheduler is not None:
+            result["scheduler"] = self.scheduler.to_dict()
         if (
             self.early_stopping_patience is not None
             or "early_stopping_patience" in self._provided_fields
         ):
             result["early_stopping_patience"] = self.early_stopping_patience
+        if (
+            self.early_stopping_relative_delta != 0.0
+            or "early_stopping_relative_delta" in self._provided_fields
+        ):
+            result["early_stopping_relative_delta"] = (
+                self.early_stopping_relative_delta
+            )
         return result
 
     @classmethod
@@ -1149,12 +1206,22 @@ class RecipeTrainingConfig:
                 "validation_batch_size",
                 "max_epochs",
                 "learning_rate",
+                "gradient_clip_norm",
+                "scheduler",
                 "early_stopping_patience",
+                "early_stopping_relative_delta",
             }),
             required=frozenset({"max_epochs"}),
             field_name="training",
         )
-        return cls(**dict(payload), _provided_fields=tuple(payload))
+        values = dict(payload)
+        if "scheduler" in values:
+            try:
+                values["scheduler"] = SchedulerConfig.from_dict(values["scheduler"])
+            except (TypeError, ValueError) as error:
+                raise _error("INVALID_RECIPE_SCHEDULER", str(error),
+                             stage="recipe.training", field="training.scheduler") from error
+        return cls(**values, _provided_fields=tuple(payload))
 
 
 @dataclass(frozen=True)
@@ -1664,7 +1731,7 @@ _MODEL_DEFAULTS = {
     "site_type_embedding_dim": 2,
     "radial_feature_dim": 3,
     "radial_hidden_dims": [8],
-    "edge_length_scale": 1.0,
+    "edge_length_scale": "radii.r_mp",
     "readout_hidden": 16,
     "energy_scale": 1.0,
     "epsilon_ot": 0.5,
@@ -1914,7 +1981,10 @@ def _compile_training_recipe_impl(
         radial_hidden_dims=tuple(_MODEL_DEFAULTS["radial_hidden_dims"]),
         avg_num_neighbors=first.builder.avg_num_neighbors,
         cutoff=recipe.radii.r_mp,
-        edge_length_scale=float(_MODEL_DEFAULTS["edge_length_scale"]),
+        # New recipes normalize MP radial powers by their physical cutoff.
+        # Persist the resolved scale so legacy bundles/resumes keep their
+        # original arithmetic (commonly edge_length_scale=1.0).
+        edge_length_scale=recipe.radii.r_mp,
     )
     if recipe.model.correlation_method == SYMMETRIC_CORRELATION_METHOD:
         higher = HigherBodyConfig(
@@ -2005,20 +2075,21 @@ def _compile_training_recipe_impl(
             energy_weight=recipe.loss.energy_weight,
             force_weight=recipe.loss.forces_weight,
             stress_weight=recipe.loss.stress_weight,
-            energy_scale=float(_TRAINING_DEFAULTS["energy_scale"]),
-            force_scale=float(_TRAINING_DEFAULTS["force_scale"]),
-            stress_scale=float(_TRAINING_DEFAULTS["stress_scale"]),
-            energy_normalization=str(_TRAINING_DEFAULTS["energy_normalization"]),
+            energy_scale=recipe.loss.energy_scale,
+            force_scale=recipe.loss.force_scale,
+            stress_scale=recipe.loss.stress_scale,
+            energy_normalization=recipe.loss.energy_normalization,
         ),
         baseline=_baseline_config(recipe.baseline),
         optimizer=OptimizerConfig(learning_rate=recipe.training.learning_rate, weight_decay=0.0),
-        train_step=TrainStepConfig(solver_path=TRAIN_FIXED),
+        train_step=TrainStepConfig(solver_path=TRAIN_FIXED, gradient_clip_norm=recipe.training.gradient_clip_norm),
         validation_step=ValidationStepConfig(solver_path=TRAIN_FIXED),
-        scheduler=SchedulerConfig(kind="none", monitor="total_loss", mode="min"),
+        scheduler=recipe.training.scheduler or SchedulerConfig(kind="none", monitor="total_loss", mode="min"),
         selection=ModelSelectionConfig(
             monitor="total_loss",
             mode="min",
             early_stopping_patience=recipe.training.early_stopping_patience,
+            relative_min_delta=recipe.training.early_stopping_relative_delta,
         ),
         fit=FitConfig(max_epochs=recipe.training.max_epochs),
         checkpointed_fit=CheckpointedFitConfig(save_every_epoch=True, require_empty_manager=True),
@@ -2029,6 +2100,7 @@ def _compile_training_recipe_impl(
 
     origins: dict[str, str] = {
         "model.contract_version": "fixed",
+        "model.edge_length_scale": "derived",
         "data.shuffle": "fixed", "optimizer.kind": "fixed",
         "optimizer.weight_decay": "fixed", "train_step.solver_path": "fixed",
         "validation_step.solver_path": "fixed", "scheduler.monitor": "fixed",
@@ -2056,6 +2128,16 @@ def _compile_training_recipe_impl(
     }
     origins["selection.early_stopping_patience"] = _origin(
         recipe.training._provided_fields, "early_stopping_patience"
+    )
+    for name in ("energy_scale", "force_scale", "stress_scale", "energy_normalization"):
+        origins[f"loss.{name}"] = _origin(recipe.loss._provided_fields, name)
+    origins["train_step.gradient_clip_norm"] = _origin(recipe.training._provided_fields, "gradient_clip_norm")
+    for name in config.scheduler.to_dict():
+        if name not in ("monitor", "mode"):
+            origins[f"scheduler.{name}"] = _origin(recipe.training._provided_fields, "scheduler")
+    origins["selection.relative_min_delta"] = _origin(
+        recipe.training._provided_fields,
+        "early_stopping_relative_delta",
     )
     if recipe.model.correlation_method == SYMMETRIC_CORRELATION_METHOD:
         origins.update(

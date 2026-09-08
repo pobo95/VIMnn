@@ -252,6 +252,13 @@ def test_advanced_example_binds_files_to_aliases_and_qualifies_inference(
     assert compiled.data.effective_validation_batch_size == 5
     assert compiled.fit.max_epochs == 500
     assert compiled.optimizer.learning_rate == 1.0e-3
+    assert compiled.selection.early_stopping_patience == 30
+    assert compiled.loss.energy_normalization == "per_atom"
+    assert compiled.train_step.gradient_clip_norm == 1.0
+    assert compiled.scheduler.kind == "reduce_on_plateau"
+    assert compiled.scheduler.patience == 5
+    assert compiled.scheduler.cooldown == 2
+    assert compiled.selection.relative_min_delta == 1.0e-3
     assert compiled.runtime.device == "cpu"
     assert compiled.runtime.dtype == "float32"
     assert resolution["recipe_summary"]["training_ot_solver"] == "sinkhorn"

@@ -20,6 +20,7 @@ from refsite_mlip._atomic import commit_temporary_file
 from .checkpoint import CheckpointMetadata, TrainingCheckpoint
 from .checkpoint_manager import ManagedCheckpointResult
 from .fit import FitEpochRecord
+from .losses import PhysicalErrorSums
 from .run_directory import ResumeRunLock, TrainingRunDirectory, canonical_runtime_json
 from .resume_fit import validate_checkpoint_history
 
@@ -328,6 +329,16 @@ class CommittedEpochMetrics:
     latest_checkpoint_basename: str
     best_checkpoint_basename: str | None
     provenance: CommittedEpochProvenance
+    training_reporting: PhysicalErrorSums = field(
+        default_factory=PhysicalErrorSums,
+        compare=False,
+        repr=False,
+    )
+    validation_reporting: PhysicalErrorSums = field(
+        default_factory=PhysicalErrorSums,
+        compare=False,
+        repr=False,
+    )
     schema_version: str = field(
         default=COMMITTED_EPOCH_METRICS_SCHEMA_VERSION, init=False
     )
@@ -447,6 +458,10 @@ class CommittedEpochMetrics:
         self._validate_checkpoint_basenames()
         if not isinstance(self.provenance, CommittedEpochProvenance):
             raise TypeError("provenance must be CommittedEpochProvenance")
+        if not isinstance(self.training_reporting, PhysicalErrorSums):
+            raise TypeError("training_reporting must be PhysicalErrorSums")
+        if not isinstance(self.validation_reporting, PhysicalErrorSums):
+            raise TypeError("validation_reporting must be PhysicalErrorSums")
 
     def _validate_checkpoint_basenames(self) -> None:
         epoch_name = self.epoch_checkpoint_basename
@@ -759,6 +774,8 @@ def committed_epoch_metrics_from_record(
         latest_checkpoint_basename=latest_name,
         best_checkpoint_basename=best_name,
         provenance=provenance,
+        training_reporting=training.reporting,
+        validation_reporting=validation.reporting,
     )
 
 
