@@ -1,4 +1,6 @@
 # Advanced reference-site MLIP training recipe.
+# Newton training, multiple references, and explicit loss/optimizer controls.
+# Values are an example starting point; see README.md before preparing a run.
 # All paths are resolved relative to this YAML file.
 # Required: this is the recipe file-format version, not a model version.
 schema_version: refsite_training_recipe_v1
@@ -58,12 +60,27 @@ data:
   # Different supercell sizes therefore require their corresponding POSCAR.
 
 ot_solver:
-  # Training always uses differentiable fixed-iteration Sinkhorn.
-  training: sinkhorn
-  # Inference-only Newton-Krylov requires automatic dataset-local qualification.
-  # Re-qualify after changing final train/validation geometry. Failure or fallback
-  # is never silently changed to Sinkhorn and does not certify arbitrary MD/NPT.
-  # Choose sinkhorn here instead when stable fixed-iteration inference is preferred.
+  # OT entropy regularization; positive. Shared by training and inference.
+  epsilon_ot: 0.5
+  # Used only with training: sinkhorn; Newton uses newton.warmup_iterations.
+  train_sinkhorn_iterations: 256
+  # Choose sinkhorn or newton_krylov. Newton training currently requires dense OT.
+  training: newton_krylov
+  newton:
+    # Sinkhorn initialization before Newton-PCG; not the pure Sinkhorn count above.
+    warmup_iterations: 16
+    # Up to 30 Newton-PCG steps, followed by two differentiable root corrections.
+    max_newton_iterations: 30
+    # Maximum PCG iterations per Newton step.
+    pcg_max_iterations: 256
+    # null selects marginal tolerance 1e-6 for float32, 1e-11 for float64.
+    convergence_tolerance: null
+    # null selects PCG abs/rel tolerances 1e-8/1e-6 (float32), 1e-13/1e-11 (float64).
+    pcg_absolute_tolerance: null
+    pcg_relative_tolerance: null
+  # This separate adaptive inference preference requires dataset-local qualification.
+  # It is applied at prediction/evaluation call time, not to the training solver.
+  # Re-qualify after changing geometry; qualification does not cover arbitrary MD.
   inference: sinkhorn_newton_krylov
 
 loss:
@@ -87,6 +104,7 @@ radii:
   r_ot: 4.0
   # Angstrom. Message-passing graph cutoff. Switch/skin radii are derived.
   # New training derives MP radial normalization from r_mp: x=(r/r_mp)^2.
+  # Do not supply edge_length_scale separately.
   r_mp: 3.0
 
 # Recommended for production. Train compositions must have full rank so each
@@ -99,7 +117,7 @@ training:
   validation_batch_size: 5
   max_epochs: 500
   # Training uses AdamW with zero weight decay.
-  learning_rate: 1.0e-3
+  learning_rate: 1.0e-4
   # Optional; null (default) disables global gradient clipping.
   gradient_clip_norm: 1.0
   # Optional; omission keeps the scheduler disabled. One step per validation epoch.
@@ -107,18 +125,21 @@ training:
     kind: reduce_on_plateau
     factor: 0.5
     patience: 5
+    # Relative mode: require a decrease greater than 0.1% of the best loss.
     threshold: 1.0e-3
     threshold_mode: rel
     cooldown: 2
     min_lr: 1.0e-6
   # Default is 15. Allow recovery after LR reductions; null disables early stopping.
   early_stopping_patience: 30
-  # A smaller change is treated as convergence; 1e-3 means 0.1% of the best loss.
+  # Separate from the scheduler threshold: minimum relative improvement for
+  # model selection and early stopping. 1e-3 means 0.1% of the best loss.
   early_stopping_relative_delta: 1.0e-3
 
 runtime:
   # Use cuda only on a CUDA-capable system; cpu remains supported.
   device: cuda
   dtype: float32
+  # Training Newton solves OT internally in float64 and returns the model dtype.
   # Controls training RNG/data ordering, independently of initialization_seed.
   seed: 123

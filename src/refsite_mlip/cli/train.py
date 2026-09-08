@@ -1112,7 +1112,7 @@ def _start_summary(
         r_candidate_ot=radii.r_candidate_ot,
         r_candidate_mp=radii.r_candidate_mp,
         ot_backend=model.config.transport_support.backend,
-        solver_path="sinkhorn",
+        solver_path=model.config.train_ot_solver,
         baseline_enabled=baseline_enabled,
         baseline_values=baseline_values,
         baseline_rank_policy=rank_policy,

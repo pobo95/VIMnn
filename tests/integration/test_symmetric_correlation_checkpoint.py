@@ -292,10 +292,11 @@ def test_v2_semantic_corruption_fails_before_runtime_or_rng_mutation(
     assert torch.equal(torch.get_rng_state(), torch_before)
 
 
+@pytest.mark.parametrize("train_ot_solver", ["sinkhorn", "newton_krylov"])
 @pytest.mark.parametrize("stability_options", [False, True])
 @pytest.mark.parametrize("scheduler_kind", ["none", "reduce_on_plateau"])
 def test_v2_cpu_float64_continuous_three_epochs_equals_one_plus_resume(
-    typed_crystal, scheduler_kind, stability_options
+    typed_crystal, scheduler_kind, stability_options, train_ot_solver
 ):
     rng_entry = (
         random.getstate(),
@@ -303,7 +304,7 @@ def test_v2_cpu_float64_continuous_three_epochs_equals_one_plus_resume(
         torch.get_rng_state().clone(),
     )
     _, continuous_model, _, _, continuous_batch, continuous_contexts, _, _ = (
-        _capture_v2(typed_crystal)
+        _capture_v2(typed_crystal, train_ot_solver=train_ot_solver)
     )
     continuous_configs = _configs(
         continuous_model, 3, scheduler_kind=scheduler_kind, stability_options=stability_options
@@ -335,7 +336,7 @@ def test_v2_cpu_float64_continuous_three_epochs_equals_one_plus_resume(
     np.random.set_state(rng_entry[1])
     torch.set_rng_state(rng_entry[2])
     _, split_model, _, _, split_batch, split_contexts, _, split_bundle = _capture_v2(
-        typed_crystal
+        typed_crystal, train_ot_solver=train_ot_solver
     )
     split_configs = _configs(split_model, 1, scheduler_kind=scheduler_kind, stability_options=stability_options)
     split_optimizer = build_optimizer(split_model, split_configs["optimizer"])

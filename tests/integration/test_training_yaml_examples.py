@@ -193,10 +193,14 @@ def test_minimal_example_uses_defaults_and_is_a_deterministic_read_only_dry_run(
     assert not (tmp_path / "my-first-run").exists()
 
 
+@pytest.mark.parametrize("training_solver", ["sinkhorn", "newton_krylov"])
 def test_advanced_example_binds_files_to_aliases_and_qualifies_inference(
-    tmp_path, capsys
+    tmp_path, capsys, training_solver
 ):
     recipe = _copy_example(tmp_path, "advanced.yaml")
+    payload = yaml.safe_load(recipe.read_text())
+    payload['ot_solver']['training'] = training_solver
+    recipe.write_text(yaml.safe_dump(payload, sort_keys=False))
     small = _reference()
     large = _reference(repeated=True)
     small_c_vacancy = _vacancy(small, species=6)
@@ -238,8 +242,13 @@ def test_advanced_example_binds_files_to_aliases_and_qualifies_inference(
     assert authored.runtime.dtype == "float32"
 
     compiled = TrainingRunConfig.from_dict(resolution["compiled_config"])
+    assert compiled.model_source.potential.train_ot_solver == training_solver
     higher = compiled.model_source.potential.higher_body
     assert compiled.model_source.potential.num_layers == 2
+    assert compiled.model_source.potential.epsilon_ot == 0.5
+    assert compiled.model_source.potential.train_sinkhorn_iterations == 256
+    assert compiled.model_source.potential.train_newton.warmup_iterations == 16
+    assert compiled.model_source.potential.train_newton.max_newton_iterations == 30
     assert higher.n_correlation_channels == 64
     assert higher.lmax == 2
     assert higher.symmetric_correlation.correlation_order == 3
@@ -251,7 +260,7 @@ def test_advanced_example_binds_files_to_aliases_and_qualifies_inference(
     assert compiled.data.batch_size == 5
     assert compiled.data.effective_validation_batch_size == 5
     assert compiled.fit.max_epochs == 500
-    assert compiled.optimizer.learning_rate == 1.0e-3
+    assert compiled.optimizer.learning_rate == 1.0e-4
     assert compiled.selection.early_stopping_patience == 30
     assert compiled.loss.energy_normalization == "per_atom"
     assert compiled.train_step.gradient_clip_norm == 1.0
@@ -261,7 +270,7 @@ def test_advanced_example_binds_files_to_aliases_and_qualifies_inference(
     assert compiled.selection.relative_min_delta == 1.0e-3
     assert compiled.runtime.device == "cpu"
     assert compiled.runtime.dtype == "float32"
-    assert resolution["recipe_summary"]["training_ot_solver"] == "sinkhorn"
+    assert resolution["recipe_summary"]["training_ot_solver"] == training_solver
     assert resolution["recipe_summary"]["inference_ot_solver"] == (
         "sinkhorn_newton_krylov"
     )
@@ -329,7 +338,7 @@ def test_example_yaml_uses_only_live_public_recipe_vocabulary(filename):
     assert "&" not in text and "*" not in text and "<<:" not in text
     assert "${" not in text
     assert recipe.model.correlation_method == "symmetric"
-    assert recipe.ot_solver.training == "sinkhorn"
+    assert recipe.ot_solver.training == ("sinkhorn" if filename == "minimal.yaml" else "newton_krylov")
     assert recipe.ot_solver.inference in {"sinkhorn", "sinkhorn_newton_krylov"}
 
     if filename == "minimal.yaml":
@@ -340,6 +349,9 @@ def test_example_yaml_uses_only_live_public_recipe_vocabulary(filename):
         assert recipe.loss.energy_weight == 1.0
         assert recipe.loss.forces_weight == 100.0
         assert recipe.loss.stress_weight == 0.0
+        assert recipe.loss.energy_normalization == "per_structure"
+        assert recipe.training.gradient_clip_norm is None
+        assert recipe.training.scheduler is None
         assert recipe.runtime.device == "cpu"
         assert recipe.runtime.dtype == "float64"
     else:
@@ -353,3 +365,9 @@ def test_example_yaml_uses_only_live_public_recipe_vocabulary(filename):
         assert recipe.training.batch_size == 5
         assert recipe.training.validation_batch_size == 5
         assert recipe.ot_solver.inference == "sinkhorn_newton_krylov"
+        assert recipe.loss.energy_normalization == "per_atom"
+        assert recipe.training.learning_rate == 1e-4
+        assert recipe.training.gradient_clip_norm == 1.0
+        assert recipe.training.scheduler.kind == "reduce_on_plateau"
+        assert recipe.ot_solver.newton.warmup_iterations == 16
+        assert recipe.ot_solver.newton.convergence_tolerance is None

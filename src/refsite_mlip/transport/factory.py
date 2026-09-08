@@ -21,6 +21,7 @@ from .sinkhorn import (
     solve_sinkhorn_train_fixed,
 )
 from .support import TransportSupportConfig, TransportSupportError
+from .training_newton import TrainNewtonConfig, solve_newton_train
 
 
 TRAIN_FIXED = "train_fixed"
@@ -31,6 +32,8 @@ def _analytic_empty_atom_result(problem, path: str, config) -> OTResult:
     f = torch.zeros_like(problem.row_marginal)
     g = torch.zeros_like(problem.column_marginal)
     effective_tolerance = None
+    if path == TRAIN_FIXED and isinstance(config, TrainNewtonConfig):
+        effective_tolerance = config.runtime_config(problem.cost.dtype).convergence_tolerance
     if path == TRAIN_FIXED and isinstance(config, TrainSinkhornConfig):
         effective_tolerance = (
             1.0e-6
@@ -61,7 +64,7 @@ def solve_atom_vacancy_ot(
     epsilon_ot: float,
     path: str,
     solver: str,
-    config: Union[TrainSinkhornConfig, EvalOTConfig],
+    config: Union[TrainSinkhornConfig, TrainNewtonConfig, EvalOTConfig],
     init_duals: Optional[DualVariables] = None,
     *,
     support_config: TransportSupportConfig | None = None,
@@ -71,6 +74,11 @@ def solve_atom_vacancy_ot(
 ) -> OTResult:
     if path not in (TRAIN_FIXED, EVAL_ADAPTIVE):
         raise ValueError("path must be train_fixed or eval_adaptive")
+    if path == TRAIN_FIXED and solver == "newton_krylov":
+        if init_duals is not None:
+            raise ValueError("training Newton uses deterministic zero initialization")
+        if not isinstance(config, TrainNewtonConfig):
+            raise ValueError("training Newton requires TrainNewtonConfig")
     support = TransportSupportConfig() if support_config is None else support_config
     if not isinstance(support, TransportSupportConfig):
         raise TransportSupportError(
@@ -95,10 +103,11 @@ def solve_atom_vacancy_ot(
         return _analytic_empty_atom_result(problem, path, config)
 
     if path == TRAIN_FIXED:
+        if solver == "newton_krylov":
+            return solve_newton_train(problem, config)
         if solver != "sinkhorn":
             raise ValueError(
-                "TRAIN_FIXED supports only fixed-unrolled log-Sinkhorn; "
-                "fixed Newton/PCG training is not a production option"
+                "TRAIN_FIXED supports sinkhorn or newton_krylov"
             )
         if init_duals is not None:
             raise ValueError("TRAIN_FIXED uses deterministic zero dual initialization")

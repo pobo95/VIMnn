@@ -447,7 +447,7 @@ def _canonical_potential_payload(value: Any) -> dict[str, Any]:
     payload = dict(
         _strict_mapping(
             value,
-            allowed=_POTENTIAL_KEYS,
+            allowed=_POTENTIAL_KEYS | frozenset({"train_ot_solver", "train_newton"}),
             required=_POTENTIAL_KEYS,
             field=field,
         )
@@ -995,7 +995,7 @@ class ScratchModelSourceConfig:
         potential = _parse_canonical(
             _canonical_potential_payload(payload["potential"]),
             cls=PotentialConfig,
-            allowed=_POTENTIAL_KEYS,
+            allowed=_POTENTIAL_KEYS | frozenset({"train_ot_solver", "train_newton"}),
             required=_POTENTIAL_KEYS,
             field="model_source.potential",
         )

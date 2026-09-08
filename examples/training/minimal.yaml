@@ -1,4 +1,5 @@
 # Minimal reference-site MLIP training recipe.
+# CPU/Sinkhorn baseline using the public defaults. See README.md for setup.
 # All paths are resolved relative to this YAML file.
 # Required: this is the recipe file-format version, not a model version.
 schema_version: refsite_training_recipe_v1
@@ -21,13 +22,19 @@ data:
   validation: ./data/validation.xyz
 
 ot_solver:
-  # Training always uses differentiable fixed-iteration Sinkhorn.
+  # Fixed-iteration Sinkhorn. The advanced example shows Newton-Krylov training.
+  # Omitted options: epsilon_ot=0.5, train_sinkhorn_iterations=256.
   training: sinkhorn
-  # Sinkhorn is the hardware-independent inference default.
+  # Call-time inference preference; this Sinkhorn-trained model uses Sinkhorn.
   inference: sinkhorn
 
 # Optional loss settings. Defaults: energy=1, forces=100, stress=0.
+# Energy normalization is per_structure; all residual scales are 1.
+# See advanced.yaml for explicit per_atom normalization and stress supervision.
 loss: {}
+
+# Omitted radii: r_ot=4.0 A, r_mp=3.0 A. MP distance normalization follows r_mp;
+# edge_length_scale is derived automatically and is not a recipe input.
 
 # Recommended for production: the train composition matrix must be full-rank
 # so every species baseline is identifiable. Use zero only for plumbing smokes;
@@ -37,6 +44,7 @@ baseline: fit_full_rank
 training:
   # Required: maximum number of epochs. Other defaults include batch size 4,
   # validation batch size 4, and learning rate 1e-3.
+  # Clipping and scheduler are off; early stopping patience is 15.
   max_epochs: 100
 
 runtime:

@@ -20,6 +20,7 @@ import stat
 from typing import Any
 
 import yaml
+import torch
 
 from refsite_mlip.data import PhaseSpecification, ReferenceTemplateBuilderConfig
 from refsite_mlip.features import ProbabilityMultipoleConfig
@@ -41,6 +42,7 @@ from refsite_mlip.training import (
     ValidationStepConfig,
 )
 from refsite_mlip.transport import TRAIN_FIXED
+from refsite_mlip.transport.training_newton import TrainNewtonConfig
 
 from .model_source import (
     ScratchModelSourceConfig,
@@ -538,20 +540,32 @@ class RecipeOTSolverConfig:
 
     training: str
     inference: str
+    epsilon_ot: float = field(default=0.5, kw_only=True)
+    train_sinkhorn_iterations: int = field(default=256, kw_only=True)
+    newton: TrainNewtonConfig = field(default_factory=TrainNewtonConfig, kw_only=True)
+    _provided_fields: tuple[str, ...] = field(default=(), repr=False, compare=False, kw_only=True)
 
     def __post_init__(self) -> None:
-        if self.training != SINKHORN_OT_SOLVER:
+        object.__setattr__(self, "epsilon_ot", _positive_real(
+            self.epsilon_ot, field_name="ot_solver.epsilon_ot"))
+        object.__setattr__(self, "train_sinkhorn_iterations", _positive_int(
+            self.train_sinkhorn_iterations, field_name="ot_solver.train_sinkhorn_iterations"))
+        object.__setattr__(self, "_provided_fields", tuple(sorted(self._provided_fields)))
+        if not isinstance(self.newton, TrainNewtonConfig):
+            raise _error("INVALID_NEWTON_CONFIG", "newton must be a TrainNewtonConfig",
+                         stage="recipe.ot_solver", field="ot_solver.newton")
+        if self.training not in (SINKHORN_OT_SOLVER, "newton_krylov"):
             if self.training == SINKHORN_NEWTON_KRYLOV_OT_SOLVER:
                 raise _error(
                     "UNSUPPORTED_TRAINING_OT_SOLVER",
-                    "sinkhorn_newton_krylov is inference-only because training requires differentiable fixed Sinkhorn",
+                    "sinkhorn_newton_krylov names the inference hybrid; use newton_krylov for training",
                     stage="recipe.ot_solver",
                     field="ot_solver.training",
                     actual=self.training,
                 )
             raise _error(
                 "UNSUPPORTED_TRAINING_OT_SOLVER",
-                "training OT solver must be sinkhorn",
+                "training OT solver must be sinkhorn or newton_krylov",
                 stage="recipe.ot_solver",
                 field="ot_solver.training",
                 actual=self.training,
@@ -568,20 +582,35 @@ class RecipeOTSolverConfig:
                 actual=self.inference,
             )
 
-    def to_dict(self) -> dict[str, str]:
-        return {"training": self.training, "inference": self.inference}
+    def to_dict(self) -> dict[str, Any]:
+        result = {"training": self.training, "inference": self.inference}
+        for name, default in (("epsilon_ot", 0.5), ("train_sinkhorn_iterations", 256)):
+            if getattr(self, name) != default or name in self._provided_fields:
+                result[name] = getattr(self, name)
+        if self.newton != TrainNewtonConfig() or "newton" in self._provided_fields:
+            result["newton"] = self.newton.to_dict()
+        return result
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "RecipeOTSolverConfig":
         payload = _strict_mapping(
             value,
-            allowed=frozenset({"training", "inference"}),
+            allowed=frozenset({"training", "inference", "epsilon_ot", "train_sinkhorn_iterations", "newton"}),
             required=frozenset({"training"}),
             field_name="ot_solver",
         )
+        try:
+            newton = TrainNewtonConfig.from_dict(payload.get("newton", {}))
+        except (TypeError, ValueError) as error:
+            raise _error("INVALID_NEWTON_CONFIG", str(error), stage="recipe.ot_solver",
+                         field="ot_solver.newton") from error
         return cls(
             training=payload["training"],
             inference=payload.get("inference", SINKHORN_OT_SOLVER),
+            epsilon_ot=payload.get("epsilon_ot", 0.5),
+            train_sinkhorn_iterations=payload.get("train_sinkhorn_iterations", 256),
+            newton=newton,
+            _provided_fields=tuple(payload),
         )
 
 
@@ -1622,7 +1651,10 @@ class RecipeResolutionManifest:
         object.__setattr__(
             self,
             "sinkhorn_iterations",
-            _positive_int(self.sinkhorn_iterations, field_name="sinkhorn_iterations"),
+            (0 if self.training_ot_solver == "newton_krylov"
+             and self.sinkhorn_iterations == 0 and not isinstance(self.sinkhorn_iterations, bool)
+             and isinstance(self.sinkhorn_iterations, Integral)
+             else _positive_int(self.sinkhorn_iterations, field_name="sinkhorn_iterations")),
         )
         tolerance = _positive_real(
             self.sinkhorn_residual_tolerance,
@@ -2007,9 +2039,11 @@ def _compile_training_recipe_impl(
         higher_body=higher,
         readout_hidden=int(_MODEL_DEFAULTS["readout_hidden"]),
         energy_scale=float(_MODEL_DEFAULTS["energy_scale"]),
-        epsilon_ot=float(_MODEL_DEFAULTS["epsilon_ot"]),
+        epsilon_ot=recipe.ot_solver.epsilon_ot,
         ell_ot=float(_MODEL_DEFAULTS["ell_ot"]),
-        train_sinkhorn_iterations=int(_MODEL_DEFAULTS["train_sinkhorn_iterations"]),
+        train_sinkhorn_iterations=recipe.ot_solver.train_sinkhorn_iterations,
+        train_ot_solver=recipe.ot_solver.training,
+        train_newton=recipe.ot_solver.newton,
         phase_steps=tuple(_MODEL_DEFAULTS["phase_steps"]),
         phase_damping=tuple(_MODEL_DEFAULTS["phase_damping"]),
         transport_support=transport_support_config_from_radii(
@@ -2125,6 +2159,10 @@ def _compile_training_recipe_impl(
         "output_directory": "user" if recipe.output_directory is not None else "preset",
         "ot_solver.training": "user",
         "ot_solver.inference": "user",
+        "model.epsilon_ot": _origin(recipe.ot_solver._provided_fields, "epsilon_ot"),
+        "model.train_sinkhorn_iterations": _origin(recipe.ot_solver._provided_fields, "train_sinkhorn_iterations"),
+        "model.train_ot_solver": "user",
+        "model.train_newton": _origin(recipe.ot_solver._provided_fields, "newton"),
     }
     origins["selection.early_stopping_patience"] = _origin(
         recipe.training._provided_fields, "early_stopping_patience"
@@ -2210,9 +2248,15 @@ def _compile_training_recipe_impl(
         field_origins=tuple(origins.items()), paths=tuple(paths),
         training_ot_solver=recipe.ot_solver.training,
         inference_ot_solver=recipe.ot_solver.inference,
-        sinkhorn_iterations=potential.train_sinkhorn_iterations,
+        sinkhorn_iterations=(potential.train_newton.warmup_iterations
+                            if potential.train_ot_solver == "newton_krylov"
+                            else potential.train_sinkhorn_iterations),
         sinkhorn_residual_tolerance=(
-            1.0e-6 if recipe.runtime.dtype == "float32" else 1.0e-7
+            potential.train_newton.runtime_config(
+                torch.float32 if recipe.runtime.dtype == "float32" else torch.float64
+            ).convergence_tolerance
+            if potential.train_ot_solver == "newton_krylov"
+            else 1.0e-6 if recipe.runtime.dtype == "float32" else 1.0e-7
         ),
         preset_versions=(
             ("model", model_defaults_version),

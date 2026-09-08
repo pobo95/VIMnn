@@ -9,6 +9,7 @@ import torch
 from .factory import solve_atom_vacancy_ot
 from .result import DualVariables, EvalOTConfig, OTResult, TrainSinkhornConfig
 from .support import TransportSupportConfig
+from .training_newton import TrainNewtonConfig
 
 
 def solve_ragged_atom_vacancy_ot(
@@ -16,7 +17,7 @@ def solve_ragged_atom_vacancy_ot(
     epsilon_ot: float,
     path: str,
     solver: str,
-    config: Union[TrainSinkhornConfig, EvalOTConfig],
+    config: Union[TrainSinkhornConfig, TrainNewtonConfig, EvalOTConfig],
     init_duals: Optional[Sequence[Optional[DualVariables]]] = None,
     *,
     support_config: TransportSupportConfig | None = None,

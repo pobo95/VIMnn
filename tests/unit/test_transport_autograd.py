@@ -113,12 +113,12 @@ def test_fixed_training_is_deterministically_repeatable():
     torch.testing.assert_close(first.g, second.g, atol=0.0, rtol=0.0)
 
 
-def test_training_factory_rejects_newton_and_initial_duals():
+def test_training_factory_rejects_wrong_newton_config_and_initial_duals():
     cost = torch.tensor([[0.1], [0.3]], dtype=torch.float64)
     import pytest
     from refsite_mlip.transport import DualVariables
 
-    with pytest.raises(ValueError, match="only fixed-unrolled"):
+    with pytest.raises(ValueError, match="TrainNewtonConfig"):
         solve_atom_vacancy_ot(
             cost, 0.3, TRAIN_FIXED, "newton_krylov", CONFIG
         )

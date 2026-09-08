@@ -19,6 +19,7 @@ from .candidate_state import (
     update_candidate_neighbor_state,
 )
 from .factory import EVAL_ADAPTIVE, TRAIN_FIXED, solve_atom_vacancy_ot
+from .training_newton import TrainNewtonConfig
 from .edge_list import (
     CompactTransportEdges,
     build_compact_transport_edges,
@@ -70,6 +71,7 @@ from .support import (
 )
 
 __all__ = [
+    "TrainNewtonConfig",
     "DualVariables",
     "DensePlanMaterialization",
     "CompactTransportEdges",

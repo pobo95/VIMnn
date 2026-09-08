@@ -10,6 +10,7 @@ from typing import Any, Mapping
 from refsite_mlip.features import ProbabilityMultipoleConfig
 from refsite_mlip.interactions import HigherBodyConfig
 from refsite_mlip.transport import TransportSupportConfig
+from refsite_mlip.transport.training_newton import TrainNewtonConfig
 
 
 def _positive_integer(name: str, value: Any) -> int:
@@ -67,6 +68,8 @@ class PotentialConfig:
         default_factory=TransportSupportConfig
     )
     eval_sinkhorn_warmup_iterations: int = 16
+    train_ot_solver: str = "sinkhorn"
+    train_newton: TrainNewtonConfig = field(default_factory=TrainNewtonConfig)
 
     def __post_init__(self) -> None:
         self.validate()
@@ -105,6 +108,14 @@ class PotentialConfig:
         )
 
     def validate(self) -> None:
+        if self.train_ot_solver not in ("sinkhorn", "newton_krylov"):
+            raise ValueError("train_ot_solver must be sinkhorn or newton_krylov")
+        if not isinstance(self.train_newton, TrainNewtonConfig):
+            raise TypeError("train_newton must be a TrainNewtonConfig")
+        if (self.train_ot_solver == "newton_krylov"
+            and isinstance(self.transport_support, TransportSupportConfig)
+            and self.transport_support.backend == "edge_list"):
+            raise ValueError("training Newton-Krylov currently requires the dense transport backend")
         if (
             not isinstance(self.species_vocabulary, tuple)
             or not self.species_vocabulary
@@ -179,7 +190,7 @@ class PotentialConfig:
 
     def to_dict(self) -> dict[str, Any]:
         self.validate()
-        return {
+        result = {
             "species_vocabulary": list(self.species_vocabulary),
             "num_layers": self.num_layers,
             "feature": self.feature.to_dict(),
@@ -194,12 +205,19 @@ class PotentialConfig:
             "transport_support": self.transport_support.to_dict(),
             "eval_sinkhorn_warmup_iterations": self.eval_sinkhorn_warmup_iterations,
         }
+        # Keep legacy Sinkhorn config bytes/fingerprints unchanged.
+        if self.train_ot_solver != "sinkhorn" or self.train_newton != TrainNewtonConfig():
+            result["train_ot_solver"] = self.train_ot_solver
+            result["train_newton"] = self.train_newton.to_dict()
+        return result
 
     @classmethod
     def from_dict(cls, values: Mapping[str, Any]) -> "PotentialConfig":
         if not isinstance(values, Mapping):
             raise TypeError("potential config must be reconstructed from a mapping")
         data = dict(values)
+        if "train_newton" in data:
+            data["train_newton"] = TrainNewtonConfig.from_dict(data["train_newton"])
         data["species_vocabulary"] = tuple(data["species_vocabulary"])
         data["feature"] = ProbabilityMultipoleConfig.from_dict(data["feature"])
         data["higher_body"] = HigherBodyConfig.from_dict(data["higher_body"])

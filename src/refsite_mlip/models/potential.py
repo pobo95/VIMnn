@@ -802,8 +802,9 @@ class ReferenceSitePotential(nn.Module):
                 else None
             )
             ot=solve_atom_vacancy_ot(
-                cost,self.config.epsilon_ot,TRAIN_FIXED,'sinkhorn',
-                TrainSinkhornConfig(self.config.train_sinkhorn_iterations),
+                cost,self.config.epsilon_ot,TRAIN_FIXED,self.config.train_ot_solver,
+                (self.config.train_newton if self.config.train_ot_solver == 'newton_krylov'
+                 else TrainSinkhornConfig(self.config.train_sinkhorn_iterations)),
                 support_config=self.config.transport_support,
                 atom_distances=distances,
                 template_id=getattr(runtime, "template_id", None),

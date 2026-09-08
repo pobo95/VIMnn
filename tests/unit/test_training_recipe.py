@@ -874,3 +874,59 @@ def test_invalid_stability_options_fail_before_training(section, key, value):
     payload[section][key] = value
     with pytest.raises(TrainingRecipeError):
         TrainingRecipeConfig.from_dict(payload)
+
+
+@pytest.mark.parametrize('method', ['symmetric', 'sequential'])
+def test_ot_controls_compile_roundtrip_and_preserve_legacy_defaults(method):
+    payload = _payload()
+    payload['model']['correlation_method'] = method
+    if method == 'sequential':
+        payload['model'].pop('correlation')
+        payload['model']['correlation_mode'] = 'uuu'
+    legacy = TrainingRecipeConfig.from_dict(payload)
+    default = compile_training_recipe(legacy, (_spec(),))
+    assert legacy.to_dict()['ot_solver'] == payload['ot_solver']
+    payload['ot_solver'].update(epsilon_ot=0.5, train_sinkhorn_iterations=256)
+    explicit = compile_training_recipe(TrainingRecipeConfig.from_dict(payload), (_spec(),))
+    assert explicit.config.config_fingerprint == default.config.config_fingerprint
+    payload['ot_solver'].update(epsilon_ot=0.2, train_sinkhorn_iterations=1024)
+    recipe = TrainingRecipeConfig.from_dict(payload)
+    resolved = compile_training_recipe(recipe, (_spec(),))
+    assert resolved.config.model_source.potential.epsilon_ot == 0.2
+    assert resolved.config.model_source.potential.train_sinkhorn_iterations == 1024
+    assert resolved.manifest.sinkhorn_iterations == 1024
+    assert dict(resolved.manifest.field_origins)['model.epsilon_ot'] == 'user'
+    assert resolved.config.config_fingerprint != default.config.config_fingerprint
+    restored = compile_training_recipe(TrainingRecipeConfig.from_dict(recipe.to_dict()), (_spec(),))
+    assert restored.config.config_fingerprint == resolved.config.config_fingerprint
+    assert TrainingRunConfig.from_dict(resolved.config.to_dict()).config_fingerprint == resolved.config.config_fingerprint
+
+
+@pytest.mark.parametrize('key,value', [
+    ('epsilon_ot', 0), ('epsilon_ot', -0.1), ('epsilon_ot', True),
+    ('epsilon_ot', float('nan')), ('epsilon_ot', float('inf')),
+    ('train_sinkhorn_iterations', 0), ('train_sinkhorn_iterations', -1),
+    ('train_sinkhorn_iterations', True), ('train_sinkhorn_iterations', 2.5),
+])
+def test_invalid_ot_controls_rejected(key, value):
+    payload = _payload()
+    payload['ot_solver'][key] = value
+    with pytest.raises(TrainingRecipeError):
+        TrainingRecipeConfig.from_dict(payload)
+
+
+def test_training_newton_recipe_compiles_and_serializes():
+    payload = _payload()
+    payload['ot_solver'].update(training='newton_krylov', epsilon_ot=0.2,
+        newton={'warmup_iterations': 8, 'max_newton_iterations': 40, 'convergence_tolerance': 1e-8})
+    recipe = TrainingRecipeConfig.from_dict(payload)
+    resolved = compile_training_recipe(recipe, (_spec(),))
+    potential = resolved.config.model_source.potential
+    assert potential.train_ot_solver == 'newton_krylov'
+    assert potential.train_newton.warmup_iterations == 8
+    assert potential.train_newton.max_newton_iterations == 40
+    assert resolved.manifest.training_ot_solver == 'newton_krylov'
+    restored = TrainingRunConfig.from_dict(resolved.config.to_dict())
+    assert restored.config_fingerprint == resolved.config.config_fingerprint
+    assert restored.model_source.potential.train_newton == potential.train_newton
+    assert TrainingRecipeConfig.from_dict(recipe.to_dict()).to_dict() == recipe.to_dict()

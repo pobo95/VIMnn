@@ -38,12 +38,12 @@ from test_grouped_evaluation_phase_batch import _adaptive_case
 from test_model_bundle_runtime import _phase_from_template
 
 
-def _capture_v2(typed_crystal, *, edge_backend=False, dtype=torch.float64):
+def _capture_v2(typed_crystal, *, edge_backend=False, dtype=torch.float64, train_ot_solver="sinkhorn"):
     data, _, registry, samples, batch, contexts, policies = _adaptive_case(
         typed_crystal
     )
     default = registry.resolve("zeta")
-    config = v2_configuration(dtype, order=3, layers=2)
+    config = replace(v2_configuration(dtype, order=3, layers=2), train_ot_solver=train_ot_solver)
     if edge_backend:
         config = replace(
             config,
